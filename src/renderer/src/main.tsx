@@ -64,6 +64,43 @@ const emptyState: AppState = {
 };
 
 type AppWindowKind = "voice" | "debug";
+type ApiKeyDialogMode = "onboarding" | "settings";
+type VoiceTone = "off" | "listening" | "working" | "connecting" | "paused" | "waiting";
+type VoiceSettingsTab = "general" | "appearance" | "configuration" | "archive";
+type VoiceOrbPresetId = "aurora" | "cloud" | "nocturne";
+
+type VoiceOrbPreset = {
+  id: VoiceOrbPresetId;
+  name: string;
+  detail: string;
+  shape: "sphere" | "cloud";
+  previewLevel: number;
+};
+
+const voiceOrbStorageKey = "codexVoice.orbPreset";
+const voiceOrbPresets: VoiceOrbPreset[] = [
+  {
+    id: "aurora",
+    name: "Aurora",
+    detail: "Round water",
+    shape: "sphere",
+    previewLevel: 0.32,
+  },
+  {
+    id: "cloud",
+    name: "Cloud",
+    detail: "Soft bloom",
+    shape: "cloud",
+    previewLevel: 0.42,
+  },
+  {
+    id: "nocturne",
+    name: "Nocturne",
+    detail: "Night glass",
+    shape: "sphere",
+    previewLevel: 0.28,
+  },
+];
 
 type ContextMenuTarget =
   | {
@@ -93,9 +130,41 @@ function appWindowKind(): AppWindowKind {
   return kind === "debug" ? "debug" : "voice";
 }
 
+function isVoiceOrbPresetId(value: string | null): value is VoiceOrbPresetId {
+  return voiceOrbPresets.some((preset) => preset.id === value);
+}
+
+function loadVoiceOrbPresetId(): VoiceOrbPresetId {
+  try {
+    const stored = window.localStorage.getItem(voiceOrbStorageKey);
+    return isVoiceOrbPresetId(stored) ? stored : "aurora";
+  } catch {
+    return "aurora";
+  }
+}
+
+function saveVoiceOrbPresetId(presetId: VoiceOrbPresetId): void {
+  try {
+    window.localStorage.setItem(voiceOrbStorageKey, presetId);
+  } catch {
+    // Visual preferences should never block the voice UI.
+  }
+}
+
+function voiceOrbPresetById(presetId: VoiceOrbPresetId): VoiceOrbPreset {
+  return voiceOrbPresets.find((preset) => preset.id === presetId) ?? voiceOrbPresets[0];
+}
+
+function voiceOrbPresetAtOffset(presetId: VoiceOrbPresetId, offset: number): VoiceOrbPresetId {
+  const currentIndex = Math.max(0, voiceOrbPresets.findIndex((preset) => preset.id === presetId));
+  const nextIndex = (currentIndex + offset + voiceOrbPresets.length) % voiceOrbPresets.length;
+  return voiceOrbPresets[nextIndex].id;
+}
+
 function App(): React.ReactElement {
   const [windowKind] = useState<AppWindowKind>(() => appWindowKind());
   const [state, setState] = useState<AppState>(emptyState);
+  const [stateLoaded, setStateLoaded] = useState(false);
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [projectName, setProjectName] = useState("");
   const [message, setMessage] = useState("");
@@ -105,7 +174,11 @@ function App(): React.ReactElement {
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceConnecting, setVoiceConnecting] = useState(false);
   const [voicePaused, setVoicePaused] = useState(false);
+  const [voiceOutputLevel, setVoiceOutputLevel] = useState(0);
+  const [realtimeIssue, setRealtimeIssue] = useState<string | null>(null);
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
+  const outputLevelUpdateRef = useRef(0);
+  const outputLevelValueRef = useRef(0);
 
   useEffect(() => {
     if (!error) return undefined;
@@ -117,7 +190,10 @@ function App(): React.ReactElement {
     document.title = windowKind === "debug" ? "Codex Voice Debug" : "Codex Voice";
     void refreshState();
     void refreshEvents();
-    const offState = window.codexVoice.onAppState(setState);
+    const offState = window.codexVoice.onAppState((nextState) => {
+      setState(nextState);
+      setStateLoaded(true);
+    });
     const offEvent = window.codexVoice.onAppEvent((event) => {
       setEvents((current) => [event, ...current].slice(0, 250));
       if (event.source === "codex" && event.kind === "serverRequest") {
@@ -139,6 +215,7 @@ function App(): React.ReactElement {
 
   async function refreshState(): Promise<void> {
     setState(await window.codexVoice.getState());
+    setStateLoaded(true);
   }
 
   async function refreshEvents(): Promise<void> {
@@ -164,6 +241,23 @@ function App(): React.ReactElement {
     }
   }
 
+  function updateVoiceOutputLevel(level: number): void {
+    const normalized = level < 0.006 ? 0 : Math.min(1, Math.max(0, level));
+    const now = performance.now();
+    if (normalized === 0 && outputLevelValueRef.current === 0) return;
+    if (normalized === 0 || now - outputLevelUpdateRef.current > 32) {
+      outputLevelUpdateRef.current = now;
+      outputLevelValueRef.current = normalized;
+      setVoiceOutputLevel(normalized);
+    }
+  }
+
+  function clearVoiceOutputLevel(): void {
+    outputLevelUpdateRef.current = 0;
+    outputLevelValueRef.current = 0;
+    setVoiceOutputLevel(0);
+  }
+
   async function toggleVoice(): Promise<void> {
     if (voiceRef.current?.connected || voiceConnected) {
       voiceRef.current?.disconnect();
@@ -171,6 +265,7 @@ function App(): React.ReactElement {
       setVoiceConnected(false);
       setVoiceConnecting(false);
       setVoicePaused(false);
+      clearVoiceOutputLevel();
       setVoiceStatus("Realtime disconnected.");
       return;
     }
@@ -180,6 +275,7 @@ function App(): React.ReactElement {
       const client = new RealtimeVoiceClient({
         onConnectionChange: (connected, label) => {
           setVoiceConnected(connected);
+          if (connected) setRealtimeIssue(null);
           setVoiceConnecting(!connected && label !== "Realtime data channel closed.");
           if (connected || label === "Realtime data channel closed." || label === "Realtime disconnected.") {
             setVoicePaused(false);
@@ -189,6 +285,7 @@ function App(): React.ReactElement {
         onLog: (event) => {
           void window.codexVoice.logEvent(event);
         },
+        onOutputLevel: updateVoiceOutputLevel,
       });
       voiceRef.current = client;
       try {
@@ -196,6 +293,8 @@ function App(): React.ReactElement {
       } catch (caught) {
         if (voiceRef.current === client) voiceRef.current = null;
         setVoicePaused(false);
+        clearVoiceOutputLevel();
+        setRealtimeIssue(caught instanceof Error ? caught.message : String(caught));
         throw caught;
       } finally {
         setVoiceConnecting(false);
@@ -215,6 +314,7 @@ function App(): React.ReactElement {
     if (voiceConnected) {
       setVoiceConnected(false);
       setVoicePaused(false);
+      clearVoiceOutputLevel();
       return;
     }
     await toggleVoice();
@@ -248,6 +348,9 @@ function App(): React.ReactElement {
   return (
     <VoiceHome
       state={state}
+      stateLoaded={stateLoaded}
+      voiceOutputLevel={voiceOutputLevel}
+      realtimeIssue={realtimeIssue}
       error={error}
       voiceConnected={voiceConnected}
       voiceConnecting={voiceConnecting}
@@ -258,12 +361,16 @@ function App(): React.ReactElement {
       onRefresh={refreshState}
       onShowDebug={openDebugWindow}
       onToggleVoice={toggleVoice}
+      onClearRealtimeIssue={() => setRealtimeIssue(null)}
     />
   );
 }
 
 function VoiceHome({
   state,
+  stateLoaded,
+  voiceOutputLevel,
+  realtimeIssue,
   error,
   voiceConnected,
   voiceConnecting,
@@ -274,8 +381,12 @@ function VoiceHome({
   onRefresh,
   onShowDebug,
   onToggleVoice,
+  onClearRealtimeIssue,
 }: {
   state: AppState;
+  stateLoaded: boolean;
+  voiceOutputLevel: number;
+  realtimeIssue: string | null;
   error: string | null;
   voiceConnected: boolean;
   voiceConnecting: boolean;
@@ -286,22 +397,26 @@ function VoiceHome({
   onRefresh: () => Promise<void>;
   onShowDebug: () => Promise<void>;
   onToggleVoice: () => Promise<void>;
+  onClearRealtimeIssue: () => void;
 }): React.ReactElement {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [futureOpen, setFutureOpen] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [switchChatOpen, setSwitchChatOpen] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [chatsOpen, setChatsOpen] = useState(false);
-  const [modelOpen, setModelOpen] = useState(false);
   const [permissionsOpen, setPermissionsOpen] = useState(false);
-  const [apiKeyOpen, setApiKeyOpen] = useState(false);
+  const [orbPresetId, setOrbPresetId] = useState<VoiceOrbPresetId>(() => loadVoiceOrbPresetId());
+  const [apiKeyDialogMode, setApiKeyDialogMode] = useState<ApiKeyDialogMode | null>(null);
+  const [apiKeyOnboardingDismissed, setApiKeyOnboardingDismissed] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuTarget | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [newName, setNewName] = useState("");
   const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
+  const paneTogglePointerActivationRef = useRef<"settings" | "future" | null>(null);
   const projects = state.projects;
   const archivedProjects = state.archivedProjects;
   const activeProject = state.activeProject;
@@ -339,6 +454,7 @@ function VoiceHome({
     const haystack = [
       project.displayName,
       project.folderPath,
+      project.workspacePath,
       project.lastStatus ?? "",
       project.lastSummary ?? "",
     ]
@@ -350,12 +466,40 @@ function VoiceHome({
   const voiceOrbLabel = voiceOrbAriaLabel(state, voiceConnected, voiceConnecting, voicePaused);
 
   useEffect(() => {
+    saveVoiceOrbPresetId(orbPresetId);
+  }, [orbPresetId]);
+
+  useEffect(() => {
     setChatsOpen(false);
   }, [activeProject?.id]);
 
   useEffect(() => {
     setChatsOpen(showProjectChats);
   }, [showProjectChats]);
+
+  useEffect(() => {
+    if (!stateLoaded || state.realtime.available || apiKeyOnboardingDismissed || apiKeyDialogMode) {
+      return;
+    }
+    setApiKeyDialogMode("onboarding");
+  }, [apiKeyDialogMode, apiKeyOnboardingDismissed, state.realtime.available, stateLoaded]);
+
+  useEffect(() => {
+    if (!apiKeyDialogMode && !settingsOpen) return undefined;
+    let cancelled = false;
+    setApiKey("");
+    void window.codexVoice
+      .getOpenAiApiKey()
+      .then((currentApiKey) => {
+        if (!cancelled) setApiKey(currentApiKey ?? "");
+      })
+      .catch(() => {
+        if (!cancelled) setApiKey("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKeyDialogMode, settingsOpen]);
 
   useEffect(() => {
     if (!contextMenu) return undefined;
@@ -460,7 +604,9 @@ function VoiceHome({
     await onAction(async () => {
       await window.codexVoice.saveOpenAiApiKey(apiKey);
       setApiKey("");
-      setApiKeyOpen(false);
+      setApiKeyOnboardingDismissed(true);
+      setApiKeyDialogMode(null);
+      onClearRealtimeIssue();
     });
   }
 
@@ -468,153 +614,143 @@ function VoiceHome({
     await onAction(async () => {
       await window.codexVoice.clearOpenAiApiKey();
       setApiKey("");
-      setApiKeyOpen(false);
+      onClearRealtimeIssue();
     });
   }
 
+  function closeApiKeyDialog(): void {
+    if (apiKeyDialogMode === "onboarding") {
+      setApiKeyOnboardingDismissed(true);
+    }
+    setApiKeyDialogMode(null);
+  }
+
+  function handleVoiceOrbClick(): void {
+    if (!state.realtime.available) {
+      setApiKeyDialogMode("onboarding");
+      return;
+    }
+    void onOrbAction();
+  }
+
+  function toggleSettingsPane(): void {
+    setPermissionsOpen(false);
+    setSettingsOpen((current) => !current);
+  }
+
+  function toggleFuturePane(): void {
+    setPermissionsOpen(false);
+    setFutureOpen((current) => !current);
+  }
+
+  function activatePaneToggle(pane: "settings" | "future"): void {
+    if (pane === "settings") {
+      toggleSettingsPane();
+      return;
+    }
+
+    toggleFuturePane();
+  }
+
+  function handlePaneTogglePointerDown(event: React.PointerEvent<HTMLButtonElement>): void {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function handlePaneTogglePointerUp(
+    event: React.PointerEvent<HTMLButtonElement>,
+    pane: "settings" | "future",
+  ): void {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    paneTogglePointerActivationRef.current = pane;
+    activatePaneToggle(pane);
+    window.setTimeout(() => {
+      if (paneTogglePointerActivationRef.current === pane) {
+        paneTogglePointerActivationRef.current = null;
+      }
+    }, 400);
+  }
+
+  function handlePaneToggleClick(
+    event: React.MouseEvent<HTMLButtonElement>,
+    pane: "settings" | "future",
+  ): void {
+    event.stopPropagation();
+    if (paneTogglePointerActivationRef.current === pane) {
+      paneTogglePointerActivationRef.current = null;
+      return;
+    }
+    activatePaneToggle(pane);
+  }
+
   return (
-    <main className="voice-home">
-      <div className="voice-home-content">
+    <main className={`voice-home ${settingsOpen ? "settings-open" : ""} ${futureOpen ? "future-open" : ""}`}>
+      <button
+        className="voice-pane-toggle left"
+        type="button"
+        aria-label={settingsOpen ? "Close left pane" : "Open left pane"}
+        aria-expanded={settingsOpen}
+        onPointerDown={handlePaneTogglePointerDown}
+        onPointerUp={(event) => handlePaneTogglePointerUp(event, "settings")}
+        onClick={(event) => handlePaneToggleClick(event, "settings")}
+      >
+        <LeftPaneIcon />
+      </button>
+      <button
+        className="voice-pane-toggle right"
+        type="button"
+        aria-label={futureOpen ? "Close right pane" : "Open right pane"}
+        aria-expanded={futureOpen}
+        onPointerDown={handlePaneTogglePointerDown}
+        onPointerUp={(event) => handlePaneTogglePointerUp(event, "future")}
+        onClick={(event) => handlePaneToggleClick(event, "future")}
+      >
+        <RightPaneIcon />
+      </button>
+      <div className="voice-shell">
+        <VoiceSettingsPane
+          open={settingsOpen}
+          state={state}
+          realtimeIssue={realtimeIssue}
+          apiKey={apiKey}
+          archivedCount={archivedCount}
+          voiceConnected={voiceConnected}
+          modelScope={modelScope}
+          effectiveModel={effectiveModel}
+          effectiveEffort={effectiveEffort}
+          effectivePermissionMode={effectivePermissionMode}
+          modelOptions={modelOptions}
+          orbPresetId={orbPresetId}
+          onOrbPresetChange={setOrbPresetId}
+          onClose={() => setSettingsOpen(false)}
+          onApiKeyChange={setApiKey}
+          onSaveApiKey={saveApiKey}
+          onClearApiKey={clearApiKey}
+          onAction={onAction}
+          onRefresh={onRefresh}
+          onShowDebug={onShowDebug}
+          onOpenArchived={() => setArchivedOpen(true)}
+          onToggleVoice={onToggleVoice}
+        />
+
+        <div className="voice-home-content">
         <header className="voice-home-header">
-          <h1>
-            Codex Voice <span>BETA</span>
-          </h1>
-          <div className="voice-menu-wrap">
-            <button
-              className="voice-icon-button"
-              aria-label="Open menu"
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((current) => !current)}
-            >
-              <EllipsisIcon />
-            </button>
-            {menuOpen && (
-              <div className="voice-menu" role="menu">
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    void onShowDebug();
-                  }}
-                >
-                  Debug UI
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    void onRefresh();
-                  }}
-                >
-                  Refresh
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setArchivedOpen(true);
-                  }}
-                >
-                  Archived{archivedCount > 0 ? ` (${archivedCount})` : ""}
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setApiKeyOpen(true);
-                  }}
-                >
-                  OpenAI API key
-                </button>
-                {voiceConnected && (
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      void onToggleVoice();
-                    }}
-                  >
-                    Disconnect voice
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
+          <h1>Codex Voice</h1>
         </header>
 
         <div className="voice-home-scroll">
-          <section className="voice-model-picker" aria-label="Model settings">
-            <button
-              className="voice-model-trigger"
-              aria-expanded={modelOpen}
-              onClick={() => setModelOpen((current) => !current)}
-            >
-              <span>{formatModelName(effectiveModel)}</span>
-              <span aria-hidden="true">·</span>
-              <span>{formatEffort(effectiveEffort)}</span>
-              <DownIcon />
-            </button>
-
-            {modelOpen && (
-              <div className="voice-model-panel">
-                <label className="voice-model-field">
-                  Model
-                  <span className="voice-model-select-wrap">
-                    <select
-                      value={effectiveModel}
-                      onChange={(event) =>
-                        void onAction(() =>
-                          window.codexVoice.setCodexSettings(
-                            { model: event.target.value || null },
-                            modelScope,
-                          ),
-                        )
-                      }
-                    >
-                      {modelOptions.length === 0 && (
-                        <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
-                      )}
-                      {modelOptions.map((model) => (
-                        <option key={model.id} value={model.model}>
-                          {model.displayName || formatModelName(model.model)}
-                        </option>
-                      ))}
-                    </select>
-                    <DownIcon />
-                  </span>
-                </label>
-
-                <div className="voice-effort-list">
-                  <span>Reasoning effort</span>
-                  {(["low", "medium", "high", "xhigh"] as ReasoningEffort[]).map((effort) => (
-                    <button
-                      key={effort}
-                      className={effort === effectiveEffort ? "selected" : ""}
-                      onClick={() =>
-                        void onAction(() =>
-                          window.codexVoice.setCodexSettings({ reasoningEffort: effort }, modelScope),
-                        )
-                      }
-                    >
-                      {formatEffort(effort)}
-                      {effort === effectiveEffort && <CheckIcon />}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-          </section>
-
           <section className="voice-hero" aria-label="Voice status">
             <button
-              className={`voice-orb ${voiceState.tone}`}
+              className={`voice-orb ${voiceState.tone} ${orbPresetId}`}
               aria-label={voiceOrbLabel}
-              onClick={() => void onOrbAction()}
+              onClick={handleVoiceOrbClick}
             >
+              <VoiceOrbCanvas tone={voiceState.tone} outputLevel={voiceOutputLevel} presetId={orbPresetId} />
               <span className="voice-orb-shine" />
             </button>
-            <div className="voice-state-line">
+            <div className={`voice-state-line ${voiceState.tone}`}>
               <WaveformIcon />
               <span>{voiceState.label}</span>
             </div>
@@ -694,15 +830,23 @@ function VoiceHome({
         </div>
 
         <footer className="voice-footer">
-          <span className={`voice-dot ${state.runtime.ready ? "ready" : ""}`} />
-          <span>{state.runtime.ready ? "Codex app-server connected" : "Codex app-server starting"}</span>
+          <button
+            className="voice-footer-settings"
+            aria-label="Open settings"
+            aria-expanded={settingsOpen}
+            title={state.runtime.ready ? "Codex app-server connected" : "Codex app-server starting"}
+            onClick={toggleSettingsPane}
+          >
+            <ConfigIcon />
+            <span className="voice-footer-settings-label">Settings</span>
+          </button>
           <div className="voice-permission-wrap footer-permissions">
             <button
               className={`voice-permission-trigger ${effectivePermissionMode}`}
               aria-expanded={permissionsOpen}
               onClick={() => setPermissionsOpen((current) => !current)}
             >
-              <ShieldIcon />
+              <PermissionIcon mode={effectivePermissionMode} />
               <span>{effectivePermission.displayName}</span>
               <DownIcon />
             </button>
@@ -712,7 +856,9 @@ function VoiceHome({
                 {CODEX_PERMISSION_PROFILES.map((profile) => (
                   <button
                     key={profile.mode}
-                    className={profile.mode === effectivePermissionMode ? "selected" : ""}
+                    className={[profile.mode, profile.mode === effectivePermissionMode ? "selected" : ""]
+                      .filter(Boolean)
+                      .join(" ")}
                     role="menuitemradio"
                     aria-checked={profile.mode === effectivePermissionMode}
                     onClick={() =>
@@ -721,7 +867,7 @@ function VoiceHome({
                       )
                     }
                   >
-                    <ShieldIcon />
+                    <PermissionIcon mode={profile.mode} />
                     <span>{profile.displayName}</span>
                     {profile.mode === effectivePermissionMode && <CheckIcon />}
                   </button>
@@ -730,6 +876,9 @@ function VoiceHome({
             )}
           </div>
         </footer>
+        </div>
+
+        <aside className="voice-future-pane" aria-hidden={!futureOpen} inert={!futureOpen} />
       </div>
 
       {newOpen && (
@@ -864,51 +1013,16 @@ function VoiceHome({
         </div>
       )}
 
-      {apiKeyOpen && (
-        <div className="voice-modal-backdrop" role="presentation">
-          <form className="voice-dialog api-key-dialog" onSubmit={(event) => void saveApiKey(event)}>
-            <div className="voice-dialog-header">
-              <h2>OpenAI API key</h2>
-              <button type="button" aria-label="Close" onClick={() => setApiKeyOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <p className="voice-dialog-note">
-              {state.realtime.available
-                ? `A key is configured from ${
-                    state.realtime.apiKeySource === "environment" ? "the environment" : "saved settings"
-                  }.`
-                : "Add a key to enable Realtime voice."}
-            </p>
-            <label className="voice-field">
-              API key
-              <input
-                autoFocus
-                type="password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder={state.realtime.available ? "Enter a new key to replace saved key" : "sk-..."}
-                autoComplete="off"
-                spellCheck={false}
-              />
-            </label>
-            <div className="voice-dialog-actions split-actions">
-              <button
-                type="button"
-                onClick={() => void clearApiKey()}
-              >
-                Clear saved key
-              </button>
-              <span />
-              <button type="button" onClick={() => setApiKeyOpen(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="voice-primary" disabled={!apiKey.trim()}>
-                Save
-              </button>
-            </div>
-          </form>
-        </div>
+      {apiKeyDialogMode && (
+        <ApiKeyDialog
+          mode={apiKeyDialogMode}
+          realtime={state.realtime}
+          realtimeIssue={realtimeIssue}
+          apiKey={apiKey}
+          onApiKeyChange={setApiKey}
+          onSubmit={saveApiKey}
+          onClose={closeApiKeyDialog}
+        />
       )}
 
       {archivedOpen && (
@@ -928,6 +1042,1043 @@ function VoiceHome({
         />
       )}
     </main>
+  );
+}
+
+function VoiceSettingsPane({
+  open,
+  state,
+  realtimeIssue,
+  apiKey,
+  archivedCount,
+  voiceConnected,
+  modelScope,
+  effectiveModel,
+  effectiveEffort,
+  effectivePermissionMode,
+  modelOptions,
+  orbPresetId,
+  onOrbPresetChange,
+  onClose,
+  onApiKeyChange,
+  onSaveApiKey,
+  onClearApiKey,
+  onAction,
+  onRefresh,
+  onShowDebug,
+  onOpenArchived,
+  onToggleVoice,
+}: {
+  open: boolean;
+  state: AppState;
+  realtimeIssue: string | null;
+  apiKey: string;
+  archivedCount: number;
+  voiceConnected: boolean;
+  modelScope: "chat" | "nextTurn";
+  effectiveModel: string;
+  effectiveEffort: ReasoningEffort;
+  effectivePermissionMode: CodexPermissionMode;
+  modelOptions: CodexModelSummary[];
+  orbPresetId: VoiceOrbPresetId;
+  onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
+  onClose: () => void;
+  onApiKeyChange: (value: string) => void;
+  onSaveApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+  onClearApiKey: () => Promise<void>;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onShowDebug: () => Promise<void>;
+  onOpenArchived: () => void;
+  onToggleVoice: () => Promise<void>;
+}): React.ReactElement {
+  const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("appearance");
+  const health = realtimeHealth(state.realtime, realtimeIssue);
+  const activeProject = state.activeProject;
+  const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
+  const hasApiKey = Boolean(apiKey.trim());
+  const selectedPreset = voiceOrbPresetById(orbPresetId);
+  const tabs: Array<{ id: VoiceSettingsTab; label: string; icon: React.ReactElement }> = [
+    { id: "general", label: "General", icon: <ConfigIcon /> },
+    { id: "appearance", label: "Appearance", icon: <AppearanceIcon /> },
+    { id: "configuration", label: "Configuration", icon: <PermissionIcon mode={effectivePermissionMode} /> },
+    { id: "archive", label: archivedCount > 0 ? `Archive (${archivedCount})` : "Archive", icon: <ArchiveIcon /> },
+  ];
+
+  return (
+    <aside className="voice-settings-pane" aria-hidden={!open} inert={!open} aria-label="Settings">
+      <div className="voice-settings-inner">
+        <header className="voice-settings-header">
+          <h2>Controls</h2>
+          <small>{selectedPreset.name} orb</small>
+        </header>
+
+        <nav className="voice-settings-nav" aria-label="Control sections" role="tablist">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={tab.id === activeTab ? "selected" : ""}
+              role="tab"
+              aria-selected={tab.id === activeTab}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.icon}
+              <span>{tab.label}</span>
+            </button>
+          ))}
+        </nav>
+
+        <div className="voice-settings-scroll" role="tabpanel">
+          {activeTab === "general" && (
+            <>
+              <section className="voice-settings-section">
+                <h3>System</h3>
+                <div className="voice-settings-card">
+                  <div className="voice-settings-row">
+                    <span>
+                      <strong>Codex app-server</strong>
+                      <small>{state.runtime.status}</small>
+                    </span>
+                    <StatusDot ready={state.runtime.ready} />
+                  </div>
+                  <div className="voice-settings-row">
+                    <span>
+                      <strong>Realtime voice</strong>
+                      <small>{health.message}</small>
+                    </span>
+                    <StatusDot ready={health.ok} />
+                  </div>
+                  <div className="voice-settings-row">
+                    <span>
+                      <strong>Workspace</strong>
+                      <small>{workspace}</small>
+                    </span>
+                  </div>
+                </div>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>OpenAI API key</h3>
+                <form className="voice-settings-card voice-settings-api-key" onSubmit={(event) => void onSaveApiKey(event)}>
+                  <label className="voice-settings-field">
+                    API key
+                    <input
+                      type="password"
+                      value={apiKey}
+                      onChange={(event) => onApiKeyChange(event.target.value)}
+                      placeholder={state.realtime.available ? "Saved key" : "sk-..."}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </label>
+                  <div className="voice-settings-actions inline">
+                    <button type="button" onClick={() => void onClearApiKey()}>
+                      Clear
+                    </button>
+                    <button type="submit" className="primary" disabled={!hasApiKey}>
+                      Save
+                    </button>
+                  </div>
+                </form>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Actions</h3>
+                <div className="voice-settings-card action-settings-card">
+                  <button type="button" className="voice-settings-action" onClick={() => void onRefresh()}>
+                    <RefreshIcon />
+                    <span>
+                      <strong>Refresh</strong>
+                      <small>Reload projects and runtime state</small>
+                    </span>
+                  </button>
+                  <button type="button" className="voice-settings-action" onClick={() => void onShowDebug()}>
+                    <DebugIcon />
+                    <span>
+                      <strong>Debug UI</strong>
+                      <small>Open the operator dashboard</small>
+                    </span>
+                  </button>
+                  {voiceConnected && (
+                    <button type="button" className="voice-settings-action" onClick={() => void onToggleVoice()}>
+                      <PowerIcon />
+                      <span>
+                        <strong>Disconnect voice</strong>
+                        <small>Stop the active Realtime session</small>
+                      </span>
+                    </button>
+                  )}
+                </div>
+              </section>
+            </>
+          )}
+
+          {activeTab === "appearance" && (
+              <section className="voice-settings-section">
+                <h3>Orb</h3>
+              <VoiceOrbPresetPicker value={orbPresetId} onChange={onOrbPresetChange} onDone={onClose} />
+              </section>
+          )}
+
+          {activeTab === "configuration" && (
+            <>
+              <section className="voice-settings-section">
+                <h3>Model</h3>
+                <div className="voice-settings-card">
+                  <label className="voice-settings-field">
+                    Model
+                    <span className="voice-settings-select-wrap">
+                      <select
+                        value={effectiveModel}
+                        onChange={(event) =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings({ model: event.target.value || null }, modelScope),
+                          )
+                        }
+                      >
+                        {modelOptions.length === 0 && (
+                          <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
+                        )}
+                        {modelOptions.map((model) => (
+                          <option key={model.id} value={model.model}>
+                            {model.displayName || formatModelName(model.model)}
+                          </option>
+                        ))}
+                      </select>
+                      <DownIcon />
+                    </span>
+                  </label>
+
+                  <div className="voice-settings-segmented" aria-label="Reasoning effort">
+                    {(["low", "medium", "high", "xhigh"] as ReasoningEffort[]).map((effort) => (
+                      <button
+                        key={effort}
+                        type="button"
+                        className={effort === effectiveEffort ? "selected" : ""}
+                        onClick={() =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings({ reasoningEffort: effort }, modelScope),
+                          )
+                        }
+                      >
+                        {formatEffort(effort)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Permissions</h3>
+                <div className="voice-settings-card permission-settings-card">
+                  {CODEX_PERMISSION_PROFILES.map((profile) => (
+                    <button
+                      key={profile.mode}
+                      type="button"
+                      className={`voice-settings-permission ${profile.mode === effectivePermissionMode ? "selected" : ""}`}
+                      onClick={() =>
+                        void onAction(() =>
+                          window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
+                        )
+                      }
+                    >
+                      <PermissionIcon mode={profile.mode} />
+                      <span>
+                        <strong>{profile.displayName}</strong>
+                        <small>{profile.description}</small>
+                      </span>
+                      {profile.mode === effectivePermissionMode && <CheckIcon />}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            </>
+          )}
+
+          {activeTab === "archive" && (
+            <section className="voice-settings-section">
+              <h3>Archive</h3>
+              <div className="voice-settings-card action-settings-card">
+                <button type="button" className="voice-settings-action" onClick={onOpenArchived}>
+                  <ArchiveIcon />
+                  <span>
+                    <strong>Archived items</strong>
+                    <small>{archivedCount > 0 ? `${archivedCount} archived items` : "No archived items"}</small>
+                  </span>
+                </button>
+              </div>
+            </section>
+          )}
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function VoiceOrbPresetPicker({
+  value,
+  onChange,
+  onDone,
+}: {
+  value: VoiceOrbPresetId;
+  onChange: (presetId: VoiceOrbPresetId) => void;
+  onDone: () => void;
+}): React.ReactElement {
+  const selectedPreset = voiceOrbPresetById(value);
+  const selectedIndex = Math.max(0, voiceOrbPresets.findIndex((preset) => preset.id === value));
+
+  function selectOffset(offset: number): void {
+    onChange(voiceOrbPresetAtOffset(value, offset));
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>): void {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      selectOffset(-1);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      selectOffset(1);
+    }
+  }
+
+  function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
+    if (Math.abs(event.deltaX) < 12 && Math.abs(event.deltaY) < 18) return;
+    event.preventDefault();
+    selectOffset(event.deltaX + event.deltaY > 0 ? 1 : -1);
+  }
+
+  return (
+    <div className="voice-settings-card voice-orb-picker-card">
+      <div
+        className="voice-orb-carousel"
+        tabIndex={0}
+        role="group"
+        aria-label="Choose orb design"
+        onKeyDown={handleKeyDown}
+        onWheel={handleWheel}
+      >
+        <button
+          type="button"
+          className="voice-orb-carousel-arrow previous"
+          aria-label="Previous orb"
+          onClick={() => selectOffset(-1)}
+        >
+          <ChevronLeftIcon />
+        </button>
+
+        <div className="voice-orb-carousel-center">
+          <div className={`voice-orb-carousel-preview ${selectedPreset.id}`}>
+            <VoiceOrbCanvas
+              tone="listening"
+              outputLevel={selectedPreset.previewLevel}
+              presetId={selectedPreset.id}
+              preview
+            />
+          </div>
+          <div className="voice-orb-carousel-label">
+            <strong>{selectedPreset.name}</strong>
+            <small>{selectedPreset.detail}</small>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          className="voice-orb-carousel-arrow next"
+          aria-label="Next orb"
+          onClick={() => selectOffset(1)}
+        >
+          <ChevronRightIcon />
+        </button>
+      </div>
+
+      <div className="voice-orb-carousel-dots" role="tablist" aria-label="Orb presets">
+        {voiceOrbPresets.map((preset, index) => (
+          <button
+            key={preset.id}
+            type="button"
+            className={preset.id === value ? "selected" : ""}
+            role="tab"
+            aria-selected={preset.id === value}
+            aria-label={`${preset.name} orb`}
+            onClick={() => onChange(preset.id)}
+          />
+        ))}
+      </div>
+
+      <div className="voice-orb-carousel-position" aria-hidden="true">
+        {selectedIndex + 1} / {voiceOrbPresets.length}
+      </div>
+
+      <button type="button" className="voice-orb-picker-done" onClick={onDone}>
+        Done
+      </button>
+    </div>
+  );
+}
+
+function StatusDot({ ready }: { ready: boolean }): React.ReactElement {
+  return <span className={`settings-status-dot ${ready ? "ready" : ""}`} aria-hidden="true" />;
+}
+
+function VoiceOrbCanvas({
+  tone,
+  outputLevel,
+  presetId,
+  preview = false,
+}: {
+  tone: VoiceTone;
+  outputLevel: number;
+  presetId: VoiceOrbPresetId;
+  preview?: boolean;
+}): React.ReactElement {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const toneRef = useRef(tone);
+  const outputLevelRef = useRef(outputLevel);
+  const presetIdRef = useRef(presetId);
+
+  useEffect(() => {
+    toneRef.current = tone;
+  }, [tone]);
+
+  useEffect(() => {
+    outputLevelRef.current = outputLevel;
+  }, [outputLevel]);
+
+  useEffect(() => {
+    presetIdRef.current = presetId;
+  }, [presetId]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const context = canvas.getContext("2d");
+    if (!context) return undefined;
+
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let animationFrame = 0;
+    let lastTime = performance.now();
+    let renderedLevel = 0;
+    let wavePhase = 0;
+    let cloudPhase = 0;
+    let pressImpulse = 0;
+    let wasActive = false;
+
+    const draw = (now: number) => {
+      const { width, height } = resizeOrbCanvas(canvas, context);
+      const dt = Math.min(48, Math.max(8, now - lastTime));
+      lastTime = now;
+
+      if (width < 4 || height < 4) {
+        animationFrame = window.requestAnimationFrame(draw);
+        return;
+      }
+
+      const preset = voiceOrbPresetById(presetIdRef.current);
+      const orb = canvas.closest(preview ? ".voice-orb-preset-option" : ".voice-orb") as HTMLElement | null;
+      const hovering = Boolean(orb?.matches(":hover, :focus-visible"));
+      const active = Boolean(orb?.matches(":active"));
+      if (active && !wasActive) pressImpulse = 1;
+      wasActive = active;
+
+      const reduced = reducedMotion.matches;
+      const toneEnergy = preview ? 0.16 : voiceToneBaseEnergy(toneRef.current);
+      const outputEnergy = Math.min(1, Math.max(0, outputLevelRef.current));
+      const interactionEnergy = reduced ? 0 : (hovering ? 0.18 : 0) + pressImpulse * 0.42;
+      const targetLevel = Math.min(1, Math.max(toneEnergy, outputEnergy) + interactionEnergy);
+      const smoothing = targetLevel > renderedLevel ? 0.22 : 0.075;
+      renderedLevel += (targetLevel - renderedLevel) * smoothing;
+      pressImpulse *= Math.pow(0.0018, dt / 1000);
+
+      const motion = reduced ? 0.08 : 1;
+      wavePhase += dt * (0.001 + renderedLevel * 0.0033) * motion;
+      cloudPhase += dt * (0.0002 + renderedLevel * 0.00075) * motion;
+
+      context.clearRect(0, 0, width, height);
+      context.save();
+      beginOrbShapePath(context, width, height, preset.shape);
+      context.clip();
+
+      drawOrbPresetBase(context, width, height, preset.id, renderedLevel, cloudPhase);
+      drawOrbClouds(context, width, height, renderedLevel, cloudPhase, hovering, preset.id);
+      const palette = orbWavePalette(preset.id);
+
+      drawOrbWaveLayer(context, width, height, {
+        baseline: height * (0.72 - renderedLevel * 0.18),
+        amplitude: 7 + renderedLevel * 25,
+        phase: wavePhase * 2.1,
+        frequency: 0.92,
+        secondFrequency: 2.2,
+        blur: 8,
+        alpha: 0.46 + renderedLevel * 0.26,
+        stops: palette.deep,
+      });
+
+      drawOrbWaveLayer(context, width, height, {
+        baseline: height * (0.62 - renderedLevel * 0.16),
+        amplitude: 5 + renderedLevel * 19,
+        phase: -wavePhase * 2.7 + 0.8,
+        frequency: 1.26,
+        secondFrequency: 2.85,
+        blur: 6,
+        alpha: 0.38 + renderedLevel * 0.24,
+        stops: palette.mid,
+      });
+
+      drawOrbWaveLayer(context, width, height, {
+        baseline: height * (0.52 - renderedLevel * 0.13),
+        amplitude: 3 + renderedLevel * 13,
+        phase: wavePhase * 3.15 + 2.4,
+        frequency: 0.7,
+        secondFrequency: 1.8,
+        blur: 10,
+        alpha: 0.2 + renderedLevel * 0.18,
+        stops: palette.mist,
+      });
+
+      drawOrbCrestLine(context, width, height, {
+        baseline: height * (0.55 - renderedLevel * 0.15),
+        amplitude: 3 + renderedLevel * 15,
+        phase: wavePhase * 3.4 + 1.2,
+        alpha: 0.22 + renderedLevel * 0.36,
+        stops: palette.crest,
+      });
+
+      context.restore();
+      drawOrbPresetEdge(context, width, height, preset.shape, preset.id, renderedLevel);
+      animationFrame = window.requestAnimationFrame(draw);
+    };
+
+    animationFrame = window.requestAnimationFrame(draw);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, []);
+
+  return <canvas ref={canvasRef} className="voice-orb-canvas" aria-hidden="true" />;
+}
+
+function voiceToneBaseEnergy(tone: VoiceTone): number {
+  if (tone === "connecting") return 0.33;
+  if (tone === "working") return 0.28;
+  if (tone === "listening") return 0.22;
+  if (tone === "waiting") return 0.2;
+  if (tone === "paused") return 0.04;
+  return 0.06;
+}
+
+function beginOrbShapePath(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  shape: VoiceOrbPreset["shape"],
+): void {
+  context.beginPath();
+  if (shape === "cloud") {
+    context.moveTo(width * 0.18, height * 0.63);
+    context.bezierCurveTo(width * 0.08, height * 0.57, width * 0.11, height * 0.39, width * 0.28, height * 0.37);
+    context.bezierCurveTo(width * 0.35, height * 0.18, width * 0.57, height * 0.14, width * 0.7, height * 0.3);
+    context.bezierCurveTo(width * 0.86, height * 0.27, width * 0.98, height * 0.42, width * 0.9, height * 0.57);
+    context.bezierCurveTo(width * 1.01, height * 0.65, width * 0.92, height * 0.82, width * 0.76, height * 0.8);
+    context.bezierCurveTo(width * 0.68, height * 0.96, width * 0.48, height * 0.92, width * 0.39, height * 0.81);
+    context.bezierCurveTo(width * 0.23, height * 0.86, width * 0.1, height * 0.75, width * 0.18, height * 0.63);
+    context.closePath();
+    return;
+  }
+
+  context.arc(width / 2, height / 2, Math.min(width, height) / 2 - 1, 0, Math.PI * 2);
+}
+
+function drawOrbPresetBase(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  presetId: VoiceOrbPresetId,
+  level: number,
+  phase: number,
+): void {
+  context.save();
+  if (presetId === "aurora") {
+    const base = context.createLinearGradient(0, height * 0.04, 0, height);
+    base.addColorStop(0, "rgba(255, 255, 250, 0.92)");
+    base.addColorStop(0.38, "rgba(225, 255, 255, 0.86)");
+    base.addColorStop(0.7, "rgba(68, 198, 255, 0.72)");
+    base.addColorStop(1, "rgba(0, 120, 255, 0.82)");
+    context.fillStyle = base;
+    context.fillRect(0, 0, width, height);
+    context.restore();
+    return;
+  }
+
+  if (presetId === "cloud") {
+    const base = context.createLinearGradient(0, height * 0.16, 0, height * 0.9);
+    base.addColorStop(0, "rgba(246, 252, 255, 0.96)");
+    base.addColorStop(0.28, "rgba(196, 239, 255, 0.92)");
+    base.addColorStop(0.62, "rgba(59, 154, 255, 0.92)");
+    base.addColorStop(1, "rgba(34, 50, 255, 0.96)");
+    context.fillStyle = base;
+    context.fillRect(0, 0, width, height);
+
+    context.globalCompositeOperation = "screen";
+    context.globalAlpha = 0.32 + level * 0.14;
+    context.fillStyle = "rgba(255, 255, 255, 0.75)";
+    context.beginPath();
+    context.ellipse(
+      width * (0.43 + Math.sin(phase) * 0.03),
+      height * 0.28,
+      width * 0.37,
+      height * 0.2,
+      -0.1,
+      0,
+      Math.PI * 2,
+    );
+    context.fill();
+    context.restore();
+    return;
+  }
+
+  const base = context.createRadialGradient(width * 0.47, height * 0.18, 0, width * 0.5, height * 0.52, width * 0.58);
+  base.addColorStop(0, "rgba(245, 252, 255, 0.72)");
+  base.addColorStop(0.36, "rgba(82, 128, 170, 0.48)");
+  base.addColorStop(0.7, "rgba(21, 30, 48, 0.9)");
+  base.addColorStop(1, "rgba(4, 7, 15, 0.98)");
+  context.fillStyle = base;
+  context.fillRect(0, 0, width, height);
+  context.restore();
+}
+
+function drawOrbPresetEdge(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  shape: VoiceOrbPreset["shape"],
+  presetId: VoiceOrbPresetId,
+  level: number,
+): void {
+  context.save();
+  beginOrbShapePath(context, width, height, shape);
+  context.globalCompositeOperation = "screen";
+  context.shadowColor =
+    presetId === "cloud"
+      ? "rgba(101, 193, 255, 0.68)"
+      : presetId === "aurora"
+        ? "rgba(161, 232, 255, 0.42)"
+        : "rgba(154, 227, 255, 0.44)";
+  context.shadowBlur = 8 + level * 16;
+  context.strokeStyle =
+    presetId === "cloud"
+      ? "rgba(205, 241, 255, 0.72)"
+      : presetId === "aurora"
+        ? "rgba(238, 255, 255, 0.52)"
+        : "rgba(213, 245, 255, 0.46)";
+  context.lineWidth = presetId === "cloud" ? 2.2 : 1.4;
+  context.stroke();
+  context.restore();
+}
+
+function orbWavePalette(presetId: VoiceOrbPresetId): {
+  deep: Array<[number, string]>;
+  mid: Array<[number, string]>;
+  mist: Array<[number, string]>;
+  crest: Array<[number, string]>;
+} {
+  if (presetId === "cloud") {
+    return {
+      deep: [
+        [0, "rgba(180, 247, 255, 0.08)"],
+        [0.35, "rgba(79, 208, 255, 0.36)"],
+        [0.72, "rgba(34, 103, 255, 0.74)"],
+        [1, "rgba(24, 39, 255, 0.92)"],
+      ],
+      mid: [
+        [0, "rgba(252, 255, 255, 0.22)"],
+        [0.4, "rgba(176, 227, 255, 0.46)"],
+        [0.78, "rgba(86, 128, 255, 0.52)"],
+        [1, "rgba(56, 90, 255, 0.64)"],
+      ],
+      mist: [
+        [0, "rgba(255, 255, 255, 0.46)"],
+        [0.5, "rgba(232, 249, 255, 0.28)"],
+        [1, "rgba(163, 221, 255, 0.16)"],
+      ],
+      crest: [
+        [0, "rgba(255, 255, 244, 0)"],
+        [0.25, "rgba(255, 255, 255, 0.82)"],
+        [0.58, "rgba(201, 236, 255, 0.72)"],
+        [1, "rgba(255, 255, 244, 0)"],
+      ],
+    };
+  }
+
+  if (presetId === "nocturne") {
+    return {
+      deep: [
+        [0, "rgba(164, 231, 255, 0.04)"],
+        [0.3, "rgba(65, 165, 212, 0.2)"],
+        [0.66, "rgba(31, 78, 139, 0.52)"],
+        [1, "rgba(12, 31, 74, 0.82)"],
+      ],
+      mid: [
+        [0, "rgba(243, 255, 255, 0.12)"],
+        [0.36, "rgba(148, 227, 255, 0.24)"],
+        [0.72, "rgba(36, 142, 206, 0.32)"],
+        [1, "rgba(19, 88, 164, 0.42)"],
+      ],
+      mist: [
+        [0, "rgba(232, 255, 255, 0.24)"],
+        [0.5, "rgba(162, 231, 255, 0.14)"],
+        [1, "rgba(84, 164, 220, 0.08)"],
+      ],
+      crest: [
+        [0, "rgba(203, 246, 255, 0)"],
+        [0.28, "rgba(203, 246, 255, 0.46)"],
+        [0.6, "rgba(143, 221, 255, 0.4)"],
+        [1, "rgba(203, 246, 255, 0)"],
+      ],
+    };
+  }
+
+  return {
+    deep: [
+      [0, "rgba(180, 247, 255, 0.08)"],
+      [0.28, "rgba(85, 219, 255, 0.28)"],
+      [0.58, "rgba(0, 151, 255, 0.68)"],
+      [1, "rgba(0, 84, 255, 0.88)"],
+    ],
+    mid: [
+      [0, "rgba(247, 255, 247, 0.2)"],
+      [0.34, "rgba(190, 251, 255, 0.42)"],
+      [0.72, "rgba(34, 190, 255, 0.52)"],
+      [1, "rgba(0, 117, 255, 0.62)"],
+    ],
+    mist: [
+      [0, "rgba(255, 255, 238, 0.36)"],
+      [0.46, "rgba(236, 255, 249, 0.26)"],
+      [1, "rgba(127, 232, 255, 0.18)"],
+    ],
+    crest: [
+      [0, "rgba(255, 255, 244, 0)"],
+      [0.24, "rgba(255, 255, 244, 0.7)"],
+      [0.58, "rgba(210, 255, 255, 0.62)"],
+      [1, "rgba(255, 255, 244, 0)"],
+    ],
+  };
+}
+
+function resizeOrbCanvas(
+  canvas: HTMLCanvasElement,
+  context: CanvasRenderingContext2D,
+): { width: number; height: number } {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const pixelWidth = Math.max(1, Math.round(rect.width * dpr));
+  const pixelHeight = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { width: rect.width, height: rect.height };
+}
+
+function drawOrbClouds(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  level: number,
+  phase: number,
+  hovering: boolean,
+  presetId: VoiceOrbPresetId,
+): void {
+  const lift = level * height * 0.08;
+  const hoverLift = hovering ? height * 0.015 : 0;
+  const cloudAlpha = presetId === "nocturne" ? 0.2 : 0.42;
+  const cloudWhite = presetId === "nocturne" ? "rgba(210, 246, 255, 0.4)" : "rgba(255, 255, 246, 0.7)";
+
+  context.save();
+  context.globalCompositeOperation = "screen";
+  context.filter = `blur(${8 + level * 5}px)`;
+  context.globalAlpha = cloudAlpha + level * 0.26;
+
+  const topGradient = context.createRadialGradient(
+    width * (0.46 + Math.sin(phase * 0.9) * 0.05),
+    height * (0.2 + Math.cos(phase * 0.7) * 0.025),
+    0,
+    width * 0.5,
+    height * 0.22,
+    width * 0.58,
+  );
+  topGradient.addColorStop(0, cloudWhite);
+  topGradient.addColorStop(0.48, "rgba(220, 255, 252, 0.28)");
+  topGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+  context.fillStyle = topGradient;
+  context.beginPath();
+  context.ellipse(width * 0.5, height * 0.22, width * 0.5, height * 0.24, -0.05, 0, Math.PI * 2);
+  context.fill();
+
+  const cloudGradient = context.createRadialGradient(
+    width * (0.25 + Math.sin(phase * 1.5) * 0.055),
+    height * 0.5 - lift - hoverLift,
+    0,
+    width * 0.36,
+    height * 0.53 - lift,
+    width * 0.58,
+  );
+  cloudGradient.addColorStop(0, "rgba(255, 254, 230, 0.46)");
+  cloudGradient.addColorStop(0.35, "rgba(205, 252, 255, 0.3)");
+  cloudGradient.addColorStop(0.72, "rgba(88, 218, 255, 0.12)");
+  cloudGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+  context.fillStyle = cloudGradient;
+  context.beginPath();
+  context.ellipse(width * 0.38, height * 0.53 - lift, width * 0.48, height * 0.2, -0.2, 0, Math.PI * 2);
+  context.fill();
+
+  context.restore();
+}
+
+function drawOrbWaveLayer(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  options: {
+    baseline: number;
+    amplitude: number;
+    phase: number;
+    frequency: number;
+    secondFrequency: number;
+    blur: number;
+    alpha: number;
+    stops: Array<[number, string]>;
+  },
+): void {
+  context.save();
+  context.filter = `blur(${options.blur}px)`;
+  context.globalAlpha = options.alpha;
+  context.globalCompositeOperation = "source-over";
+  context.beginPath();
+  context.moveTo(-20, height + 20);
+
+  for (let x = -20; x <= width + 20; x += 3) {
+    const unit = x / width;
+    const y =
+      options.baseline +
+      Math.sin(unit * Math.PI * 2 * options.frequency + options.phase) * options.amplitude +
+      Math.sin(unit * Math.PI * 2 * options.secondFrequency - options.phase * 0.72) * options.amplitude * 0.38 +
+      Math.sin(unit * Math.PI * 2 * 0.5 + options.phase * 1.6) * options.amplitude * 0.16;
+    context.lineTo(x, y);
+  }
+
+  context.lineTo(width + 20, height + 20);
+  context.closePath();
+
+  const gradient = context.createLinearGradient(0, options.baseline - options.amplitude * 2, 0, height);
+  for (const [offset, color] of options.stops) {
+    gradient.addColorStop(offset, color);
+  }
+  context.fillStyle = gradient;
+  context.fill();
+  context.restore();
+}
+
+function drawOrbCrestLine(
+  context: CanvasRenderingContext2D,
+  width: number,
+  _height: number,
+  options: {
+    baseline: number;
+    amplitude: number;
+    phase: number;
+    alpha: number;
+    stops: Array<[number, string]>;
+  },
+): void {
+  context.save();
+  context.filter = "blur(3px)";
+  context.globalCompositeOperation = "screen";
+  context.globalAlpha = options.alpha;
+  context.beginPath();
+
+  for (let x = -8; x <= width + 8; x += 2) {
+    const unit = x / width;
+    const y =
+      options.baseline +
+      Math.sin(unit * Math.PI * 2 * 0.95 + options.phase) * options.amplitude +
+      Math.sin(unit * Math.PI * 2 * 2.4 - options.phase * 0.6) * options.amplitude * 0.28;
+    if (x === -8) {
+      context.moveTo(x, y);
+    } else {
+      context.lineTo(x, y);
+    }
+  }
+
+  const gradient = context.createLinearGradient(0, 0, width, 0);
+  for (const [offset, color] of options.stops) {
+    gradient.addColorStop(offset, color);
+  }
+  context.strokeStyle = gradient;
+  context.lineWidth = 3.2;
+  context.lineCap = "round";
+  context.stroke();
+  context.restore();
+}
+
+function ApiKeyDialog({
+  mode,
+  realtime,
+  realtimeIssue,
+  apiKey,
+  onApiKeyChange,
+  onSubmit,
+  onClose,
+}: {
+  mode: ApiKeyDialogMode;
+  realtime: AppState["realtime"];
+  realtimeIssue: string | null;
+  apiKey: string;
+  onApiKeyChange: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+  onClose: () => void;
+}): React.ReactElement {
+  const [revealed, setRevealed] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [waveDancing, setWaveDancing] = useState(false);
+  const waveDanceTimeoutRef = useRef<number | null>(null);
+  const title = mode === "onboarding" ? "Connect OpenAI" : "OpenAI API key";
+  const primaryLabel = mode === "onboarding" ? "Save key" : "Save";
+  const secondaryLabel = mode === "onboarding" ? "Later" : "Cancel";
+  const hasApiKey = Boolean(apiKey.trim());
+  const health = realtimeHealth(realtime, realtimeIssue);
+
+  useEffect(() => {
+    if (!copied) return undefined;
+    const timeoutId = window.setTimeout(() => setCopied(false), 1600);
+    return () => window.clearTimeout(timeoutId);
+  }, [copied]);
+
+  useEffect(
+    () => () => {
+      if (waveDanceTimeoutRef.current !== null) {
+        window.clearTimeout(waveDanceTimeoutRef.current);
+      }
+    },
+    [],
+  );
+
+  function startWaveDance(): void {
+    if (waveDancing) return;
+    setWaveDancing(true);
+    if (waveDanceTimeoutRef.current !== null) {
+      window.clearTimeout(waveDanceTimeoutRef.current);
+    }
+    waveDanceTimeoutRef.current = window.setTimeout(() => {
+      setWaveDancing(false);
+      waveDanceTimeoutRef.current = null;
+    }, 1280);
+  }
+
+  async function copyApiKey(): Promise<void> {
+    if (!hasApiKey) return;
+    try {
+      await navigator.clipboard.writeText(apiKey);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="voice-modal-backdrop api-key-backdrop" role="presentation">
+      <form className="voice-dialog api-key-dialog" onSubmit={(event) => void onSubmit(event)}>
+        <div className="api-key-visual" aria-hidden="true">
+          <span
+            className={`api-key-meter ${waveDancing ? "dancing" : ""}`}
+            onPointerEnter={startWaveDance}
+            onFocus={startWaveDance}
+          >
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </span>
+        </div>
+
+        <div className="voice-dialog-header api-key-header">
+          <div>
+            <div className="api-key-title-row">
+              <h2>{title}</h2>
+              <span
+                className={`api-key-status ${health.ok ? "ready" : "broken"}`}
+                tabIndex={health.ok ? undefined : 0}
+                aria-label={health.ok ? "Realtime API key is ready" : health.message}
+                title={health.ok ? "Realtime API key is ready" : undefined}
+              >
+                {!health.ok && <span className="api-key-health-popover">{health.message}</span>}
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="api-key-info-button"
+            aria-label="API key storage details"
+            title="Storage details"
+            onClick={() => setInfoOpen((current) => !current)}
+          >
+            <InfoIcon />
+          </button>
+          {infoOpen && (
+            <div className="api-key-info-popover" role="status">
+              Stored locally with Electron safeStorage when available. OPENAI_API_KEY takes
+              precedence.
+            </div>
+          )}
+        </div>
+
+        <div className="voice-field api-key-field">
+          <div className="api-key-input-wrap">
+            <input
+              id="openai-api-key-input"
+              aria-label="OpenAI API key"
+              autoFocus
+              type={revealed ? "text" : "password"}
+              value={apiKey}
+              onChange={(event) => onApiKeyChange(event.target.value)}
+              placeholder={realtime.available ? "Saved key" : "sk-..."}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <div className="api-key-input-actions">
+              <button
+                type="button"
+                aria-label={revealed ? "Hide API key" : "Reveal API key"}
+                title={revealed ? "Hide key" : "Reveal key"}
+                disabled={!hasApiKey}
+                onClick={() => setRevealed((current) => !current)}
+              >
+                {revealed ? <EyeOffIcon /> : <EyeIcon />}
+              </button>
+              <button
+                type="button"
+                aria-label="Copy API key"
+                title="Copy key"
+                disabled={!hasApiKey}
+                onClick={() => void copyApiKey()}
+              >
+                {copied ? <CheckIcon /> : <CopyIcon />}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="voice-dialog-actions api-key-actions">
+          <button type="button" onClick={onClose}>
+            {secondaryLabel}
+          </button>
+          <button type="submit" className="voice-primary" disabled={!hasApiKey}>
+            {primaryLabel}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -1219,7 +2370,7 @@ function DebugDashboard({
   const projects = state.projects;
   const activeProject = state.activeProject;
   const activeProjectId = state.runtime.activeProjectId;
-  const activeFolder = activeProject?.folderPath ?? "No active project.";
+  const activeFolder = activeProject?.workspacePath ?? "No active project.";
   const activeChatName =
     (activeProject?.chats ?? []).find((chat) => chat.id === state.runtime.activeChatId && !chat.archivedAt)
       ?.displayName ?? "none";
@@ -1256,7 +2407,7 @@ function DebugDashboard({
           <code>{state.baseFolder || "Loading..."}</code>
         </div>
         <div>
-          <span className="label">Active folder</span>
+          <span className="label">Workspace</span>
           <code>{activeFolder}</code>
         </div>
       </section>
@@ -1433,7 +2584,8 @@ function voiceStateLabel(
   voiceConnected: boolean,
   voiceConnecting: boolean,
   voicePaused: boolean,
-): { label: string; tone: "off" | "listening" | "working" | "connecting" | "paused" | "waiting" } {
+): { label: string; tone: VoiceTone } {
+  if (!state.realtime.available) return { label: "API key needed", tone: "off" };
   if (voiceConnecting) return { label: "Connecting", tone: "connecting" };
   if (state.runtime.pendingRequests.length > 0) return { label: "Needs input", tone: "waiting" };
   if (voiceConnected && voicePaused && state.runtime.activeTurnId) {
@@ -1451,6 +2603,7 @@ function voiceOrbAriaLabel(
   voiceConnecting: boolean,
   voicePaused: boolean,
 ): string {
+  if (!state.realtime.available) return "Set up OpenAI API key";
   if (voiceConnecting) return "Voice connecting";
   if (state.runtime.pendingRequests.length > 0) return "Respond to pending Codex request";
   if (voiceConnected && voicePaused && state.runtime.activeTurnId) {
@@ -1488,6 +2641,69 @@ function archivedChatsForProjects(projects: VoiceProject[]): ArchivedChat[] {
         chat,
       })),
   );
+}
+
+function realtimeHealth(
+  realtime: AppState["realtime"],
+  realtimeIssue: string | null,
+): { ok: boolean; message: string } {
+  if (!realtime.available) {
+    return {
+      ok: false,
+      message: "No OpenAI API key is configured. Add a key here, then save it to enable voice.",
+    };
+  }
+  if (realtimeIssue) {
+    return {
+      ok: false,
+      message: friendlyRealtimeIssue(realtimeIssue),
+    };
+  }
+  return { ok: true, message: "Realtime API key is ready." };
+}
+
+function friendlyRealtimeIssue(issue: string): string {
+  const message = openAiErrorMessage(issue);
+  const haystack = `${issue} ${message ?? ""}`.toLowerCase();
+
+  if (
+    haystack.includes("insufficient_quota") ||
+    haystack.includes("quota") ||
+    haystack.includes("billing") ||
+    haystack.includes("credits")
+  ) {
+    return "OpenAI rejected the Realtime session because the account is out of quota or billing is not active. Check credits or billing, then try again.";
+  }
+  if (haystack.includes("invalid_api_key") || haystack.includes("incorrect api key") || haystack.includes("401")) {
+    return "OpenAI rejected this API key. Check that it is copied correctly and still active.";
+  }
+  if (haystack.includes("permission") || haystack.includes("forbidden") || haystack.includes("403")) {
+    return "This key does not appear to have access to Realtime sessions. Check the project permissions or use another key.";
+  }
+  if (haystack.includes("network") || haystack.includes("failed to fetch") || haystack.includes("fetch failed")) {
+    return "Codex Voice could not reach OpenAI. Check the network connection, then try again.";
+  }
+  if (message) {
+    return `OpenAI reported: ${message}`;
+  }
+  return `Realtime voice could not start. ${shortenStatus(issue)}`;
+}
+
+function openAiErrorMessage(issue: string): string | null {
+  const jsonStart = issue.indexOf("{");
+  if (jsonStart < 0) return null;
+  try {
+    const parsed = JSON.parse(issue.slice(jsonStart)) as {
+      error?: { message?: unknown };
+    };
+    return typeof parsed.error?.message === "string" ? parsed.error.message : null;
+  } catch {
+    return null;
+  }
+}
+
+function shortenStatus(value: string): string {
+  return value.replace(/^Realtime session creation failed:\s*/i, "").slice(0, 220);
 }
 
 function formatProjectTime(iso: string): string {
@@ -1569,12 +2785,120 @@ function CheckIcon(): React.ReactElement {
   );
 }
 
-function ShieldIcon(): React.ReactElement {
+function LeftPaneIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 3.5 18.5 6v5.4c0 4.25-2.6 7.15-6.5 9.1-3.9-1.95-6.5-4.85-6.5-9.1V6L12 3.5Z" />
-      <path d="M12 8.2v4.25" />
-      <path d="M12 15.8h.01" />
+      <rect x="4.6" y="4.4" width="14.8" height="15.2" rx="3" />
+      <path d="M9.6 7.2v9.6" />
+    </svg>
+  );
+}
+
+function RightPaneIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="4.6" y="4.4" width="14.8" height="15.2" rx="3" />
+      <path d="M14.4 7.2v9.6" />
+    </svg>
+  );
+}
+
+function RefreshIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M20 6v5h-5" />
+      <path d="M4 18v-5h5" />
+      <path d="M18.4 9A6.6 6.6 0 0 0 6.7 7.1L4 10" />
+      <path d="M5.6 15A6.6 6.6 0 0 0 17.3 16.9L20 14" />
+    </svg>
+  );
+}
+
+function ArchiveIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4.5 6.5h15" />
+      <path d="M6.25 6.5v11.25a2 2 0 0 0 2 2h7.5a2 2 0 0 0 2-2V6.5" />
+      <path d="M8.5 3.75h7a2 2 0 0 1 2 2v.75h-11v-.75a2 2 0 0 1 2-2Z" />
+      <path d="M9.5 11.5h5" />
+    </svg>
+  );
+}
+
+function DebugIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M7 8.75h10" />
+      <path d="M8.5 4.75h7" />
+      <path d="M5.75 11.5v2.25a6.25 6.25 0 0 0 12.5 0V11.5" />
+      <path d="M3.5 13h17" />
+      <path d="M6.25 18.25 4.75 20" />
+      <path d="m17.75 18.25 1.5 1.75" />
+    </svg>
+  );
+}
+
+function PowerIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3.75v8" />
+      <path d="M7.15 6.95A7.5 7.5 0 1 0 16.85 7" />
+    </svg>
+  );
+}
+
+function AppearanceIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3.9c1.85 2.5 3.95 3.92 7.1 4.25-2.5 1.85-3.92 3.95-4.25 7.1-1.85-2.5-3.95-3.92-7.1-4.25 2.5-1.85 3.92-3.95 4.25-7.1Z" />
+      <path d="M6.3 14.7c.76 1.03 1.63 1.62 2.95 1.76-1.03.76-1.62 1.63-1.76 2.95-.76-1.03-1.63-1.62-2.95-1.76 1.03-.76 1.62-1.63 1.76-2.95Z" />
+    </svg>
+  );
+}
+
+function PermissionIcon({ mode }: { mode: CodexPermissionMode }): React.ReactElement {
+  if (mode === "default") return <DefaultPermissionsIcon />;
+  if (mode === "auto-review") return <AutoReviewIcon />;
+  if (mode === "custom-config") return <ConfigIcon />;
+  return <FullAccessIcon />;
+}
+
+function DefaultPermissionsIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M7.85 11.75V7.05a1.34 1.34 0 0 1 2.68 0v4.25" />
+      <path d="M10.53 11.1V5.75a1.34 1.34 0 0 1 2.68 0v5.4" />
+      <path d="M13.21 11.35V6.55a1.34 1.34 0 0 1 2.68 0v5.25" />
+      <path d="M15.89 12.2V8.35a1.3 1.3 0 0 1 2.6 0v5.35c0 4.05-2.55 6.55-6.42 6.55h-.95c-2.38 0-4-.96-5.2-2.62l-1.96-2.78a1.34 1.34 0 0 1 2.18-1.55l1.8 2.15" />
+    </svg>
+  );
+}
+
+function AutoReviewIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M12 3.6 18.35 6v5.35c0 4.08-2.52 6.92-6.35 8.85-3.83-1.93-6.35-4.77-6.35-8.85V6L12 3.6Z" />
+      <path d="m9.45 10.25 1.9 1.75-1.9 1.75" />
+      <path d="M13.15 14h2.25" />
+    </svg>
+  );
+}
+
+function FullAccessIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M12 3.6 18.35 6v5.35c0 4.08-2.52 6.92-6.35 8.85-3.83-1.93-6.35-4.77-6.35-8.85V6L12 3.6Z" />
+      <path d="M12 8.35v4.3" />
+      <path d="M12 16.15h.01" />
+    </svg>
+  );
+}
+
+function ConfigIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M12 9.25a2.75 2.75 0 1 1 0 5.5 2.75 2.75 0 0 1 0-5.5Z" />
+      <path d="M19.35 13.7a7.9 7.9 0 0 0 .05-3.4l2.05-1.5-2-3.45-2.52 1.04a7.85 7.85 0 0 0-2.9-1.67L13.65 2h-3.3l-.38 2.72a7.85 7.85 0 0 0-2.9 1.67L4.55 5.35l-2 3.45 2.05 1.5a7.9 7.9 0 0 0 .05 3.4L2.6 15.2l2 3.45 2.47-1.02a7.85 7.85 0 0 0 2.9 1.65l.38 2.72h3.3l.38-2.72a7.85 7.85 0 0 0 2.9-1.65l2.47 1.02 2-3.45-2.05-1.5Z" />
     </svg>
   );
 }
@@ -1589,6 +2913,18 @@ function ChevronIcon({ className }: { className?: string } = {}): React.ReactEle
       <path d="m9 5.5 6.5 6.5L9 18.5" />
     </svg>
   );
+}
+
+function ChevronLeftIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="voice-chevron">
+      <path d="M15 5.5 8.5 12l6.5 6.5" />
+    </svg>
+  );
+}
+
+function ChevronRightIcon(): React.ReactElement {
+  return <ChevronIcon />;
 }
 
 function SwitchIcon(): React.ReactElement {
@@ -1607,20 +2943,49 @@ function WaveformIcon(): React.ReactElement {
   );
 }
 
-function EllipsisIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="ellipsis-icon">
-      <circle cx="6.5" cy="12" r="1.45" />
-      <circle cx="12" cy="12" r="1.45" />
-      <circle cx="17.5" cy="12" r="1.45" />
-    </svg>
-  );
-}
-
 function CloseIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m6.5 6.5 11 11M17.5 6.5l-11 11" />
+    </svg>
+  );
+}
+
+function InfoIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 10.75v5.5" />
+      <path d="M12 7.75h.01" />
+      <path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z" />
+    </svg>
+  );
+}
+
+function EyeIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3.5 12s3.15-5.5 8.5-5.5 8.5 5.5 8.5 5.5-3.15 5.5-8.5 5.5S3.5 12 3.5 12Z" />
+      <path d="M12 14.45a2.45 2.45 0 1 0 0-4.9 2.45 2.45 0 0 0 0 4.9Z" />
+    </svg>
+  );
+}
+
+function EyeOffIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m4 4 16 16" />
+      <path d="M9.2 6.95A8.88 8.88 0 0 1 12 6.5c5.35 0 8.5 5.5 8.5 5.5a14.7 14.7 0 0 1-2.7 3.24" />
+      <path d="M14.15 14.3a2.45 2.45 0 0 1-3.45-3.45" />
+      <path d="M6.2 8.7A14.7 14.7 0 0 0 3.5 12s3.15 5.5 8.5 5.5c1.02 0 1.96-.2 2.8-.54" />
+    </svg>
+  );
+}
+
+function CopyIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="8.25" y="8.25" width="11" height="11" rx="2" />
+      <path d="M5.75 15.75h-.5a2 2 0 0 1-2-2v-8.5a2 2 0 0 1 2-2h8.5a2 2 0 0 1 2 2v.5" />
     </svg>
   );
 }
