@@ -1,41 +1,37 @@
-# Codex Voice Agent
+# Codex Voice
 
-A local Electron and TypeScript app that lets you talk to Codex through OpenAI
-Realtime voice. The Realtime model is the voice/control layer; Codex app-server
-is the computer-use agent that owns local execution, approvals, questions,
-project state, and tool work.
+![Codex Voice](./docs/assets/codex-voice-readme-banner.png)
 
-## What it does
+Codex Voice is a local desktop app that lets you talk to Codex through OpenAI
+Realtime voice. Realtime handles the voice/control layer; `codex app-server`
+owns local execution, approvals, questions, project state, and tool work.
 
-- Opens a compact voice window for speaking requests to Codex.
-- Starts, resumes, summarizes, interrupts, and steers Codex app-server turns.
-- Stores per-project workspaces under `~/Documents/Codex Voice Projects/`.
-- Forwards Codex approval and tool-question requests back through the UI and
-  voice layer.
-- Uses OpenAI Realtime for audio input/output and `codex app-server` for the
-  actual local work.
+## Features
 
-## Debugging
-
-This repo is still early, so the app includes a debugging-oriented window rather
-than a polished management surface. It shows project state, chats, runtime
-status, events, pending approvals, and manual send/steer controls.
+- Compact voice window for speaking requests to Codex.
+- Project creation, resume, summarize, interrupt, and steer flows for
+  `codex app-server` turns.
+- Per-project workspaces stored under `~/Documents/Codex Voice Projects/`.
+- Approval and tool-question forwarding between Codex, the UI, and the voice
+  layer.
+- Debug window for project state, chats, runtime status, events, pending
+  approvals, and manual send/steer controls.
 
 ## Requirements
 
-- Node.js and npm.
-- A Codex CLI install available on `PATH` with `codex app-server` support.
-- An OpenAI API key for Realtime voice.
+- Node.js and npm
+- Codex CLI on `PATH` with `codex app-server` support
+- OpenAI API key for Realtime voice
 
 ## Setup
 
-Install dependencies:
+Install dependencies.
 
 ```sh
 npm install
 ```
 
-Configure an OpenAI API key in one of two ways:
+Configure an OpenAI API key in one of two ways.
 
 - Set `OPENAI_API_KEY` in the environment before launching the app.
 - Add the key from the app menu after launch. The app can store it through the
@@ -51,29 +47,30 @@ export OPENAI_REALTIME_REASONING_EFFORT=low
 
 The app also exposes a Realtime model selector in Settings, with
 `gpt-realtime-2` and `gpt-realtime-1.5` available. GPT Realtime 2 is the default
-and supports low, medium, or high reasoning effort for voice sessions.
+and supports minimal, low, medium, high, or xhigh reasoning effort for voice
+sessions.
 
 ## Development
 
-Run the app in development mode:
+Run the app in development mode.
 
 ```sh
 npm run dev
 ```
 
-Typecheck:
+Typecheck.
 
 ```sh
 npm run typecheck
 ```
 
-Build:
+Build.
 
 ```sh
 npm run build
 ```
 
-Preview the built Electron app:
+Preview the built desktop app.
 
 ```sh
 npm run preview
