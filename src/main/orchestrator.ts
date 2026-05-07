@@ -22,6 +22,7 @@ import type {
   PendingRequestQuestion,
   PendingRequestQuestionOption,
   PendingCodexRequest,
+  RealtimeReasoningEffort,
   ReasoningEffort,
   ToolQuestionAnswer,
   VoiceExecCommandArgs,
@@ -36,7 +37,7 @@ import {
   DEFAULT_CODEX_REASONING_EFFORT,
 } from "../shared/types";
 import { CodexBridge, type CodexJsonMessage } from "./codexBridge";
-import { createRealtimeClientSecret, realtimeConfig } from "./realtime";
+import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
 import { ProjectStore } from "./projectStore";
 
 type TurnWaiter = {
@@ -685,6 +686,20 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return formatVoiceExecResult(session, startedAt, args.max_output_tokens, true);
   }
 
+  async terminateVoiceExecSession(sessionId: number): Promise<void> {
+    const session = this.voiceExecSessions.get(sessionId);
+    if (!session || session.completedAt) return;
+    await this.codex.request("command/exec/terminate", {
+      processId: session.processId,
+    });
+    await waitForVoiceSession(session, 500);
+    this.emitEvent("app", "voiceExecTerminated", `Terminated voice exec session ${sessionId}.`, {
+      sessionId,
+      processId: session.processId,
+    });
+    this.emitState();
+  }
+
   async applyPatchForVoice(input: string): Promise<VoiceExecCommandResult> {
     if (!input.trim()) throw new Error("apply_patch input is required.");
     return this.runVoiceCommand(["apply_patch", input], {
@@ -772,6 +787,20 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 
   createRealtimeClientSecret = createRealtimeClientSecret;
+
+  async setRealtimeSettings(settings: {
+    model?: AppState["realtime"]["model"] | null;
+    voice?: AppState["realtime"]["voice"] | null;
+    reasoningEffort?: RealtimeReasoningEffort | null;
+  }): Promise<AppState["realtime"]> {
+    const config = saveRealtimeSettings(settings);
+    this.status = `Updated Realtime voice: ${config.model}, ${config.voice}, reasoning ${
+      config.reasoningEffort ?? "none"
+    }.`;
+    this.emitEvent("app", "settingsChanged", this.status, config);
+    this.emitState();
+    return config;
+  }
 
   private async runVoiceCommand(
     command: string[],
@@ -1049,7 +1078,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       this.status = status;
       this.emitEvent("codex", method, status, message.params);
       if (threadId) this.updateChatForThread(threadId, { lastStatus: status });
-    } else if (method !== "item/agentMessage/delta" && method !== "command/exec/outputDelta") {
+    } else if (method !== "command/exec/outputDelta") {
       this.emitEvent("codex", method, method, message.params);
     }
 
@@ -1104,8 +1133,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           this.activeTurnByThread.delete(completedThreadId);
           this.activeTurnModelByThread.delete(completedThreadId);
           this.activeTurnReasoningEffortByThread.delete(completedThreadId);
-          const lastStatus = turn.status === "failed" ? "Codex turn failed." : "Codex finished.";
-          if (turn.id) {
+          this.activeTurnPermissionModeByThread.delete(completedThreadId);
+          const lastStatus = completedTurnStatusText(turn.status);
+          const cleared = this.clearPendingRequestsForTurn(completedThreadId, turn.id);
+          if (cleared > 0) {
+            this.emitEvent("app", "pendingRequestsCleared", `Cleared ${cleared} pending Codex request${cleared === 1 ? "" : "s"} for the ended turn.`, {
+              threadId: completedThreadId,
+              turnId: turn.id,
+            });
+          }
+          if (turn.id && turn.status !== "interrupted") {
             void this.captureCompletedTurnOutput(completedThreadId, turn.id, lastStatus);
           } else {
             this.updateChatForThread(completedThreadId, { lastStatus });
@@ -1120,6 +1157,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           this.turnWaiters.delete(turn.id);
           if (turn.status === "failed") {
             waiter.reject(new Error(turn.error?.message ?? "Codex summary turn failed."));
+          } else if (turn.status === "interrupted") {
+            waiter.reject(new Error("Codex summary turn was interrupted."));
           } else {
             waiter.resolve(waiter.text.trim() || "Codex finished, but no summary text was returned.");
           }
@@ -1143,6 +1182,17 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     }
   }
 
+  private clearPendingRequestsForTurn(threadId: string, turnId?: string): number {
+    let cleared = 0;
+    for (const [requestId, request] of this.pendingRequests.entries()) {
+      if (request.threadId !== threadId) continue;
+      if (turnId && request.turnId && request.turnId !== turnId) continue;
+      this.pendingRequests.delete(requestId);
+      cleared += 1;
+    }
+    return cleared;
+  }
+
   private waitForTurnText(turnId: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -1162,7 +1212,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       const turn = response.thread?.turns?.find((candidate) => candidate.id === turnId);
       if (!turn) {
         await this.updateCompletedTurnStatus(threadId, lastStatus);
-        this.emitEvent("app", "turnOutputUnavailable", "Codex completed, but thread/read did not include the completed turn.", {
+        this.emitEvent("app", "turnOutputUnavailable", "Codex turn ended, but thread/read did not include the completed turn.", {
+          threadId,
+          turnId,
+        });
+        return;
+      }
+
+      if (turn.status === "interrupted") {
+        await this.updateCompletedTurnStatus(threadId, lastStatus);
+        this.emitEvent("app", "turnOutputSkipped", "Codex turn was interrupted; partial output was not injected into voice context.", {
           threadId,
           turnId,
         });
@@ -1172,7 +1231,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       const finalAssistantText = finalAssistantTextFromTurn(turn);
       if (!finalAssistantText) {
         await this.updateCompletedTurnStatus(threadId, lastStatus);
-        this.emitEvent("app", "turnOutputUnavailable", "Codex completed, but no final assistant output was available.", {
+        this.emitEvent("app", "turnOutputUnavailable", "Codex turn ended, but no final assistant output was available.", {
           threadId,
           turnId,
           status: turn.status,
@@ -1185,6 +1244,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         turnId,
         status: turn.status ?? "completed",
         finalAssistantText,
+        items: Array.isArray(turn.items) ? turn.items : [],
         startedAt: numberOrNull(turn.startedAt),
         completedAt: numberOrNull(turn.completedAt),
         durationMs: numberOrNull(turn.durationMs),
@@ -2382,7 +2442,7 @@ function statusFromNotification(method: string, params?: Record<string, unknown>
   if (method === "turn/started") return "Codex started working.";
   if (method === "turn/completed") {
     const turn = (params?.turn ?? {}) as { status?: string };
-    return turn.status === "failed" ? "Codex turn failed." : "Codex finished.";
+    return completedTurnStatusText(turn.status);
   }
   if (method === "item/started") {
     const item = (params?.item ?? {}) as { type?: string; command?: string; server?: string; tool?: string; query?: string };
@@ -2403,6 +2463,12 @@ function statusFromNotification(method: string, params?: Record<string, unknown>
   if (method === "serverRequest/resolved") return "Codex request resolved.";
   if (method === "error") return "Codex reported an error.";
   return null;
+}
+
+function completedTurnStatusText(status: unknown): string {
+  if (status === "failed") return "Codex turn failed.";
+  if (status === "interrupted") return "Codex interrupted.";
+  return "Codex finished.";
 }
 
 function stringField(value: unknown): string | undefined {

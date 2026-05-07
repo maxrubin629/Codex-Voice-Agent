@@ -3,6 +3,81 @@ export type CodexApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "n
 export type CodexApprovalsReviewer = "user" | "auto_review";
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexPermissionMode = "default" | "auto-review" | "full-access" | "custom-config";
+export type RealtimeReasoningEffort = Extract<ReasoningEffort, "low" | "medium" | "high">;
+
+export const REALTIME_MODEL_OPTIONS = [
+  {
+    model: "gpt-realtime-2",
+    displayName: "GPT Realtime 2",
+    description: "Reasoning voice model",
+  },
+  {
+    model: "gpt-realtime-1.5",
+    displayName: "GPT Realtime 1.5",
+    description: "Flagship audio model",
+  },
+] as const;
+
+export type RealtimeModelId = (typeof REALTIME_MODEL_OPTIONS)[number]["model"];
+export const DEFAULT_REALTIME_MODEL: RealtimeModelId = "gpt-realtime-2";
+
+export const REALTIME_VOICE_OPTIONS = [
+  {
+    voice: "marin",
+    displayName: "Marin",
+    description: "Warm and composed",
+  },
+  {
+    voice: "cedar",
+    displayName: "Cedar",
+    description: "Grounded and calm",
+  },
+  {
+    voice: "verse",
+    displayName: "Verse",
+    description: "Bright and fluid",
+  },
+  {
+    voice: "coral",
+    displayName: "Coral",
+    description: "Clear and lively",
+  },
+  {
+    voice: "sage",
+    displayName: "Sage",
+    description: "Measured and soft",
+  },
+  {
+    voice: "ballad",
+    displayName: "Ballad",
+    description: "Expressive and gentle",
+  },
+  {
+    voice: "ash",
+    displayName: "Ash",
+    description: "Low and steady",
+  },
+  {
+    voice: "shimmer",
+    displayName: "Shimmer",
+    description: "Light and crisp",
+  },
+  {
+    voice: "alloy",
+    displayName: "Alloy",
+    description: "Balanced and direct",
+  },
+  {
+    voice: "echo",
+    displayName: "Echo",
+    description: "Smooth and focused",
+  },
+] as const;
+
+export type RealtimeVoiceId = (typeof REALTIME_VOICE_OPTIONS)[number]["voice"];
+export const DEFAULT_REALTIME_VOICE: RealtimeVoiceId = "marin";
+export const DEFAULT_REALTIME_REASONING_EFFORT: RealtimeReasoningEffort = "low";
+export const REALTIME_REASONING_EFFORT_OPTIONS: RealtimeReasoningEffort[] = ["low", "medium", "high"];
 
 export type CodexPermissionProfile = {
   mode: CodexPermissionMode;
@@ -89,6 +164,7 @@ export type CodexTurnOutput = {
   turnId: string;
   status: string;
   finalAssistantText: string;
+  items?: unknown[];
   startedAt: number | null;
   completedAt: number | null;
   durationMs: number | null;
@@ -127,6 +203,11 @@ export type VoiceProject = {
   archivedAt: string | null;
   lastSummary: string | null;
   lastStatus: string | null;
+};
+
+export type SelectedWorkspaceFolder = {
+  path: string;
+  name: string;
 };
 
 export type CodexChatRuntime = {
@@ -225,8 +306,9 @@ export type AppState = {
   codexSettings: CodexSettings;
   realtime: {
     available: boolean;
-    model: string;
-    voice: string;
+    model: RealtimeModelId;
+    voice: RealtimeVoiceId;
+    reasoningEffort: RealtimeReasoningEffort | null;
     reason: string | null;
     apiKeySource: "environment" | "saved" | null;
     apiKeyEncrypted: boolean;
@@ -259,8 +341,9 @@ export type ToolQuestionAnswer = {
 export type RealtimeClientSecret = {
   value: string;
   expiresAt?: number;
-  model: string;
-  voice: string;
+  model: RealtimeModelId;
+  voice: RealtimeVoiceId;
+  reasoningEffort: RealtimeReasoningEffort | null;
 };
 
 export type VoiceExecCommandArgs = {
@@ -291,10 +374,12 @@ export type VoiceExecCommandResult = {
 
 export type CodexVoiceApi = {
   getState(): Promise<AppState>;
+  openVoiceWindow(): Promise<void>;
   openDebugWindow(): Promise<void>;
   getEvents(): Promise<AppEvent[]>;
   clearEvents(): Promise<void>;
   logEvent(event: AppEvent): Promise<void>;
+  selectWorkspaceFolder(): Promise<SelectedWorkspaceFolder | null>;
   createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject>;
   resumeProject(projectId: string): Promise<VoiceProject>;
   archiveProject(projectId: string): Promise<VoiceProject>;
@@ -318,11 +403,17 @@ export type CodexVoiceApi = {
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
   execCommand(args: VoiceExecCommandArgs): Promise<VoiceExecCommandResult>;
   writeStdin(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult>;
+  terminateExecSession(sessionId: number): Promise<void>;
   applyPatch(input: string): Promise<VoiceExecCommandResult>;
   getOpenAiApiKey(): Promise<string | null>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;
+  setRealtimeSettings(settings: {
+    model?: RealtimeModelId | null;
+    voice?: RealtimeVoiceId | null;
+    reasoningEffort?: RealtimeReasoningEffort | null;
+  }): Promise<AppState["realtime"]>;
   onAppState(listener: (state: AppState) => void): () => void;
   onAppEvent(listener: (event: AppEvent) => void): () => void;
 };

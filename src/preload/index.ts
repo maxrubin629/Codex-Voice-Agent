@@ -14,10 +14,12 @@ import type {
 
 const api: CodexVoiceApi = {
   getState: () => ipcRenderer.invoke("app:getState"),
+  openVoiceWindow: () => ipcRenderer.invoke("app:openVoiceWindow"),
   openDebugWindow: () => ipcRenderer.invoke("app:openDebugWindow"),
   getEvents: () => ipcRenderer.invoke("app:getEvents"),
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
   logEvent: (event: AppEvent) => ipcRenderer.invoke("app:logEvent", event),
+  selectWorkspaceFolder: () => ipcRenderer.invoke("projects:selectWorkspaceFolder"),
   createProject: (name?: string, workspacePath?: string | null) =>
     ipcRenderer.invoke("projects:create", { name, workspacePath }),
   resumeProject: (projectId: string) => ipcRenderer.invoke("projects:resume", { projectId }),
@@ -50,11 +52,13 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:answerToolQuestion", { requestId, answers }),
   execCommand: (args: VoiceExecCommandArgs) => ipcRenderer.invoke("voiceTools:execCommand", args),
   writeStdin: (args: VoiceWriteStdinArgs) => ipcRenderer.invoke("voiceTools:writeStdin", args),
+  terminateExecSession: (sessionId: number) => ipcRenderer.invoke("voiceTools:terminateExecSession", { sessionId }),
   applyPatch: (input: string) => ipcRenderer.invoke("voiceTools:applyPatch", { input }),
   getOpenAiApiKey: () => ipcRenderer.invoke("settings:getOpenAiApiKey"),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),
+  setRealtimeSettings: (settings) => ipcRenderer.invoke("realtime:setSettings", { settings }),
   onAppState: (listener: (state: AppState) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, state: AppState) => listener(state);
     ipcRenderer.on("app:state", handler);

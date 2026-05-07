@@ -20,7 +20,27 @@ type FunctionCallItem = {
   type: "function_call";
   name: string;
   call_id: string;
+  id?: string;
+  status?: string;
   arguments?: string;
+};
+
+type TrackedFunctionCall = {
+  callId: string;
+  itemId?: string;
+  name: string;
+  arguments: string;
+  status?: string;
+  running: boolean;
+  outputSent: boolean;
+  stale: boolean;
+};
+
+type TrackedRealtimeResponse = {
+  responseId: string;
+  status?: string;
+  epoch: number;
+  calls: Map<string, TrackedFunctionCall>;
 };
 
 export class RealtimeVoiceClient {
@@ -35,6 +55,10 @@ export class RealtimeVoiceClient {
   private outputLevelFrame: number | null = null;
   private smoothedOutputLevel = 0;
   private isPaused = false;
+  private realtimeEpoch = 0;
+  private trackedResponses = new Map<string, TrackedRealtimeResponse>();
+  private functionCallsByCallId = new Map<string, TrackedFunctionCall>();
+  private functionCallsByItemId = new Map<string, TrackedFunctionCall>();
 
   constructor(private readonly callbacks: RealtimeCallbacks) {}
 
@@ -108,6 +132,10 @@ export class RealtimeVoiceClient {
   }
 
   disconnect(): void {
+    this.realtimeEpoch += 1;
+    this.trackedResponses.clear();
+    this.functionCallsByCallId.clear();
+    this.functionCallsByItemId.clear();
     this.localStream?.getTracks().forEach((track) => track.stop());
     this.dc?.close();
     this.pc?.close();
@@ -162,12 +190,7 @@ export class RealtimeVoiceClient {
       type: "response.create",
       response: {
         output_modalities: ["audio"],
-        instructions: [
-          "A Codex completion status update was just added to the conversation by the app.",
-          "Briefly tell the user that Codex finished.",
-          "Use one short natural sentence.",
-          "Do not call tools.",
-        ].join("\n"),
+        instructions: codexCompletionSpeechInstructions(event),
       },
     });
   }
@@ -229,18 +252,86 @@ export class RealtimeVoiceClient {
       return;
     }
 
+    if (payload.type === "input_audio_buffer.speech_started") {
+      this.invalidatePendingToolCalls("userSpeechStarted", payload);
+    }
+
     if (payload.type === "response.output_audio_transcript.delta" && payload.delta) {
       this.log("voiceDelta", payload.delta, payload);
       return;
     }
 
+    if (payload.type === "conversation.item.input_audio_transcription.delta" && payload.delta) {
+      this.log("userTranscriptDelta", payload.delta, payload);
+      return;
+    }
+
+    if (payload.type === "conversation.item.input_audio_transcription.completed" && payload.transcript) {
+      this.log("userTranscript", payload.transcript, payload);
+      return;
+    }
+
+    if (payload.type === "response.output_audio_transcript.done" && payload.transcript) {
+      this.log("assistantTranscript", payload.transcript, payload);
+      return;
+    }
+
+    if (payload.type === "response.created") {
+      const responseId = stringValue(payload.response?.id);
+      if (responseId) this.ensureTrackedResponse(responseId);
+    }
+
+    if (payload.type === "response.output_item.added") {
+      const item = payload.item;
+      if (item?.type === "function_call") {
+        this.upsertFunctionCall(stringValue(payload.response_id), item as FunctionCallItem);
+      }
+    }
+
+    if (payload.type === "response.function_call_arguments.delta") {
+      const call = this.findFunctionCall(payload);
+      if (call && typeof payload.delta === "string") {
+        call.arguments += payload.delta;
+        this.log("toolArgsDelta", `${call.name} ${payload.delta}`, payload);
+      }
+    }
+
+    if (payload.type === "response.function_call_arguments.done") {
+      const call = this.findOrCreateFunctionCallFromArgumentEvent(payload);
+      if (call) {
+        call.arguments = typeof payload.arguments === "string" ? payload.arguments : call.arguments;
+        call.name = stringValue(payload.name) ?? call.name;
+        this.log("toolArgsDone", `${call.name} ${call.arguments}`, payload);
+      }
+    }
+
+    if (payload.type === "response.output_item.done") {
+      const item = payload.item;
+      if (item?.type === "function_call") {
+        this.upsertFunctionCall(stringValue(payload.response_id), item as FunctionCallItem);
+      }
+    }
+
     if (payload.type === "response.done") {
+      const responseId = stringValue(payload.response?.id);
+      const responseStatus = stringValue(payload.response?.status) ?? "completed";
+      const record = responseId ? this.ensureTrackedResponse(responseId) : null;
+      if (record) record.status = responseStatus;
+
       const output = payload.response?.output;
       if (Array.isArray(output)) {
         for (const item of output) {
           if (item?.type === "function_call") {
-            void this.handleFunctionCall(item as FunctionCallItem);
+            this.upsertFunctionCall(responseId, item as FunctionCallItem);
           }
+        }
+      }
+
+      if (record) {
+        if (responseStatus === "completed") {
+          void this.handleFunctionCalls(record);
+        } else {
+          this.skipFunctionCalls(record, `Realtime response ended with status ${responseStatus}.`);
         }
       }
     }
@@ -253,29 +344,200 @@ export class RealtimeVoiceClient {
     this.log(payload.type ?? "event", payload.type ?? "Realtime event.", payload);
   }
 
-  private async handleFunctionCall(item: FunctionCallItem): Promise<void> {
-    const args = safeJson(item.arguments);
-    this.log("toolCall", `${item.name} ${JSON.stringify(args)}`, item);
-    let output: unknown;
+  private ensureTrackedResponse(responseId: string): TrackedRealtimeResponse {
+    const existing = this.trackedResponses.get(responseId);
+    if (existing) return existing;
+    const record: TrackedRealtimeResponse = {
+      responseId,
+      epoch: this.realtimeEpoch,
+      calls: new Map(),
+    };
+    this.trackedResponses.set(responseId, record);
+    return record;
+  }
 
-    try {
-      output = await callVoiceTool(item.name, args);
-    } catch (error) {
-      output = {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+  private upsertFunctionCall(responseId: string | undefined, item: FunctionCallItem): TrackedFunctionCall | null {
+    const callId = stringValue(item.call_id);
+    const itemId = stringValue(item.id);
+    const name = stringValue(item.name);
+    if (!callId || !name) return null;
+
+    const record = responseId ? this.ensureTrackedResponse(responseId) : null;
+    const existing = this.functionCallsByCallId.get(callId) ?? (itemId ? this.functionCallsByItemId.get(itemId) : undefined);
+    const call =
+      existing ??
+      ({
+        callId,
+        itemId,
+        name,
+        arguments: "",
+        running: false,
+        outputSent: false,
+        stale: false,
+      } satisfies TrackedFunctionCall);
+
+    call.name = name;
+    call.itemId = itemId ?? call.itemId;
+    call.status = stringValue(item.status) ?? call.status;
+    if (typeof item.arguments === "string" && item.arguments.trim()) {
+      call.arguments = item.arguments;
     }
 
-    this.send({
-      type: "conversation.item.create",
-      item: {
-        type: "function_call_output",
-        call_id: item.call_id,
-        output: JSON.stringify(output),
-      },
+    this.functionCallsByCallId.set(callId, call);
+    if (call.itemId) this.functionCallsByItemId.set(call.itemId, call);
+    record?.calls.set(callId, call);
+    return call;
+  }
+
+  private findFunctionCall(payload: any): TrackedFunctionCall | null {
+    const callId = stringValue(payload.call_id);
+    const itemId = stringValue(payload.item_id);
+    return (
+      (callId ? this.functionCallsByCallId.get(callId) : undefined) ??
+      (itemId ? this.functionCallsByItemId.get(itemId) : undefined) ??
+      null
+    );
+  }
+
+  private findOrCreateFunctionCallFromArgumentEvent(payload: any): TrackedFunctionCall | null {
+    const existing = this.findFunctionCall(payload);
+    if (existing) return existing;
+
+    const responseId = stringValue(payload.response_id);
+    const callId = stringValue(payload.call_id);
+    const name = stringValue(payload.name);
+    if (!responseId || !callId || !name) return null;
+
+    return this.upsertFunctionCall(responseId, {
+      type: "function_call",
+      call_id: callId,
+      id: stringValue(payload.item_id),
+      name,
+      arguments: typeof payload.arguments === "string" ? payload.arguments : "",
     });
+  }
+
+  private invalidatePendingToolCalls(kind: string, raw?: unknown): void {
+    this.realtimeEpoch += 1;
+    let invalidated = 0;
+    for (const record of this.trackedResponses.values()) {
+      for (const call of record.calls.values()) {
+        if (!call.outputSent) {
+          call.stale = true;
+          invalidated += 1;
+        }
+      }
+    }
+    if (invalidated > 0) {
+      this.log(kind, `Invalidated ${invalidated} pending Realtime tool call${invalidated === 1 ? "" : "s"}.`, raw);
+    }
+  }
+
+  private skipFunctionCalls(record: TrackedRealtimeResponse, reason: string): void {
+    let skipped = 0;
+    for (const call of record.calls.values()) {
+      if (!call.outputSent) {
+        call.stale = true;
+        call.outputSent = true;
+        skipped += 1;
+      }
+    }
+    if (skipped > 0) this.log("toolCallsSkipped", reason, { responseId: record.responseId, skipped });
+    this.cleanupTrackedResponse(record);
+  }
+
+  private async handleFunctionCalls(record: TrackedRealtimeResponse): Promise<void> {
+    const calls = [...record.calls.values()].filter((call) => !call.outputSent);
+    if (calls.length === 0) {
+      this.cleanupTrackedResponse(record);
+      return;
+    }
+
+    const outputs: Array<{ call: TrackedFunctionCall; output: unknown }> = [];
+    for (const call of calls) {
+      if (call.stale || record.epoch !== this.realtimeEpoch) {
+        call.outputSent = true;
+        this.log("toolCallSkipped", `${call.name} skipped because the Realtime response was interrupted.`, {
+          responseId: record.responseId,
+          callId: call.callId,
+        });
+        continue;
+      }
+
+      call.running = true;
+      const args = safeJson(call.arguments);
+      this.log("toolCall", `${call.name} ${JSON.stringify(args)}`, {
+        responseId: record.responseId,
+        callId: call.callId,
+        arguments: call.arguments,
+      });
+
+      let output: unknown;
+      try {
+        output = await callVoiceTool(call.name, args);
+      } catch (error) {
+        output = {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        call.running = false;
+      }
+
+      if (call.stale || record.epoch !== this.realtimeEpoch || !this.connected) {
+        call.outputSent = true;
+        await cancelStaleVoiceTool(call.name, output).catch((error) => {
+          this.log("toolCancelFailed", `${call.name} stale-result cleanup failed.`, {
+            responseId: record.responseId,
+            callId: call.callId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        this.log("toolResultDiscarded", `${call.name} completed after interruption; result was not sent to Realtime.`, {
+          responseId: record.responseId,
+          callId: call.callId,
+          output,
+        });
+        this.cleanupTrackedResponse(record);
+        return;
+      }
+
+      call.outputSent = true;
+      this.log("toolResult", `${call.name} completed.`, {
+        responseId: record.responseId,
+        name: call.name,
+        callId: call.callId,
+        arguments: args,
+        output,
+      });
+      outputs.push({ call, output });
+    }
+
+    if (outputs.length === 0 || !this.connected || record.epoch !== this.realtimeEpoch) {
+      this.cleanupTrackedResponse(record);
+      return;
+    }
+
+    for (const { call, output } of outputs) {
+      this.send({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: call.callId,
+          output: JSON.stringify(output),
+        },
+      });
+    }
     this.send({ type: "response.create" });
+    this.cleanupTrackedResponse(record);
+  }
+
+  private cleanupTrackedResponse(record: TrackedRealtimeResponse): void {
+    this.trackedResponses.delete(record.responseId);
+    for (const call of record.calls.values()) {
+      this.functionCallsByCallId.delete(call.callId);
+      if (call.itemId) this.functionCallsByItemId.delete(call.itemId);
+    }
   }
 
   private send(payload: unknown): void {
@@ -575,6 +837,24 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
   throw new Error(`Unknown Realtime tool: ${name}`);
 }
 
+async function cancelStaleVoiceTool(name: string, output: unknown): Promise<void> {
+  const result = output as {
+    session_id?: unknown;
+    turnId?: unknown;
+    chat?: { id?: unknown } | null;
+  } | null;
+
+  if ((name === "exec_command" || name === "apply_patch") && typeof result?.session_id === "number") {
+    await window.codexVoice.terminateExecSession(result.session_id);
+    return;
+  }
+
+  if (name === "submit_to_codex" && typeof result?.turnId === "string") {
+    const chatId = typeof result.chat?.id === "string" ? result.chat.id : undefined;
+    await window.codexVoice.interruptCodex(chatId);
+  }
+}
+
 function safeJson(raw: string | undefined): Record<string, unknown> {
   if (!raw) return {};
   try {
@@ -582,6 +862,10 @@ function safeJson(raw: string | undefined): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function stringArg(value: unknown): string {
@@ -816,6 +1100,27 @@ function codexCompletionUpdateText(event: AppEvent): string | null {
     lines.push(`Error: ${turn.error.message}`);
   }
   return lines.join("\n");
+}
+
+function codexCompletionSpeechInstructions(event: AppEvent): string {
+  const raw = (event.raw ?? {}) as {
+    turn?: {
+      status?: unknown;
+    };
+  };
+  const status = raw.turn?.status;
+  const outcome =
+    status === "interrupted"
+      ? "Codex was interrupted."
+      : status === "failed"
+        ? "Codex failed."
+        : "Codex finished.";
+  return [
+    "A Codex completion status update was just added to the conversation by the app.",
+    `Briefly tell the user: ${outcome}`,
+    "Use one short natural sentence.",
+    "Do not call tools.",
+  ].join("\n");
 }
 
 function codexTurnOutputContextText(output: CodexTurnOutput): string {

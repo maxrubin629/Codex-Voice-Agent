@@ -490,6 +490,7 @@ function normalizeCodexTurnOutput(value: unknown): CodexTurnOutput | null {
     turnId: output.turnId,
     status: output.status,
     finalAssistantText: output.finalAssistantText,
+    ...(Array.isArray(output.items) ? { items: output.items } : {}),
     startedAt: numberOrNull(output.startedAt),
     completedAt: numberOrNull(output.completedAt),
     durationMs: numberOrNull(output.durationMs),

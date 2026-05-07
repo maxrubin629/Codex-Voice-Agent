@@ -1,30 +1,100 @@
-import type { RealtimeClientSecret } from "../shared/types";
+import { app } from "electron";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import {
+  DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_REASONING_EFFORT,
+  DEFAULT_REALTIME_VOICE,
+  REALTIME_MODEL_OPTIONS,
+  REALTIME_REASONING_EFFORT_OPTIONS,
+  REALTIME_VOICE_OPTIONS,
+  type AppState,
+  type RealtimeClientSecret,
+  type RealtimeModelId,
+  type RealtimeReasoningEffort,
+  type RealtimeVoiceId,
+} from "../shared/types";
 import { getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
 
 const REALTIME_ENDPOINT = "https://api.openai.com/v1/realtime/client_secrets";
+const SETTINGS_FILE_NAME = "codex-voice-realtime-settings.json";
 
-export function realtimeConfig(): {
-  available: boolean;
-  model: string;
-  voice: string;
-  reason: string | null;
-  apiKeySource: "environment" | "saved" | null;
-  apiKeyEncrypted: boolean;
-} {
-  const model = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-1.5";
-  const voice = process.env.OPENAI_REALTIME_VOICE || "marin";
+type RealtimeSettingsFile = {
+  version: 1;
+  model?: RealtimeModelId | null;
+  voice?: RealtimeVoiceId | null;
+  reasoningEffort?: RealtimeReasoningEffort | null;
+  updatedAt?: string;
+};
+
+export function realtimeConfig(): AppState["realtime"] {
+  const saved = readRealtimeSettings();
+  const model =
+    saved.model ??
+    normalizeRealtimeModel(process.env.OPENAI_REALTIME_MODEL) ??
+    DEFAULT_REALTIME_MODEL;
+  const voice =
+    saved.voice ??
+    normalizeRealtimeVoice(process.env.OPENAI_REALTIME_VOICE) ??
+    DEFAULT_REALTIME_VOICE;
+  const selectedReasoningEffort =
+    saved.reasoningEffort ??
+    normalizeRealtimeReasoningEffort(process.env.OPENAI_REALTIME_REASONING_EFFORT) ??
+    DEFAULT_REALTIME_REASONING_EFFORT;
+  const reasoningEffort = realtimeReasoningEffort(model, selectedReasoningEffort);
   const status = getOpenAiApiKeyStatus();
   const available = status.configured;
   return {
     available,
     model,
     voice,
+    reasoningEffort,
     reason: available
       ? null
       : "Add an OpenAI API key from the menu to enable Realtime voice.",
     apiKeySource: status.source,
     apiKeyEncrypted: status.encrypted,
   };
+}
+
+export function saveRealtimeSettings(settings: {
+  model?: RealtimeModelId | null;
+  voice?: RealtimeVoiceId | null;
+  reasoningEffort?: RealtimeReasoningEffort | null;
+}): AppState["realtime"] {
+  const current = readRealtimeSettings();
+  const next: RealtimeSettingsFile = {
+    ...current,
+    version: 1,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (settings.model !== undefined) {
+    if (settings.model === null) {
+      next.model = null;
+    } else {
+      next.model = requireRealtimeModel(settings.model);
+    }
+  }
+
+  if (settings.voice !== undefined) {
+    if (settings.voice === null) {
+      next.voice = null;
+    } else {
+      next.voice = requireRealtimeVoice(settings.voice);
+    }
+  }
+
+  if (settings.reasoningEffort !== undefined) {
+    if (settings.reasoningEffort === null) {
+      next.reasoningEffort = null;
+    } else {
+      next.reasoningEffort = requireRealtimeReasoningEffort(settings.reasoningEffort);
+    }
+  }
+
+  writeRealtimeSettings(next);
+  return realtimeConfig();
 }
 
 export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret> {
@@ -44,12 +114,24 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
       session: {
         type: "realtime",
         model: config.model,
+        ...(config.reasoningEffort
+          ? {
+              reasoning: {
+                effort: config.reasoningEffort,
+              },
+            }
+          : {}),
         output_modalities: ["audio"],
         instructions: realtimeInstructions(),
         audio: {
           input: {
+            transcription: {
+              model: "gpt-4o-mini-transcribe",
+            },
             turn_detection: {
               type: "semantic_vad",
+              create_response: true,
+              interrupt_response: true,
             },
           },
           output: {
@@ -83,7 +165,92 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
     expiresAt: data.expires_at ?? data.client_secret?.expires_at,
     model: config.model,
     voice: config.voice,
+    reasoningEffort: config.reasoningEffort,
   };
+}
+
+function normalizeRealtimeModel(value: unknown): RealtimeModelId | null {
+  if (typeof value !== "string") return null;
+  const model = value.trim();
+  const option = REALTIME_MODEL_OPTIONS.find((candidate) => candidate.model === model);
+  return option?.model ?? null;
+}
+
+function requireRealtimeModel(value: unknown): RealtimeModelId {
+  const model = normalizeRealtimeModel(value);
+  if (!model) {
+    throw new Error(
+      `Unsupported Realtime model "${String(value)}". Choose gpt-realtime-2 or gpt-realtime-1.5.`,
+    );
+  }
+  return model;
+}
+
+function normalizeRealtimeVoice(value: unknown): RealtimeVoiceId | null {
+  if (typeof value !== "string") return null;
+  const voice = value.trim();
+  const option = REALTIME_VOICE_OPTIONS.find((candidate) => candidate.voice === voice);
+  return option?.voice ?? null;
+}
+
+function requireRealtimeVoice(value: unknown): RealtimeVoiceId {
+  const voice = normalizeRealtimeVoice(value);
+  if (!voice) {
+    throw new Error(`Unsupported Realtime voice "${String(value)}".`);
+  }
+  return voice;
+}
+
+function normalizeRealtimeReasoningEffort(value: unknown): RealtimeReasoningEffort | null {
+  if (typeof value !== "string") return null;
+  const effort = value.trim();
+  return REALTIME_REASONING_EFFORT_OPTIONS.includes(effort as RealtimeReasoningEffort)
+    ? (effort as RealtimeReasoningEffort)
+    : null;
+}
+
+function requireRealtimeReasoningEffort(value: unknown): RealtimeReasoningEffort {
+  const effort = normalizeRealtimeReasoningEffort(value);
+  if (!effort) {
+    throw new Error(`Unsupported Realtime reasoning effort "${String(value)}". Choose low, medium, or high.`);
+  }
+  return effort;
+}
+
+function realtimeReasoningEffort(
+  model: RealtimeModelId,
+  selectedReasoningEffort: RealtimeReasoningEffort,
+): RealtimeReasoningEffort | null {
+  return model === "gpt-realtime-2" ? selectedReasoningEffort : null;
+}
+
+function realtimeSettingsPath(): string {
+  return path.join(app.getPath("userData"), SETTINGS_FILE_NAME);
+}
+
+function readRealtimeSettings(): RealtimeSettingsFile {
+  try {
+    const filePath = realtimeSettingsPath();
+    if (!existsSync(filePath)) return { version: 1 };
+    const settings = JSON.parse(readFileSync(filePath, "utf8")) as RealtimeSettingsFile;
+    return {
+      version: 1,
+      model: settings.model === null ? null : normalizeRealtimeModel(settings.model),
+      voice: settings.voice === null ? null : normalizeRealtimeVoice(settings.voice),
+      reasoningEffort: settings.reasoningEffort === null
+        ? null
+        : normalizeRealtimeReasoningEffort(settings.reasoningEffort),
+      updatedAt: settings.updatedAt,
+    };
+  } catch {
+    return { version: 1 };
+  }
+}
+
+function writeRealtimeSettings(settings: RealtimeSettingsFile): void {
+  const filePath = realtimeSettingsPath();
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(settings, null, 2), { mode: 0o600 });
 }
 
 function realtimeInstructions(): string {

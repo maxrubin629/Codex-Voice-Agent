@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, type OpenDialogOptions } from "electron";
 import path from "node:path";
 import { clearOpenAiApiKey, getOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
 import appIcon from "./assets/app-icon.png?asset";
@@ -10,6 +10,9 @@ import type {
   AppEvent,
   CodexPermissionMode,
   CodexSettingsScope,
+  RealtimeModelId,
+  RealtimeReasoningEffort,
+  RealtimeVoiceId,
   ReasoningEffort,
   ToolQuestionAnswer,
   VoiceExecCommandArgs,
@@ -184,6 +187,9 @@ app.on("before-quit", () => {
 
 function registerIpc(): void {
   registerIpcHandler("app:getState", () => requireOrchestrator().state());
+  registerIpcHandler("app:openVoiceWindow", () => {
+    createVoiceWindow();
+  });
   registerIpcHandler("app:openDebugWindow", () => {
     createDebugWindow();
   });
@@ -193,6 +199,23 @@ function registerIpc(): void {
   });
   registerIpcHandler("app:logEvent", (_event, payload: AppEvent) => {
     publishEvent(normalizeAppEvent(payload));
+  });
+  registerIpcHandler("projects:selectWorkspaceFolder", async () => {
+    const options: OpenDialogOptions = {
+      title: "Use an existing folder",
+      buttonLabel: "Use folder",
+      properties: ["openDirectory"],
+    };
+    const result =
+      voiceWindow && !voiceWindow.isDestroyed()
+        ? await dialog.showOpenDialog(voiceWindow, options)
+        : await dialog.showOpenDialog(options);
+    const folderPath = result.filePaths[0];
+    if (result.canceled || !folderPath) return null;
+    return {
+      path: folderPath,
+      name: path.basename(folderPath) || folderPath,
+    };
   });
   registerIpcHandler(
     "projects:create",
@@ -288,6 +311,9 @@ function registerIpc(): void {
   registerIpcHandler("voiceTools:writeStdin", (_event, payload: VoiceWriteStdinArgs) =>
     requireOrchestrator().writeStdinForVoice(payload),
   );
+  registerIpcHandler("voiceTools:terminateExecSession", (_event, payload: { sessionId: number }) =>
+    requireOrchestrator().terminateVoiceExecSession(payload.sessionId),
+  );
   registerIpcHandler("voiceTools:applyPatch", (_event, payload: { input: string }) =>
     requireOrchestrator().applyPatchForVoice(payload.input),
   );
@@ -300,5 +326,19 @@ function registerIpc(): void {
   });
   registerIpcHandler("realtime:createClientSecret", () =>
     requireOrchestrator().createRealtimeClientSecret(),
+  );
+  registerIpcHandler(
+    "realtime:setSettings",
+    (
+      _event,
+      payload: {
+        settings: {
+          model?: RealtimeModelId | null;
+          voice?: RealtimeVoiceId | null;
+          reasoningEffort?: RealtimeReasoningEffort | null;
+        };
+      },
+    ) =>
+      requireOrchestrator().setRealtimeSettings(payload.settings),
   );
 }
