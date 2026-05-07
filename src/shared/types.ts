@@ -3,7 +3,10 @@ export type CodexApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "n
 export type CodexApprovalsReviewer = "user" | "auto_review";
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexPermissionMode = "default" | "auto-review" | "full-access" | "custom-config";
-export type RealtimeReasoningEffort = Extract<ReasoningEffort, "low" | "medium" | "high">;
+export type RealtimeReasoningEffort = Extract<
+  ReasoningEffort,
+  "minimal" | "low" | "medium" | "high" | "xhigh"
+>;
 
 export const REALTIME_MODEL_OPTIONS = [
   {
@@ -77,7 +80,13 @@ export const REALTIME_VOICE_OPTIONS = [
 export type RealtimeVoiceId = (typeof REALTIME_VOICE_OPTIONS)[number]["voice"];
 export const DEFAULT_REALTIME_VOICE: RealtimeVoiceId = "marin";
 export const DEFAULT_REALTIME_REASONING_EFFORT: RealtimeReasoningEffort = "low";
-export const REALTIME_REASONING_EFFORT_OPTIONS: RealtimeReasoningEffort[] = ["low", "medium", "high"];
+export const REALTIME_REASONING_EFFORT_OPTIONS: RealtimeReasoningEffort[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
 
 export type CodexPermissionProfile = {
   mode: CodexPermissionMode;
@@ -513,6 +522,7 @@ export type CodexVoiceApi = {
   clearEvents(): Promise<void>;
   logEvent(event: AppEvent): Promise<void>;
   selectWorkspaceFolder(): Promise<SelectedWorkspaceFolder | null>;
+  setWorkspaceFolder(workspacePath: string, name?: string | null): Promise<VoiceProject>;
   createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject>;
   resumeProject(projectId: string): Promise<VoiceProject>;
   archiveProject(projectId: string): Promise<VoiceProject>;

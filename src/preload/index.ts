@@ -24,6 +24,8 @@ const api: CodexVoiceApi = {
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
   logEvent: (event: AppEvent) => ipcRenderer.invoke("app:logEvent", event),
   selectWorkspaceFolder: () => ipcRenderer.invoke("projects:selectWorkspaceFolder"),
+  setWorkspaceFolder: (workspacePath: string, name?: string | null) =>
+    ipcRenderer.invoke("projects:setWorkspaceFolder", { workspacePath, name }),
   createProject: (name?: string, workspacePath?: string | null) =>
     ipcRenderer.invoke("projects:create", { name, workspacePath }),
   resumeProject: (projectId: string) => ipcRenderer.invoke("projects:resume", { projectId }),

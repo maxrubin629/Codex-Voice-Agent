@@ -77,6 +77,7 @@ const emptyState: AppState = {
 type AppWindowKind = "voice" | "debug";
 type ApiKeyDialogMode = "onboarding" | "settings";
 type OnboardingStep = "key" | "voice" | "orb" | "project";
+type PaneSide = "settings" | "future";
 type VoiceTone = "off" | "listening" | "working" | "connecting" | "paused" | "waiting";
 type VoiceSettingsTab = "general" | "appearance" | "configuration" | "archive";
 type VoiceOrbPresetId = "aurora" | "cloud" | "nocturne";
@@ -97,11 +98,15 @@ type VoiceOrbCustomization = {
 };
 
 const voiceOrbStorageKey = "codexVoice.orbPreset";
+const leftPanelWidthStorageKey = "codexVoice.leftPanel.width";
 const rightPanelWidthStorageKey = "codexVoice.rightPanel.width";
 const voiceOrbCustomizationStorageKey = "codexVoice.orbCustomization";
 const voiceOnboardingSeenStorageKey = "codexVoice.onboardingSeen";
 const dualPaneLayoutMediaQuery = "(min-width: 1420px)";
 const paneReplacementDelayMs = 120;
+const minPaneWidth = 320;
+const maxPaneWidth = 720;
+const defaultPaneWidth = 420;
 const defaultVoiceOrbCustomization: VoiceOrbCustomization = {
   accentColor: "#1d9bf0",
   glow: 52,
@@ -236,18 +241,22 @@ function saveVoiceOrbCustomization(customization: VoiceOrbCustomization): void {
   }
 }
 
-function loadRightPanelWidth(): number {
+function clampPaneWidth(width: number): number {
+  return Math.max(minPaneWidth, Math.min(maxPaneWidth, Math.round(width)));
+}
+
+function loadPaneWidth(storageKey: string): number {
   try {
-    const value = Number(window.localStorage.getItem(rightPanelWidthStorageKey));
-    return Number.isFinite(value) ? Math.max(320, Math.min(720, value)) : 420;
+    const value = Number(window.localStorage.getItem(storageKey));
+    return Number.isFinite(value) ? clampPaneWidth(value) : defaultPaneWidth;
   } catch {
-    return 420;
+    return defaultPaneWidth;
   }
 }
 
-function saveRightPanelWidth(width: number): void {
+function savePaneWidth(storageKey: string, width: number): void {
   try {
-    window.localStorage.setItem(rightPanelWidthStorageKey, String(width));
+    window.localStorage.setItem(storageKey, String(clampPaneWidth(width)));
   } catch {
     // Visual preferences should never block the voice UI.
   }
@@ -559,7 +568,9 @@ function VoiceHome({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [futureOpen, setFutureOpen] = useState(false);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
-  const [rightPanelWidth, setRightPanelWidth] = useState(() => loadRightPanelWidth());
+  const [leftPaneWidth, setLeftPaneWidth] = useState(() => loadPaneWidth(leftPanelWidthStorageKey));
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => loadPaneWidth(rightPanelWidthStorageKey));
+  const [resizingPane, setResizingPane] = useState<PaneSide | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [switchChatOpen, setSwitchChatOpen] = useState(false);
@@ -577,9 +588,12 @@ function VoiceHome({
   const [newName, setNewName] = useState("");
   const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
-  const paneTogglePointerActivationRef = useRef<"settings" | "future" | null>(null);
+  const paneTogglePointerActivationRef = useRef<PaneSide | null>(null);
   const paneReplacementTimeoutRef = useRef<number | null>(null);
-  const lastOpenedPaneRef = useRef<"settings" | "future">("settings");
+  const paneResizeFrameRef = useRef<number | null>(null);
+  const pendingPaneResizeRef = useRef<{ pane: PaneSide; width: number } | null>(null);
+  const paneResizeCleanupRef = useRef<(() => void) | null>(null);
+  const lastOpenedPaneRef = useRef<PaneSide>("settings");
   const projects = state.projects;
   const archivedProjects = state.archivedProjects;
   const activeProject = state.activeProject;
@@ -637,7 +651,11 @@ function VoiceHome({
   }, [orbCustomization]);
 
   useEffect(() => {
-    saveRightPanelWidth(rightPanelWidth);
+    savePaneWidth(leftPanelWidthStorageKey, leftPaneWidth);
+  }, [leftPaneWidth]);
+
+  useEffect(() => {
+    savePaneWidth(rightPanelWidthStorageKey, rightPanelWidth);
   }, [rightPanelWidth]);
 
   useEffect(() => {
@@ -653,6 +671,10 @@ function VoiceHome({
     return () => {
       if (paneReplacementTimeoutRef.current !== null) {
         window.clearTimeout(paneReplacementTimeoutRef.current);
+      }
+      paneResizeCleanupRef.current?.();
+      if (paneResizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(paneResizeFrameRef.current);
       }
     };
   }, []);
@@ -758,6 +780,15 @@ function VoiceHome({
     if (created) {
       completeOnboarding();
     }
+  }
+
+  async function selectWorkspaceFolder(): Promise<void> {
+    await onAction(async () => {
+      const folder = await window.codexVoice.selectWorkspaceFolder();
+      if (!folder) return;
+      await window.codexVoice.setWorkspaceFolder(folder.path, folder.name);
+      await onRefresh();
+    });
   }
 
   async function resumeProject(projectId: string): Promise<void> {
@@ -894,7 +925,7 @@ function VoiceHome({
     paneReplacementTimeoutRef.current = null;
   }
 
-  function openPaneAfterReplacement(pane: "settings" | "future"): void {
+  function openPaneAfterReplacement(pane: PaneSide): void {
     paneReplacementTimeoutRef.current = window.setTimeout(() => {
       if (pane === "settings") {
         setSettingsOpen(true);
@@ -943,7 +974,7 @@ function VoiceHome({
     openPaneAfterReplacement("future");
   }
 
-  function activatePaneToggle(pane: "settings" | "future"): void {
+  function activatePaneToggle(pane: PaneSide): void {
     if (pane === "settings") {
       toggleSettingsPane();
       return;
@@ -959,7 +990,7 @@ function VoiceHome({
 
   function handlePaneTogglePointerUp(
     event: React.PointerEvent<HTMLButtonElement>,
-    pane: "settings" | "future",
+    pane: PaneSide,
   ): void {
     if (event.pointerType === "mouse" && event.button !== 0) return;
     event.preventDefault();
@@ -975,7 +1006,7 @@ function VoiceHome({
 
   function handlePaneToggleClick(
     event: React.MouseEvent<HTMLButtonElement>,
-    pane: "settings" | "future",
+    pane: PaneSide,
   ): void {
     event.stopPropagation();
     if (paneTogglePointerActivationRef.current === pane) {
@@ -985,13 +1016,150 @@ function VoiceHome({
     activatePaneToggle(pane);
   }
 
+  function paneWidth(pane: PaneSide): number {
+    return pane === "settings" ? leftPaneWidth : rightPanelWidth;
+  }
+
+  function setPaneWidth(pane: PaneSide, width: number): void {
+    if (pane === "settings") {
+      setLeftPaneWidth(clampPaneWidth(width));
+      return;
+    }
+    setRightPanelWidth(clampPaneWidth(width));
+  }
+
+  function maxPaneWidthForResize(pane: PaneSide): number {
+    const otherPaneWidth =
+      pane === "settings" && futureOpen ? rightPanelWidth : pane === "future" && settingsOpen ? leftPaneWidth : 0;
+    const centerMinWidth = window.innerWidth >= 1240 ? 500 : 340;
+    const availableWidth = window.innerWidth - otherPaneWidth - centerMinWidth;
+    return Math.max(minPaneWidth, Math.min(maxPaneWidth, availableWidth));
+  }
+
+  function clampPaneWidthForResize(pane: PaneSide, width: number): number {
+    return Math.max(minPaneWidth, Math.min(maxPaneWidthForResize(pane), Math.round(width)));
+  }
+
+  function flushPendingPaneResize(): void {
+    const pending = pendingPaneResizeRef.current;
+    if (!pending) return;
+    pendingPaneResizeRef.current = null;
+    paneResizeFrameRef.current = null;
+    setPaneWidth(pending.pane, pending.width);
+  }
+
+  function schedulePaneResize(pane: PaneSide, width: number): void {
+    pendingPaneResizeRef.current = { pane, width };
+    if (paneResizeFrameRef.current !== null) return;
+    paneResizeFrameRef.current = window.requestAnimationFrame(flushPendingPaneResize);
+  }
+
+  function finishPaneResize(pane: PaneSide): void {
+    const pending = pendingPaneResizeRef.current;
+    if (paneResizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(paneResizeFrameRef.current);
+      paneResizeFrameRef.current = null;
+    }
+    if (pending?.pane === pane) {
+      pendingPaneResizeRef.current = null;
+      setPaneWidth(pending.pane, pending.width);
+    }
+    setResizingPane(null);
+  }
+
+  function startPaneResize(event: React.PointerEvent<HTMLDivElement>, pane: PaneSide): void {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    paneResizeCleanupRef.current?.();
+
+    const target = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startWidth = paneWidth(pane);
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+
+    target.setPointerCapture(pointerId);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    setResizingPane(pane);
+
+    function onMove(moveEvent: PointerEvent): void {
+      const delta = moveEvent.clientX - startX;
+      const nextWidth = pane === "settings" ? startWidth + delta : startWidth - delta;
+      schedulePaneResize(pane, clampPaneWidthForResize(pane, nextWidth));
+    }
+
+    function onEnd(): void {
+      cleanup();
+    }
+
+    function cleanup(): void {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      window.removeEventListener("blur", onEnd);
+      if (target.hasPointerCapture(pointerId)) {
+        target.releasePointerCapture(pointerId);
+      }
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      paneResizeCleanupRef.current = null;
+      finishPaneResize(pane);
+    }
+
+    paneResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+    window.addEventListener("blur", onEnd);
+  }
+
+  function resizePaneWithKeyboard(event: React.KeyboardEvent<HTMLDivElement>, pane: PaneSide): void {
+    const direction = pane === "settings" ? 1 : -1;
+    const step = event.shiftKey ? 48 : 24;
+
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      setPaneWidth(pane, clampPaneWidthForResize(pane, paneWidth(pane) - step * direction));
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      setPaneWidth(pane, clampPaneWidthForResize(pane, paneWidth(pane) + step * direction));
+    }
+  }
+
+  function paneResizer(pane: PaneSide, open: boolean): React.ReactElement {
+    const label = pane === "settings" ? "left" : "right";
+    const maxWidth = maxPaneWidthForResize(pane);
+    const currentWidth = Math.min(paneWidth(pane), maxWidth);
+    return (
+      <div
+        className={`voice-pane-resizer ${label}${resizingPane === pane ? " resizing" : ""}`}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label={`Resize ${label} pane`}
+        aria-valuemin={minPaneWidth}
+        aria-valuemax={maxWidth}
+        aria-valuenow={currentWidth}
+        tabIndex={open ? 0 : -1}
+        onPointerDown={(event) => startPaneResize(event, pane)}
+        onKeyDown={(event) => resizePaneWithKeyboard(event, pane)}
+      />
+    );
+  }
+
   return (
     <main
       className={`voice-home ${settingsOpen ? "settings-open" : ""} ${futureOpen ? "future-open" : ""} ${
         windowChromeState.isFullScreen ? "window-fullscreen" : ""
+      } ${
+        resizingPane ? `pane-resizing pane-resizing-${resizingPane}` : ""
       }`}
       style={{
-        ...voiceAccentStyle(orbCustomization.accentColor),
+        ...voiceAccentStyle(orbCustomization),
+        "--settings-pane-resized-width": `${leftPaneWidth}px`,
         "--right-pane-width": `${rightPanelWidth}px`,
       } as React.CSSProperties}
     >
@@ -1037,12 +1205,14 @@ function VoiceHome({
           onApiKeyChange={setApiKey}
           onSaveApiKey={saveApiKey}
           onClearApiKey={clearApiKey}
+          onSelectWorkspace={selectWorkspaceFolder}
           onAction={onAction}
           onRefresh={onRefresh}
           onShowDebug={onShowDebug}
           onOpenArchived={() => setArchivedOpen(true)}
           onToggleVoice={onToggleVoice}
           onRestartVoice={onRestartVoice}
+          resizer={paneResizer("settings", settingsOpen)}
         />
 
         <div className="voice-home-content">
@@ -1404,12 +1574,14 @@ function VoiceSettingsPane({
   onApiKeyChange,
   onSaveApiKey,
   onClearApiKey,
+  onSelectWorkspace,
   onAction,
   onRefresh,
   onShowDebug,
   onOpenArchived,
   onToggleVoice,
   onRestartVoice,
+  resizer,
 }: {
   open: boolean;
   state: AppState;
@@ -1429,19 +1601,20 @@ function VoiceSettingsPane({
   onApiKeyChange: (value: string) => void;
   onSaveApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
   onClearApiKey: () => Promise<void>;
+  onSelectWorkspace: () => Promise<void>;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
   onRefresh: () => Promise<void>;
   onShowDebug: () => Promise<void>;
   onOpenArchived: () => void;
   onToggleVoice: () => Promise<void>;
   onRestartVoice: () => Promise<void>;
+  resizer?: React.ReactNode;
 }): React.ReactElement {
   const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("appearance");
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const activeProject = state.activeProject;
   const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
   const hasApiKey = Boolean(apiKey.trim());
-  const selectedPreset = voiceOrbPresetById(orbPresetId);
   const realtimeSupportsReasoning = state.realtime.model === "gpt-realtime-2";
   const selectedRealtimeReasoningEffort =
     state.realtime.reasoningEffort ?? DEFAULT_REALTIME_REASONING_EFFORT;
@@ -1493,10 +1666,10 @@ function VoiceSettingsPane({
 
   return (
     <aside className="voice-settings-pane" aria-hidden={!open} inert={!open} aria-label="Settings">
+      {resizer}
       <div className="voice-settings-inner">
         <header className="voice-settings-header">
           <h2>Controls</h2>
-          <small>{selectedPreset.name} orb</small>
         </header>
 
         <nav className="voice-settings-nav" aria-label="Control sections" role="tablist">
@@ -1535,12 +1708,19 @@ function VoiceSettingsPane({
                     </span>
                     <StatusDot ready={health.ok} />
                   </div>
-                  <div className="voice-settings-row">
+                  <button
+                    type="button"
+                    className="voice-settings-row voice-settings-workspace-row"
+                    onClick={() => void onSelectWorkspace()}
+                    aria-label="Select workspace folder"
+                    title={workspace}
+                  >
                     <span>
                       <strong>Workspace</strong>
                       <small>{workspace}</small>
                     </span>
-                  </div>
+                    <FolderIcon />
+                  </button>
                 </div>
               </section>
 
@@ -1634,15 +1814,20 @@ function VoiceSettingsPane({
                     </span>
                   </label>
 
-                  <div className="voice-settings-row">
-                    <span>
-                      <strong>{formatRealtimeModelName(state.realtime.model)}</strong>
-                      <small>{realtimeModelDetail(state.realtime)}</small>
-                    </span>
-                  </div>
-
-                  <div className="voice-settings-field">
-                    Reasoning
+                  <div className={`realtime-reasoning-panel ${realtimeSupportsReasoning ? "" : "disabled"}`}>
+                    <div className="realtime-reasoning-header">
+                      <span>
+                        <strong>Reasoning</strong>
+                        <small>
+                          {realtimeSupportsReasoning
+                            ? formatEffort(selectedRealtimeReasoningEffort)
+                            : "Off on Realtime 1.5"}
+                        </small>
+                      </span>
+                      <span className="realtime-reasoning-badge">
+                        {realtimeSupportsReasoning ? "2.0" : "1.5"}
+                      </span>
+                    </div>
                     <div className="voice-settings-segmented realtime-reasoning" aria-label="Realtime reasoning effort">
                       {REALTIME_REASONING_EFFORT_OPTIONS.map((effort) => (
                         <button
@@ -1971,7 +2156,6 @@ function OnboardingFlow({
   const [step, setStep] = useState<OnboardingStep>(initialStep);
   const [revealed, setRevealed] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const hasApiKey = Boolean(apiKey.trim());
   const selectedVoice = realtimeVoiceOption(state.realtime.voice);
@@ -2018,7 +2202,11 @@ function OnboardingFlow({
     setStep("voice");
   }
 
-  function goNext(): void {
+  async function goNext(): Promise<void> {
+    if (step === "key") {
+      await saveKeyAndContinue();
+      return;
+    }
     if (isLastStep) {
       onClose();
       return;
@@ -2032,7 +2220,6 @@ function OnboardingFlow({
   }
 
   function startProject(mode: "scratch" | "folder"): void {
-    setProjectMenuOpen(false);
     onStartProject(mode);
   }
 
@@ -2130,14 +2317,6 @@ function OnboardingFlow({
                 </div>
               </div>
 
-              <button
-                type="button"
-                className="onboarding-card-primary"
-                disabled={!state.realtime.available && !hasApiKey}
-                onClick={() => void saveKeyAndContinue()}
-              >
-                {state.realtime.available ? "Continue" : "Save key"}
-              </button>
             </article>
 
             <article className="onboarding-card">
@@ -2189,27 +2368,16 @@ function OnboardingFlow({
 
               <div className="onboarding-project-stage">
                 <div className="onboarding-project-menu-wrap">
-                  <button
-                    type="button"
-                    className="onboarding-project-trigger"
-                    aria-expanded={projectMenuOpen}
-                    onClick={() => setProjectMenuOpen((current) => !current)}
-                  >
-                    Start project
-                    <DownIcon />
-                  </button>
-                  {projectMenuOpen && (
-                    <div className="onboarding-project-menu" role="menu">
-                      <button type="button" role="menuitem" onClick={() => startProject("scratch")}>
-                        <PlusIcon />
-                        <span>Start from scratch</span>
-                      </button>
-                      <button type="button" role="menuitem" onClick={() => startProject("folder")}>
-                        <FolderIcon />
-                        <span>Use an existing folder</span>
-                      </button>
-                    </div>
-                  )}
+                  <div className="onboarding-project-menu" role="menu">
+                    <button type="button" role="menuitem" onClick={() => startProject("scratch")}>
+                      <PlusIcon />
+                      <span>Start from scratch</span>
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => startProject("folder")}>
+                      <FolderIcon />
+                      <span>Use an existing folder</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </article>
@@ -2227,8 +2395,8 @@ function OnboardingFlow({
             <button
               type="button"
               className="voice-primary"
-              disabled={step === "key" && !state.realtime.available}
-              onClick={goNext}
+              disabled={step === "key" && !state.realtime.available && !hasApiKey}
+              onClick={() => void goNext()}
             >
               {isLastStep ? "Done" : "Next"}
             </button>
@@ -2271,7 +2439,7 @@ function OnboardingKeyIcon(): React.ReactElement {
     <svg viewBox="0 0 24 24" aria-hidden="true" className="onboarding-key-icon">
       <circle cx="8.1" cy="12" r="3.15" />
       <path className="key-shaft" d="M11.25 12h8" />
-      <path className="key-tooth" d="M16.8 12v2.65M19.25 12v-2.25" />
+      <path className="key-tooth" d="M16.8 12v2.65M19.25 12v2.15" />
     </svg>
   );
 }
@@ -2688,13 +2856,32 @@ function rgbaFromHex(color: string, alpha: number): string | null {
   return rgb ? `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})` : null;
 }
 
-function voiceAccentStyle(color: string): React.CSSProperties {
-  const accent = isHexColor(color) ? color : defaultVoiceOrbCustomization.accentColor;
+function scaledGlowAlpha(alpha: number, glow: number): number {
+  const normalizedGlow = clampControlValue(glow, defaultVoiceOrbCustomization.glow);
+  const scale = normalizedGlow / defaultVoiceOrbCustomization.glow;
+  return Math.min(1, Math.max(0, Number((alpha * scale).toFixed(3))));
+}
+
+function glowColor(accent: string, alpha: number, glow: number, fallback: string): string {
+  return rgbaFromHex(accent, scaledGlowAlpha(alpha, glow)) ?? fallback;
+}
+
+function voiceAccentStyle(customization: VoiceOrbCustomization): React.CSSProperties {
+  const accent = isHexColor(customization.accentColor)
+    ? customization.accentColor
+    : defaultVoiceOrbCustomization.accentColor;
+  const glow = clampControlValue(customization.glow, defaultVoiceOrbCustomization.glow);
   return {
     "--voice-accent": accent,
     "--voice-accent-soft": rgbaFromHex(accent, 0.22) ?? "rgba(29, 155, 240, 0.22)",
     "--voice-accent-mid": rgbaFromHex(accent, 0.34) ?? "rgba(29, 155, 240, 0.34)",
     "--voice-accent-strong": rgbaFromHex(accent, 0.58) ?? "rgba(29, 155, 240, 0.58)",
+    "--voice-glow-faint": glowColor(accent, 0.08, glow, "rgba(29, 155, 240, 0.08)"),
+    "--voice-glow-soft": glowColor(accent, 0.13, glow, "rgba(29, 155, 240, 0.13)"),
+    "--voice-glow-medium": glowColor(accent, 0.2, glow, "rgba(29, 155, 240, 0.2)"),
+    "--voice-glow-strong": glowColor(accent, 0.3, glow, "rgba(29, 155, 240, 0.3)"),
+    "--voice-glow-hot": glowColor(accent, 0.42, glow, "rgba(29, 155, 240, 0.42)"),
+    "--voice-glow-rim": glowColor(accent, 0.48, glow, "rgba(29, 155, 240, 0.48)"),
   } as React.CSSProperties;
 }
 

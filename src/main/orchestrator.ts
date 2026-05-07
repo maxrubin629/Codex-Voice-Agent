@@ -214,6 +214,38 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return project;
   }
 
+  async setWorkspaceFolder(workspacePath?: string | null, name?: string | null): Promise<VoiceProject> {
+    const resolvedWorkspacePath = await resolveWorkspacePathInput(workspacePath);
+    if (!resolvedWorkspacePath) throw new Error("No workspace folder selected.");
+
+    const activeProject = await this.getActiveProject();
+    const projects = await this.store.listProjects();
+    const existing = projects.find((project) => samePath(projectWorkspacePath(project), resolvedWorkspacePath));
+    if (existing && existing.id !== activeProject?.id) {
+      this.activeProjectId = existing.id;
+      this.showProjectChatsFlag = false;
+      this.status = `Active project: ${existing.displayName}`;
+      this.emitEvent("app", "workspaceSelected", `Selected workspace "${existing.displayName}".`, existing);
+      this.emitState();
+      return existing;
+    }
+
+    if (!activeProject) {
+      return this.createProject(name || path.basename(resolvedWorkspacePath) || undefined, resolvedWorkspacePath);
+    }
+
+    const updated = await this.store.updateProject(activeProject.id, {
+      workspacePath: resolvedWorkspacePath,
+      lastStatus: `Workspace: ${resolvedWorkspacePath}`,
+    });
+    this.activeProjectId = updated.id;
+    this.showProjectChatsFlag = false;
+    this.status = `Workspace selected: ${resolvedWorkspacePath}`;
+    this.emitEvent("app", "workspaceSelected", `Selected workspace "${resolvedWorkspacePath}".`, updated);
+    this.emitState();
+    return updated;
+  }
+
   async resumeProject(projectId: string): Promise<VoiceProject> {
     let project = await this.store.getProject(projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);

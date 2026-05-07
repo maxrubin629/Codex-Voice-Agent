@@ -212,7 +212,11 @@ function normalizeRealtimeReasoningEffort(value: unknown): RealtimeReasoningEffo
 function requireRealtimeReasoningEffort(value: unknown): RealtimeReasoningEffort {
   const effort = normalizeRealtimeReasoningEffort(value);
   if (!effort) {
-    throw new Error(`Unsupported Realtime reasoning effort "${String(value)}". Choose low, medium, or high.`);
+    throw new Error(
+      `Unsupported Realtime reasoning effort "${String(value)}". Choose ${REALTIME_REASONING_EFFORT_OPTIONS.join(
+        ", ",
+      )}.`,
+    );
   }
   return effort;
 }

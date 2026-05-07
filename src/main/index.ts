@@ -243,6 +243,11 @@ function registerIpc(): void {
     };
   });
   registerIpcHandler(
+    "projects:setWorkspaceFolder",
+    (_event, payload: { workspacePath?: string | null; name?: string | null }) =>
+      requireOrchestrator().setWorkspaceFolder(payload.workspacePath, payload.name),
+  );
+  registerIpcHandler(
     "projects:create",
     (_event, payload: { name?: string; workspacePath?: string | null }) =>
       requireOrchestrator().createProject(payload.name, payload.workspacePath),
