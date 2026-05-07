@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, type OpenDialogOptions } from "electron";
 import path from "node:path";
-import { clearOpenAiApiKey, getOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
+import { clearOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
 import appIcon from "./assets/app-icon.png?asset";
 import { CodexBridge } from "./codexBridge";
 import { VoiceCodexOrchestrator } from "./orchestrator";
@@ -374,7 +374,6 @@ function registerIpc(): void {
   registerIpcHandler("voiceTools:applyPatch", (_event, payload: { input: string }) =>
     requireOrchestrator().applyPatchForVoice(payload.input),
   );
-  registerIpcHandler("settings:getOpenAiApiKey", () => getOpenAiApiKey());
   registerIpcHandler("settings:saveOpenAiApiKey", (_event, payload: { apiKey: string }) => {
     saveOpenAiApiKey(payload.apiKey);
   });

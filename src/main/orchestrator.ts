@@ -3843,27 +3843,26 @@ function permissionProfile(mode: CodexPermissionMode) {
   );
 }
 
-function threadPermissionParams(mode: CodexPermissionMode): {
+type CodexPermissionParams = {
   approvalPolicy?: CodexApprovalPolicy;
   approvalsReviewer?: CodexApprovalsReviewer;
   sandbox?: CodexSandboxMode;
-} {
+};
+
+function threadPermissionParams(mode: CodexPermissionMode): CodexPermissionParams {
+  return codexPermissionParams(mode);
+}
+
+function turnPermissionParams(mode: CodexPermissionMode): CodexPermissionParams {
+  return codexPermissionParams(mode);
+}
+
+function codexPermissionParams(mode: CodexPermissionMode): CodexPermissionParams {
   const profile = permissionProfile(mode);
   return {
     ...(profile.approvalPolicy ? { approvalPolicy: profile.approvalPolicy } : {}),
     ...(profile.approvalsReviewer ? { approvalsReviewer: profile.approvalsReviewer } : {}),
     ...(profile.sandbox ? { sandbox: profile.sandbox } : {}),
-  };
-}
-
-function turnPermissionParams(mode: CodexPermissionMode): {
-  approvalPolicy?: CodexApprovalPolicy;
-  approvalsReviewer?: CodexApprovalsReviewer;
-} {
-  const profile = permissionProfile(mode);
-  return {
-    ...(profile.approvalPolicy ? { approvalPolicy: profile.approvalPolicy } : {}),
-    ...(profile.approvalsReviewer ? { approvalsReviewer: profile.approvalsReviewer } : {}),
   };
 }
 

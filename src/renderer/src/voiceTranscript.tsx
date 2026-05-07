@@ -1773,7 +1773,11 @@ function isRealtimeAssistantTranscriptDelta(kind: string): boolean {
 }
 
 function realtimeTranscriptText(event: AppEvent, raw: Record<string, unknown> | null): string | null {
-  return stringFromUnknown(raw?.transcript) ?? stringFromUnknown(raw?.text) ?? stringFromUnknown(event.message);
+  const text = stringFromUnknown(raw?.transcript) ?? stringFromUnknown(raw?.text);
+  if (text) return text;
+  const fallback = stringFromUnknown(event.message);
+  if (!fallback || fallback === event.kind || fallback.includes("_audio_transcript")) return null;
+  return fallback;
 }
 
 function realtimeStreamKey(role: "user" | "assistant", raw: Record<string, unknown> | null, event: AppEvent): string {

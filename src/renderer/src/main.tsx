@@ -730,20 +730,8 @@ function VoiceHome({
   }, [onboardingRequestId]);
 
   useEffect(() => {
-    if (!apiKeyDialogMode && !settingsOpen && !onboardingOpen) return undefined;
-    let cancelled = false;
+    if (!apiKeyDialogMode && !settingsOpen && !onboardingOpen) return;
     setApiKey("");
-    void window.codexVoice
-      .getOpenAiApiKey()
-      .then((currentApiKey) => {
-        if (!cancelled) setApiKey(currentApiKey ?? "");
-      })
-      .catch(() => {
-        if (!cancelled) setApiKey("");
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [apiKeyDialogMode, onboardingOpen, settingsOpen]);
 
   useEffect(() => {
@@ -912,12 +900,14 @@ function VoiceHome({
   }
 
   function completeOnboarding(): void {
+    setApiKey("");
     saveVoiceOnboardingSeen(true);
     setOnboardingSeen(true);
     setOnboardingOpen(false);
   }
 
   function closeApiKeyDialog(): void {
+    setApiKey("");
     setApiKeyDialogMode(null);
   }
 
@@ -1628,6 +1618,9 @@ function VoiceSettingsPane({
   const activeProject = state.activeProject;
   const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
   const hasApiKey = Boolean(apiKey.trim());
+  const apiKeySource = state.realtime.apiKeySource;
+  const apiKeyManagedByEnvironment = apiKeySource === "environment";
+  const canClearSavedApiKey = apiKeySource === "saved";
   const realtimeSupportsReasoning = state.realtime.model === "gpt-realtime-2";
   const selectedRealtimeReasoningEffort =
     state.realtime.reasoningEffort ?? DEFAULT_REALTIME_REASONING_EFFORT;
@@ -1743,23 +1736,28 @@ function VoiceSettingsPane({
               <section className="voice-settings-section">
                 <h3>OpenAI API key</h3>
                 <form className="voice-settings-card voice-settings-api-key" onSubmit={(event) => void onSaveApiKey(event)}>
+                  <div className="voice-settings-secret-status">
+                    <strong>{apiKeyStorageTitle(state.realtime)}</strong>
+                    <small>{apiKeyStorageDetail(state.realtime)}</small>
+                  </div>
                   <label className="voice-settings-field">
-                    API key
+                    {apiKeySource === "saved" ? "Replacement key" : "API key"}
                     <input
                       type="password"
                       value={apiKey}
                       onChange={(event) => onApiKeyChange(event.target.value)}
-                      placeholder={state.realtime.available ? "Saved key" : "sk-..."}
+                      placeholder={apiKeyInputPlaceholder(state.realtime)}
+                      disabled={apiKeyManagedByEnvironment}
                       autoComplete="off"
                       spellCheck={false}
                     />
                   </label>
                   <div className="voice-settings-actions inline">
-                    <button type="button" onClick={() => void onClearApiKey()}>
+                    <button type="button" onClick={() => void onClearApiKey()} disabled={!canClearSavedApiKey}>
                       Clear
                     </button>
-                    <button type="submit" className="primary" disabled={!hasApiKey}>
-                      Save
+                    <button type="submit" className="primary" disabled={!hasApiKey || apiKeyManagedByEnvironment}>
+                      {apiKeySource === "saved" ? "Replace" : "Save"}
                     </button>
                   </div>
                 </form>
@@ -1976,6 +1974,10 @@ function VoiceSettingsPane({
               <section className="voice-settings-section">
                 <h3>Permissions</h3>
                 <div className="voice-settings-card permission-settings-card">
+                  <div className="voice-settings-permission-note">
+                    <strong>Direct voice tools run in this workspace</strong>
+                    <small>{workspace}</small>
+                  </div>
                   {CODEX_PERMISSION_PROFILES.map((profile) => (
                     <button
                       key={profile.mode}
@@ -2216,9 +2218,9 @@ function OnboardingFlow({
   const initialStep = state.realtime.available ? "voice" : "key";
   const [step, setStep] = useState<OnboardingStep>(initialStep);
   const [revealed, setRevealed] = useState(false);
-  const [copied, setCopied] = useState(false);
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const hasApiKey = Boolean(apiKey.trim());
+  const apiKeyManagedByEnvironment = state.realtime.apiKeySource === "environment";
   const selectedVoice = realtimeVoiceOption(state.realtime.voice);
   const selectedOrb = voiceOrbPresetById(orbPresetId);
   const hasProject = state.projects.length > 0;
@@ -2237,30 +2239,16 @@ function OnboardingFlow({
     { id: "project", label: "Project", complete: hasProject },
   ];
 
-  useEffect(() => {
-    if (!copied) return undefined;
-    const timeoutId = window.setTimeout(() => setCopied(false), 1400);
-    return () => window.clearTimeout(timeoutId);
-  }, [copied]);
-
-  async function copyApiKey(): Promise<void> {
-    if (!hasApiKey) return;
-    try {
-      await navigator.clipboard.writeText(apiKey);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
-  }
-
   async function saveKeyAndContinue(): Promise<void> {
+    if (hasApiKey) {
+      await onSaveApiKey();
+      setStep("voice");
+      return;
+    }
     if (state.realtime.available) {
       setStep("voice");
       return;
     }
-    if (!hasApiKey) return;
-    await onSaveApiKey();
-    setStep("voice");
   }
 
   async function goNext(): Promise<void> {
@@ -2337,7 +2325,7 @@ function OnboardingFlow({
                 >
                   <InfoIcon />
                   <span className="api-key-info-popover" role="status">
-                    Stored locally with Electron safeStorage when available. OPENAI_API_KEY takes precedence.
+                    Main creates Realtime client secrets. Saved keys are not sent back to this window.
                   </span>
                 </button>
               </div>
@@ -2351,7 +2339,8 @@ function OnboardingFlow({
                     type={revealed ? "text" : "password"}
                     value={apiKey}
                     onChange={(event) => onApiKeyChange(event.target.value)}
-                    placeholder={state.realtime.available ? "Saved key" : "sk-..."}
+                    placeholder={apiKeyInputPlaceholder(state.realtime)}
+                    disabled={apiKeyManagedByEnvironment}
                     autoComplete="off"
                     spellCheck={false}
                   />
@@ -2364,15 +2353,6 @@ function OnboardingFlow({
                       onClick={() => setRevealed((current) => !current)}
                     >
                       {revealed ? <EyeOffIcon /> : <EyeIcon />}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="Copy API key"
-                      title="Copy key"
-                      disabled={!hasApiKey}
-                      onClick={() => void copyApiKey()}
-                    >
-                      {copied ? <CheckIcon /> : <CopyIcon />}
                     </button>
                   </div>
                 </div>
@@ -3263,20 +3243,15 @@ function ApiKeyDialog({
 }): React.ReactElement {
   const [revealed, setRevealed] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
   const [waveDancing, setWaveDancing] = useState(false);
   const waveDanceTimeoutRef = useRef<number | null>(null);
   const title = mode === "onboarding" ? "Connect OpenAI" : "OpenAI API key";
-  const primaryLabel = mode === "onboarding" ? "Save key" : "Save";
+  const primaryLabel =
+    realtime.apiKeySource === "saved" ? "Replace" : mode === "onboarding" ? "Save key" : "Save";
   const secondaryLabel = mode === "onboarding" ? "Later" : "Cancel";
   const hasApiKey = Boolean(apiKey.trim());
+  const apiKeyManagedByEnvironment = realtime.apiKeySource === "environment";
   const health = realtimeHealth(realtime, realtimeIssue);
-
-  useEffect(() => {
-    if (!copied) return undefined;
-    const timeoutId = window.setTimeout(() => setCopied(false), 1600);
-    return () => window.clearTimeout(timeoutId);
-  }, [copied]);
 
   useEffect(
     () => () => {
@@ -3297,16 +3272,6 @@ function ApiKeyDialog({
       setWaveDancing(false);
       waveDanceTimeoutRef.current = null;
     }, 1280);
-  }
-
-  async function copyApiKey(): Promise<void> {
-    if (!hasApiKey) return;
-    try {
-      await navigator.clipboard.writeText(apiKey);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
   }
 
   return (
@@ -3351,8 +3316,7 @@ function ApiKeyDialog({
           </button>
           {infoOpen && (
             <div className="api-key-info-popover" role="status">
-              Stored locally with Electron safeStorage when available. OPENAI_API_KEY takes
-              precedence.
+              Main creates Realtime client secrets. Saved keys are not sent back to this window.
             </div>
           )}
         </div>
@@ -3366,7 +3330,8 @@ function ApiKeyDialog({
               type={revealed ? "text" : "password"}
               value={apiKey}
               onChange={(event) => onApiKeyChange(event.target.value)}
-              placeholder={realtime.available ? "Saved key" : "sk-..."}
+              placeholder={apiKeyInputPlaceholder(realtime)}
+              disabled={apiKeyManagedByEnvironment}
               autoComplete="off"
               spellCheck={false}
             />
@@ -3380,15 +3345,6 @@ function ApiKeyDialog({
               >
                 {revealed ? <EyeOffIcon /> : <EyeIcon />}
               </button>
-              <button
-                type="button"
-                aria-label="Copy API key"
-                title="Copy key"
-                disabled={!hasApiKey}
-                onClick={() => void copyApiKey()}
-              >
-                {copied ? <CheckIcon /> : <CopyIcon />}
-              </button>
             </div>
           </div>
         </div>
@@ -3397,7 +3353,7 @@ function ApiKeyDialog({
           <button type="button" onClick={onClose}>
             {secondaryLabel}
           </button>
-          <button type="submit" className="voice-primary" disabled={!hasApiKey}>
+          <button type="submit" className="voice-primary" disabled={!hasApiKey || apiKeyManagedByEnvironment}>
             {primaryLabel}
           </button>
         </div>
@@ -4001,6 +3957,32 @@ function realtimeHealth(
   return { ok: true, message: "Realtime API key is ready." };
 }
 
+function apiKeyInputPlaceholder(realtime: AppState["realtime"]): string {
+  if (realtime.apiKeySource === "environment") return "OPENAI_API_KEY is set";
+  if (realtime.apiKeySource === "saved") return "Paste a replacement key";
+  return "sk-...";
+}
+
+function apiKeyStorageTitle(realtime: AppState["realtime"]): string {
+  if (realtime.apiKeySource === "environment") return "Environment key active";
+  if (realtime.apiKeySource === "saved") {
+    return realtime.apiKeyEncrypted ? "Saved key encrypted" : "Saved key active";
+  }
+  return "No key configured";
+}
+
+function apiKeyStorageDetail(realtime: AppState["realtime"]): string {
+  if (realtime.apiKeySource === "environment") {
+    return "Loaded by main from OPENAI_API_KEY. Remove it from the environment to use a saved key.";
+  }
+  if (realtime.apiKeySource === "saved") {
+    return realtime.apiKeyEncrypted
+      ? "Stored with Electron safeStorage. Paste a new key here to replace it."
+      : "Stored locally without safeStorage encryption on this machine.";
+  }
+  return "Paste a key once. After saving, this window cannot read it back.";
+}
+
 function friendlyRealtimeIssue(issue: string): string {
   const message = openAiErrorMessage(issue);
   const haystack = `${issue} ${message ?? ""}`.toLowerCase();
@@ -4350,15 +4332,6 @@ function EyeOffIcon(): React.ReactElement {
       <path d="M9.2 6.95A8.88 8.88 0 0 1 12 6.5c5.35 0 8.5 5.5 8.5 5.5a14.7 14.7 0 0 1-2.7 3.24" />
       <path d="M14.15 14.3a2.45 2.45 0 0 1-3.45-3.45" />
       <path d="M6.2 8.7A14.7 14.7 0 0 0 3.5 12s3.15 5.5 8.5 5.5c1.02 0 1.96-.2 2.8-.54" />
-    </svg>
-  );
-}
-
-function CopyIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <rect x="8.25" y="8.25" width="11" height="11" rx="2" />
-      <path d="M5.75 15.75h-.5a2 2 0 0 1-2-2v-8.5a2 2 0 0 1 2-2h8.5a2 2 0 0 1 2 2v.5" />
     </svg>
   );
 }

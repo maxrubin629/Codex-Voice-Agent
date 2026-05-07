@@ -74,7 +74,6 @@ const api: CodexVoiceApi = {
   writeStdin: (args: VoiceWriteStdinArgs) => ipcRenderer.invoke("voiceTools:writeStdin", args),
   terminateExecSession: (sessionId: number) => ipcRenderer.invoke("voiceTools:terminateExecSession", { sessionId }),
   applyPatch: (input: string) => ipcRenderer.invoke("voiceTools:applyPatch", { input }),
-  getOpenAiApiKey: () => ipcRenderer.invoke("settings:getOpenAiApiKey"),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),

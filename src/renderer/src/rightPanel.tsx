@@ -323,13 +323,6 @@ export function RightPanel({
       />
 
       <div className="voice-right-inner">
-        <header className="voice-right-header">
-          <div>
-            <h2>Context</h2>
-            <small>{activeProject?.displayName ?? "No active project"}</small>
-          </div>
-        </header>
-
         <div className="voice-right-tabbar">
           <div
             className="voice-right-tabs"
@@ -961,7 +954,9 @@ function LastOutputTab({ activeChat }: { activeChat: VoiceChat | null }): React.
 
 function ChatsTab({ state }: { state: AppState }): React.ReactElement {
   const project = state.activeProject;
-  if (!project) return <RightPanelEmpty title="No active project" detail="Project chats will appear here once a project is selected." />;
+  if (!project) {
+    return <RightPanelEmpty title="No chats yet" detail="Create or resume a project and its chats will appear here." />;
+  }
   const chats = project.chats.filter((chat) => !chat.archivedAt);
   return (
     <div className="voice-right-stack">

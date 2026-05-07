@@ -1030,6 +1030,33 @@ code {
   padding: 12px 13px;
 }
 
+.voice-settings-permission-note,
+.voice-settings-secret-status {
+  display: grid;
+  gap: 3px;
+  padding: 12px 13px;
+}
+
+.voice-settings-permission-note {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.voice-settings-permission-note strong,
+.voice-settings-secret-status strong {
+  color: rgba(244, 248, 255, 0.88);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.voice-settings-permission-note small,
+.voice-settings-secret-status small {
+  color: rgba(204, 213, 226, 0.56);
+  font-size: 11px;
+  font-weight: 520;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .voice-settings-permission:hover,
 .voice-settings-permission.selected,
 .voice-settings-action:hover {
@@ -1089,6 +1116,7 @@ code {
 }
 
 .voice-settings-actions button:disabled {
+  cursor: not-allowed;
   opacity: 0.42;
 }
 
@@ -1994,46 +2022,17 @@ code {
   -webkit-app-region: no-drag;
 }
 
+.voice-home.future-open .voice-right-panel {
+  z-index: 100;
+}
+
 .voice-right-inner {
   display: flex;
   width: 100%;
   min-width: 0;
   height: 100%;
   flex-direction: column;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.01)),
-    rgba(18, 19, 20, 0.985);
-}
-
-.voice-right-header {
-  display: grid;
-  min-height: 54px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.075);
-  padding: 12px 58px 9px 16px;
-}
-
-.voice-right-header h2 {
-  margin: 0;
-  color: rgba(255, 255, 255, 0.96);
-  font-size: 17px;
-  font-weight: 680;
-  letter-spacing: 0;
-  line-height: 1.1;
-}
-
-.voice-right-header small {
-  display: block;
-  overflow: hidden;
-  margin-top: 5px;
-  color: rgba(211, 220, 235, 0.56);
-  font-size: 12px;
-  font-weight: 520;
-  line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  background: rgba(18, 19, 20, 0.985);
 }
 
 .voice-right-tab-menu-wrap,
@@ -2065,7 +2064,12 @@ code {
 }
 
 .voice-right-tab-menu-wrap > button {
-  width: 31px;
+  width: 34px;
+  min-height: 34px;
+  border-color: transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: rgba(229, 236, 247, 0.6);
   padding: 0;
 }
 
@@ -2088,18 +2092,26 @@ code {
 
 .voice-right-tabbar {
   position: relative;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: stretch;
-  gap: 6px;
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  gap: 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.075);
-  padding: 7px 8px;
+  padding: 10px 68px 8px 10px;
+  -webkit-app-region: no-drag;
+}
+
+.voice-right-tabbar button,
+.voice-right-tab-menu {
+  -webkit-app-region: no-drag;
 }
 
 .voice-right-tabs {
   display: flex;
   min-width: 0;
-  gap: 4px;
+  max-width: calc(100% - 42px);
+  flex: 0 1 auto;
+  gap: 6px;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
@@ -2111,34 +2123,36 @@ code {
 
 .voice-right-tab-shell {
   display: inline-grid;
-  min-width: 92px;
-  max-width: 172px;
+  min-width: 0;
+  max-width: 184px;
   grid-template-columns: minmax(0, 1fr) 24px;
   align-items: center;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 14px;
   color: rgba(219, 228, 242, 0.68);
   user-select: none;
 }
 
 .voice-right-tab-shell.active {
-  border-color: rgba(255, 255, 255, 0.09);
-  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.055);
+  background: rgba(255, 255, 255, 0.062);
   color: rgba(255, 255, 255, 0.94);
 }
 
 .voice-right-tab-shell button[role="tab"] {
   display: grid;
   min-width: 0;
-  min-height: 32px;
-  grid-template-columns: 17px minmax(0, 1fr);
+  min-height: 40px;
+  grid-template-columns: 20px minmax(0, 1fr);
   align-items: center;
-  gap: 6px;
-  border-radius: 8px;
+  gap: 8px;
+  border-radius: 14px;
   color: inherit;
-  font-size: 12px;
-  font-weight: 650;
-  padding: 0 7px;
+  font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+  font-size: 14px;
+  font-weight: 560;
+  letter-spacing: 0;
+  padding: 0 10px 0 12px;
   text-align: left;
 }
 
@@ -2170,13 +2184,14 @@ code {
 
 .voice-right-tab-menu-wrap {
   position: relative;
+  flex: 0 0 auto;
 }
 
 .voice-right-tab-menu {
   position: absolute;
   z-index: 4;
   top: 38px;
-  right: 0;
+  left: 0;
   display: grid;
   width: 186px;
   gap: 4px;
@@ -2818,10 +2833,9 @@ code {
 }
 
 @media (max-width: 719px) {
-  .voice-right-header {
-    min-height: 72px;
-    padding-top: 14px;
-    padding-left: var(--mac-titlebar-safe-left);
+  .voice-right-tabbar {
+    padding-top: 12px;
+    padding-left: max(10px, var(--mac-titlebar-safe-left));
   }
 
   .voice-right-body {

@@ -108,7 +108,7 @@ export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
   {
     mode: "default",
     displayName: "Default permissions",
-    description: "Ask when Codex decides approval is needed.",
+    description: "Workspace-write sandbox; Codex turns ask when approval is needed.",
     approvalPolicy: "on-request",
     approvalsReviewer: "user",
     sandbox: "workspace-write",
@@ -116,7 +116,7 @@ export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
   {
     mode: "auto-review",
     displayName: "Auto-review",
-    description: "Route eligible approval prompts through Codex auto-review.",
+    description: "Workspace-write sandbox with eligible Codex approvals auto-reviewed.",
     approvalPolicy: "on-request",
     approvalsReviewer: "auto_review",
     sandbox: "workspace-write",
@@ -132,7 +132,7 @@ export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
   {
     mode: "custom-config",
     displayName: "Custom (config.toml)",
-    description: "Use approval and sandbox settings from config.toml.",
+    description: "Use approval and sandbox settings from the active Codex config.",
     approvalPolicy: null,
     approvalsReviewer: null,
     sandbox: null,
@@ -574,7 +574,6 @@ export type CodexVoiceApi = {
   writeStdin(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult>;
   terminateExecSession(sessionId: number): Promise<void>;
   applyPatch(input: string): Promise<VoiceExecCommandResult>;
-  getOpenAiApiKey(): Promise<string | null>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;
