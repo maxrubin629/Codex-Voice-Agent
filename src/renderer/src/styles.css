@@ -2064,10 +2064,10 @@ code {
 }
 
 .voice-right-tab-menu-wrap > button {
-  width: 34px;
-  min-height: 34px;
+  width: var(--voice-titlebar-button-size);
+  min-height: var(--voice-titlebar-button-size);
   border-color: transparent;
-  border-radius: 10px;
+  border-radius: 12px;
   background: transparent;
   color: rgba(229, 236, 247, 0.6);
   padding: 0;
@@ -2093,11 +2093,11 @@ code {
 .voice-right-tabbar {
   position: relative;
   display: flex;
-  min-height: 56px;
-  align-items: center;
+  min-height: var(--voice-titlebar-drag-height);
+  align-items: flex-start;
   gap: 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.075);
-  padding: 10px 68px 8px 10px;
+  padding: var(--voice-titlebar-button-top) 68px 8px 10px;
   -webkit-app-region: no-drag;
 }
 
@@ -2123,6 +2123,7 @@ code {
 
 .voice-right-tab-shell {
   display: inline-grid;
+  height: var(--voice-titlebar-button-size);
   min-width: 0;
   max-width: 184px;
   grid-template-columns: minmax(0, 1fr) 24px;
@@ -2142,7 +2143,7 @@ code {
 .voice-right-tab-shell button[role="tab"] {
   display: grid;
   min-width: 0;
-  min-height: 40px;
+  min-height: var(--voice-titlebar-button-size);
   grid-template-columns: 20px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
