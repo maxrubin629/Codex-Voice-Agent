@@ -5,6 +5,7 @@ import type {
   ApprovalDecision,
   CodexPermissionMode,
   CodexSettingsScope,
+  CodexServiceTier,
   CodexVoiceApi,
   ReasoningEffort,
   RightPanelOpenTarget,
@@ -49,7 +50,12 @@ const api: CodexVoiceApi = {
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
   setCodexSettings: (
-    settings: { model?: string | null; reasoningEffort?: ReasoningEffort | null; permissionMode?: CodexPermissionMode | null },
+    settings: {
+      model?: string | null;
+      reasoningEffort?: ReasoningEffort | null;
+      serviceTier?: CodexServiceTier | null;
+      permissionMode?: CodexPermissionMode | null;
+    },
     scope: CodexSettingsScope,
   ) => ipcRenderer.invoke("codex:setSettings", { settings, scope }),
   answerApproval: (requestId: string | number, decision: ApprovalDecision) =>

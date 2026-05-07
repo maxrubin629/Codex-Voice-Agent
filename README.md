@@ -50,6 +50,11 @@ The app also exposes a Realtime model selector in Settings, with
 and supports minimal, low, medium, high, or xhigh reasoning effort for voice
 sessions.
 
+The app uses OpenAI's ephemeral-token WebRTC path: the desktop main process
+creates a Realtime client secret with the saved or environment API key, and the
+renderer posts browser SDP to `/v1/realtime/calls` with that short-lived secret.
+It does not use the unified server-side multipart `/v1/realtime/calls` sample.
+
 ## Development
 
 Run the app in development mode.
@@ -79,7 +84,7 @@ npm run preview
 ## Project layout
 
 ```text
-src/main/       Electron main process, Codex bridge, Realtime secret creation,
+src/main/       Desktop main process, Codex bridge, Realtime secret creation,
                 project store, and orchestration.
 src/preload/    Context-isolated renderer bridge.
 src/renderer/   React UI and browser-side Realtime client.

@@ -5,8 +5,10 @@ import {
   DEFAULT_CODEX_MODEL,
   DEFAULT_CODEX_PERMISSION_MODE,
   DEFAULT_CODEX_REASONING_EFFORT,
+  DEFAULT_CODEX_SERVICE_TIER,
   DEFAULT_REALTIME_MODEL,
   DEFAULT_REALTIME_REASONING_EFFORT,
+  FAST_CODEX_SERVICE_TIER,
   REALTIME_MODEL_OPTIONS,
   REALTIME_REASONING_EFFORT_OPTIONS,
   REALTIME_VOICE_OPTIONS,
@@ -14,6 +16,7 @@ import {
   type AppState,
   type CodexModelSummary,
   type CodexPermissionMode,
+  type CodexServiceTier,
   type CodexThreadTokenUsage,
   type CodexTurnOutput,
   type PendingCodexRequest,
@@ -51,15 +54,19 @@ const emptyState: AppState = {
   codexSettings: {
     chatModel: null,
     chatReasoningEffort: null,
+    chatServiceTier: DEFAULT_CODEX_SERVICE_TIER,
     chatPermissionMode: DEFAULT_CODEX_PERMISSION_MODE,
     nextTurnModel: null,
     nextTurnReasoningEffort: null,
+    nextTurnServiceTier: null,
     nextTurnPermissionMode: null,
     activeTurnModel: null,
     activeTurnReasoningEffort: null,
+    activeTurnServiceTier: null,
     activeTurnPermissionMode: null,
     defaultModel: DEFAULT_CODEX_MODEL,
     defaultReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
+    defaultServiceTier: DEFAULT_CODEX_SERVICE_TIER,
     defaultPermissionMode: DEFAULT_CODEX_PERMISSION_MODE,
     models: [],
   },
@@ -339,8 +346,6 @@ function App(): React.ReactElement {
         voiceRef.current?.speakPendingRequest(event.raw as PendingCodexRequest);
       } else if (event.source === "codex" && event.kind === "turn/finalOutput") {
         voiceRef.current?.injectCodexTurnOutput(event.raw as CodexTurnOutput);
-      } else if (event.source === "codex" && event.kind === "turn/completed") {
-        voiceRef.current?.notifyCodexTurnCompleted(event);
       } else if (event.source === "codex" && event.kind === "error") {
         voiceRef.current?.speakStatus(event.message);
       }
@@ -618,6 +623,11 @@ function VoiceHome({
     state.codexSettings.chatReasoningEffort ??
     state.codexSettings.defaultReasoningEffort ??
     DEFAULT_CODEX_REASONING_EFFORT;
+  const effectiveServiceTier =
+    state.codexSettings.nextTurnServiceTier ??
+    state.codexSettings.chatServiceTier ??
+    state.codexSettings.defaultServiceTier ??
+    DEFAULT_CODEX_SERVICE_TIER;
   const effectivePermissionMode =
     state.codexSettings.nextTurnPermissionMode ??
     state.codexSettings.chatPermissionMode ??
@@ -1196,6 +1206,7 @@ function VoiceHome({
           modelScope={modelScope}
           effectiveModel={effectiveModel}
           effectiveEffort={effectiveEffort}
+          effectiveServiceTier={effectiveServiceTier}
           effectivePermissionMode={effectivePermissionMode}
           modelOptions={modelOptions}
           orbPresetId={orbPresetId}
@@ -1565,6 +1576,7 @@ function VoiceSettingsPane({
   modelScope,
   effectiveModel,
   effectiveEffort,
+  effectiveServiceTier,
   effectivePermissionMode,
   modelOptions,
   orbPresetId,
@@ -1592,6 +1604,7 @@ function VoiceSettingsPane({
   modelScope: "chat" | "nextTurn";
   effectiveModel: string;
   effectiveEffort: ReasoningEffort;
+  effectiveServiceTier: CodexServiceTier | null;
   effectivePermissionMode: CodexPermissionMode;
   modelOptions: CodexModelSummary[];
   orbPresetId: VoiceOrbPresetId;
@@ -1618,6 +1631,9 @@ function VoiceSettingsPane({
   const realtimeSupportsReasoning = state.realtime.model === "gpt-realtime-2";
   const selectedRealtimeReasoningEffort =
     state.realtime.reasoningEffort ?? DEFAULT_REALTIME_REASONING_EFFORT;
+  const selectedCodexModel = modelOptions.find((model) => model.model === effectiveModel) ?? null;
+  const modelSupportsFast = supportsFastMode(selectedCodexModel);
+  const fastModeOn = isFastServiceTier(effectiveServiceTier);
   const tabs: Array<{ id: VoiceSettingsTab; label: string; icon: React.ReactElement }> = [
     { id: "general", label: "General", icon: <ConfigIcon /> },
     { id: "appearance", label: "Appearance", icon: <AppearanceIcon /> },
@@ -1874,11 +1890,15 @@ function VoiceSettingsPane({
                     <span className="voice-settings-select-wrap">
                       <select
                         value={effectiveModel}
-                        onChange={(event) =>
+                        onChange={(event) => {
+                          const model = event.target.value || null;
+                          const nextModel = modelOptions.find((candidate) => candidate.model === model) ?? null;
+                          const serviceTier =
+                            model && !supportsFastMode(nextModel) ? DEFAULT_CODEX_SERVICE_TIER : effectiveServiceTier;
                           void onAction(() =>
-                            window.codexVoice.setCodexSettings({ model: event.target.value || null }, modelScope),
-                          )
-                        }
+                            window.codexVoice.setCodexSettings({ model, serviceTier }, modelScope),
+                          );
+                        }}
                       >
                         {modelOptions.length === 0 && (
                           <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
@@ -1908,6 +1928,47 @@ function VoiceSettingsPane({
                         {formatEffort(effort)}
                       </button>
                     ))}
+                  </div>
+
+                  <div className="voice-settings-speed">
+                    <div className="voice-settings-speed-header">
+                      <span>
+                        <strong>Speed</strong>
+                        <small>{fastModeOn ? "Fast mode" : "Standard speed"}</small>
+                      </span>
+                    </div>
+                    <div className="voice-settings-segmented codex-speed" aria-label="Codex speed">
+                      <button
+                        type="button"
+                        className={!fastModeOn ? "selected" : ""}
+                        onClick={() =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings(
+                              { serviceTier: DEFAULT_CODEX_SERVICE_TIER },
+                              modelScope,
+                            ),
+                          )
+                        }
+                      >
+                        Standard
+                      </button>
+                      <button
+                        type="button"
+                        className={fastModeOn ? "selected" : ""}
+                        disabled={!modelSupportsFast}
+                        title={modelSupportsFast ? "Use Fast mode" : "Fast mode is not reported for this model"}
+                        onClick={() =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings(
+                              { serviceTier: FAST_CODEX_SERVICE_TIER },
+                              modelScope,
+                            ),
+                          )
+                        }
+                      >
+                        Fast
+                      </button>
+                    </div>
                   </div>
                 </div>
               </section>
@@ -4044,9 +4105,27 @@ function modelsForValue(models: CodexModelSummary[], value: string | null): Code
       hidden: false,
       defaultReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
       supportedReasoningEfforts: [],
+      additionalSpeedTiers: [],
+      serviceTiers: [],
     },
     ...models,
   ];
+}
+
+function supportsFastMode(model: CodexModelSummary | null): boolean {
+  if (!model) return false;
+  return (
+    model.serviceTiers.some((tier) => tier.id === FAST_CODEX_SERVICE_TIER || tier.name.toLowerCase() === "fast") ||
+    model.additionalSpeedTiers.includes("fast")
+  );
+}
+
+function isFastServiceTier(value: CodexServiceTier | null | undefined): boolean {
+  return value === FAST_CODEX_SERVICE_TIER || value === "fast";
+}
+
+function formatServiceTier(value: CodexServiceTier | null | undefined): string {
+  return isFastServiceTier(value) ? "Fast" : "Standard";
 }
 
 function formatEffort(effort: string | null): string {
@@ -4297,6 +4376,8 @@ function CodexSettingsPanel({
   const nextTurnModel = state.codexSettings.nextTurnModel ?? "";
   const chatEffort = state.codexSettings.chatReasoningEffort ?? "";
   const nextTurnEffort = state.codexSettings.nextTurnReasoningEffort ?? "";
+  const chatServiceTier = state.codexSettings.chatServiceTier ?? "";
+  const nextTurnServiceTier = state.codexSettings.nextTurnServiceTier ?? "";
   const chatPermissionMode = state.codexSettings.chatPermissionMode;
   const nextTurnPermissionMode = state.codexSettings.nextTurnPermissionMode ?? "";
   const chatModelOptions = modelsForValue(models, chatModel);
@@ -4309,18 +4390,25 @@ function CodexSettingsPanel({
           label="Default"
           model={state.codexSettings.defaultModel ?? "unknown"}
           effort={state.codexSettings.defaultReasoningEffort ?? "unknown"}
+          speed={formatServiceTier(state.codexSettings.defaultServiceTier)}
           permission={permissionProfile(state.codexSettings.defaultPermissionMode).displayName}
         />
         <SettingReadout
           label="Chat"
           model={state.codexSettings.chatModel ?? "default"}
           effort={state.codexSettings.chatReasoningEffort ?? "default"}
+          speed={formatServiceTier(state.codexSettings.chatServiceTier)}
           permission={permissionProfile(state.codexSettings.chatPermissionMode).displayName}
         />
         <SettingReadout
           label="Next Turn"
           model={state.codexSettings.nextTurnModel ?? "chat/default"}
           effort={state.codexSettings.nextTurnReasoningEffort ?? "chat/default"}
+          speed={
+            state.codexSettings.nextTurnServiceTier
+              ? formatServiceTier(state.codexSettings.nextTurnServiceTier)
+              : "chat/default"
+          }
           permission={
             state.codexSettings.nextTurnPermissionMode
               ? permissionProfile(state.codexSettings.nextTurnPermissionMode).displayName
@@ -4331,6 +4419,11 @@ function CodexSettingsPanel({
           label="Active Turn"
           model={state.codexSettings.activeTurnModel ?? "none"}
           effort={state.codexSettings.activeTurnReasoningEffort ?? "none"}
+          speed={
+            state.codexSettings.activeTurnServiceTier
+              ? formatServiceTier(state.codexSettings.activeTurnServiceTier)
+              : "none"
+          }
           permission={
             state.codexSettings.activeTurnPermissionMode
               ? permissionProfile(state.codexSettings.activeTurnPermissionMode).displayName
@@ -4380,6 +4473,25 @@ function CodexSettingsPanel({
                 {effort}
               </option>
             ))}
+          </select>
+        </label>
+
+        <label>
+          Chat speed
+          <select
+            value={chatServiceTier}
+            disabled={!state.activeProject}
+            onChange={(event) =>
+              void onAction(() =>
+                window.codexVoice.setCodexSettings(
+                  { serviceTier: (event.target.value || null) as CodexServiceTier | null },
+                  "chat",
+                ),
+              )
+            }
+          >
+            <option value="">Standard</option>
+            <option value={FAST_CODEX_SERVICE_TIER}>Fast</option>
           </select>
         </label>
 
@@ -4447,6 +4559,24 @@ function CodexSettingsPanel({
         </label>
 
         <label>
+          Next-turn speed
+          <select
+            value={nextTurnServiceTier}
+            onChange={(event) =>
+              void onAction(() =>
+                window.codexVoice.setCodexSettings(
+                  { serviceTier: (event.target.value || null) as CodexServiceTier | null },
+                  "nextTurn",
+                ),
+              )
+            }
+          >
+            <option value="">Use chat/default</option>
+            <option value={FAST_CODEX_SERVICE_TIER}>Fast</option>
+          </select>
+        </label>
+
+        <label>
           Next-turn permissions
           <select
             value={nextTurnPermissionMode}
@@ -4476,25 +4606,29 @@ function SettingReadout({
   label,
   model,
   effort,
+  speed,
   permission,
 }: {
   label: string;
   model: string;
   effort: string;
+  speed: string;
   permission: string;
 }): React.ReactElement {
   return (
     <div className="setting-readout">
       <span>{label}</span>
       <strong>{model}</strong>
-      <small>{effort}</small>
+      <small>
+        {effort} / {speed}
+      </small>
       <small>{permission}</small>
     </div>
   );
 }
 
 function NativeSlashPanel(): React.ReactElement {
-  const backed = ["/status", "/model", "/review", "/compact", "/mcp", "/apps", "/plugins"];
+  const backed = ["/status", "/model", "/fast", "/review", "/compact", "/mcp", "/apps", "/plugins"];
   const projectCommands = ["/new", "/resume"];
   const recognized = ["/feedback", "/plan-mode", "/diff", "/init", "/permissions", "/agent", "/stop"];
   return (

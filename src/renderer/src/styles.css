@@ -984,6 +984,47 @@ code {
   transform: none;
 }
 
+.voice-settings-speed {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.075);
+  padding: 11px 8px 8px;
+}
+
+.voice-settings-speed-header span {
+  display: grid;
+  gap: 2px;
+}
+
+.voice-settings-speed-header strong,
+.voice-settings-speed-header small {
+  font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+  letter-spacing: 0;
+}
+
+.voice-settings-speed-header strong {
+  color: rgba(244, 248, 255, 0.9);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.voice-settings-speed-header small {
+  color: rgba(204, 213, 226, 0.58);
+  font-size: 11px;
+  font-weight: 540;
+}
+
+.voice-settings-segmented.codex-speed {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 0;
+  padding: 0;
+}
+
+.voice-settings-segmented.codex-speed button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .voice-settings-permission {
   grid-template-columns: 24px minmax(0, 1fr) 20px;
   padding: 12px 13px;

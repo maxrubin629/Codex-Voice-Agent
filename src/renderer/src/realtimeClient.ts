@@ -95,7 +95,10 @@ export class RealtimeVoiceClient {
       this.dc = dc;
       dc.addEventListener("open", () => {
         this.setPaused(false);
-        this.callbacks.onConnectionChange(true, `Connected to ${secret.model} (${secret.voice}).`);
+        this.callbacks.onConnectionChange(
+          true,
+          `Connected to ${secret.model} (${secret.voice}, reasoning ${secret.reasoningEffort}).`,
+        );
         this.log("connection", "Realtime data channel opened.");
       });
       dc.addEventListener("close", () => {
@@ -199,6 +202,25 @@ export class RealtimeVoiceClient {
     if (!this.connected) return;
     this.sendConversationText(codexTurnOutputContextText(output));
     this.log("codexTurnOutputContext", "Injected Codex final output into Realtime context.", output);
+    if (this.paused) return;
+
+    this.send({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
+        instructions: [
+          "App-provided Codex final output was just added to the conversation.",
+          "Give the user a short natural completion nudge, not a full summary.",
+          "Prefer the shape: 'Hey, just wanted to let you know Codex finished ...' but vary the wording naturally.",
+          "Use the final output to decide whether the blank should be a specific task/outcome, a blocker, or no extra detail.",
+          "Share at most one specific detail unless the final output says Codex failed or the user needs to act.",
+          "If no concise specific detail is obvious, simply say Codex finished.",
+          "Do not read long paths, logs, lists, or test output aloud.",
+          "Use one short sentence, or two only if there is an important next step.",
+          "Do not call tools.",
+        ].join("\n"),
+      },
+    });
   }
 
   speakPendingRequest(request: PendingCodexRequest): void {
