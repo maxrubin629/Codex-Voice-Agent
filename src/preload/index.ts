@@ -7,14 +7,18 @@ import type {
   CodexSettingsScope,
   CodexVoiceApi,
   ReasoningEffort,
+  RightPanelOpenTarget,
+  RightPanelPreviewRequest,
   ToolQuestionAnswer,
   VoiceExecCommandArgs,
   VoiceWriteStdinArgs,
+  WindowChromeState,
 } from "../shared/types";
 
 const api: CodexVoiceApi = {
   getState: () => ipcRenderer.invoke("app:getState"),
   openVoiceWindow: () => ipcRenderer.invoke("app:openVoiceWindow"),
+  getWindowChromeState: () => ipcRenderer.invoke("app:getWindowChromeState"),
   openDebugWindow: () => ipcRenderer.invoke("app:openDebugWindow"),
   getEvents: () => ipcRenderer.invoke("app:getEvents"),
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
@@ -50,6 +54,14 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:answerApproval", { requestId, decision }),
   answerToolQuestion: (requestId: string | number, answers: ToolQuestionAnswer[]) =>
     ipcRenderer.invoke("codex:answerToolQuestion", { requestId, answers }),
+  getActiveThreadSummary: (chatId?: string) =>
+    ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
+  getGitChangeSummary: (workspacePath?: string | null) =>
+    ipcRenderer.invoke("rightPanel:getGitChangeSummary", { workspacePath }),
+  previewRightPanelTarget: (target: RightPanelPreviewRequest) =>
+    ipcRenderer.invoke("rightPanel:previewTarget", target),
+  openRightPanelTarget: (target: RightPanelOpenTarget) =>
+    ipcRenderer.invoke("rightPanel:openTarget", target),
   execCommand: (args: VoiceExecCommandArgs) => ipcRenderer.invoke("voiceTools:execCommand", args),
   writeStdin: (args: VoiceWriteStdinArgs) => ipcRenderer.invoke("voiceTools:writeStdin", args),
   terminateExecSession: (sessionId: number) => ipcRenderer.invoke("voiceTools:terminateExecSession", { sessionId }),
@@ -59,6 +71,11 @@ const api: CodexVoiceApi = {
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),
   setRealtimeSettings: (settings) => ipcRenderer.invoke("realtime:setSettings", { settings }),
+  onWindowChromeState: (listener: (state: WindowChromeState) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: WindowChromeState) => listener(state);
+    ipcRenderer.on("app:windowChromeState", handler);
+    return () => ipcRenderer.off("app:windowChromeState", handler);
+  },
   onAppState: (listener: (state: AppState) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, state: AppState) => listener(state);
     ipcRenderer.on("app:state", handler);

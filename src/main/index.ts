@@ -5,6 +5,11 @@ import appIcon from "./assets/app-icon.png?asset";
 import { CodexBridge } from "./codexBridge";
 import { VoiceCodexOrchestrator } from "./orchestrator";
 import { ProjectStore } from "./projectStore";
+import {
+  openRightPanelTarget,
+  previewRightPanelTarget,
+  readGitChangeSummary,
+} from "./rightPanelData";
 import type {
   ApprovalDecision,
   AppEvent,
@@ -14,9 +19,12 @@ import type {
   RealtimeReasoningEffort,
   RealtimeVoiceId,
   ReasoningEffort,
+  RightPanelOpenTarget,
+  RightPanelPreviewRequest,
   ToolQuestionAnswer,
   VoiceExecCommandArgs,
   VoiceWriteStdinArgs,
+  WindowChromeState,
 } from "../shared/types";
 
 const maxBufferedEvents = 250;
@@ -59,6 +67,9 @@ function createVoiceWindow(): void {
 
   loadRenderer(window, "voice");
   window.webContents.setZoomFactor(0.85);
+  window.webContents.once("did-finish-load", () => publishWindowChromeState(window));
+  window.on("enter-full-screen", () => publishWindowChromeState(window));
+  window.on("leave-full-screen", () => publishWindowChromeState(window));
   window.on("closed", () => {
     if (voiceWindow === window) voiceWindow = null;
   });
@@ -115,6 +126,17 @@ function broadcastToAppWindows(channel: string, payload: unknown): void {
   for (const window of appWindows()) {
     window.webContents.send(channel, payload);
   }
+}
+
+function windowChromeStateFor(window: BrowserWindow | null): WindowChromeState {
+  return {
+    isFullScreen: Boolean(window && !window.isDestroyed() && window.isFullScreen()),
+  };
+}
+
+function publishWindowChromeState(window: BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  window.webContents.send("app:windowChromeState", windowChromeStateFor(window));
 }
 
 function recordEvent(event: AppEvent): void {
@@ -190,6 +212,9 @@ function registerIpc(): void {
   registerIpcHandler("app:openVoiceWindow", () => {
     createVoiceWindow();
   });
+  registerIpcHandler("app:getWindowChromeState", (event) =>
+    windowChromeStateFor(BrowserWindow.fromWebContents(event.sender)),
+  );
   registerIpcHandler("app:openDebugWindow", () => {
     createDebugWindow();
   });
@@ -304,6 +329,22 @@ function registerIpc(): void {
     "codex:answerToolQuestion",
     (_event, payload: { requestId: string | number; answers: ToolQuestionAnswer[] }) =>
       requireOrchestrator().answerToolQuestion(payload.requestId, payload.answers),
+  );
+  registerIpcHandler(
+    "rightPanel:getActiveThreadSummary",
+    (_event, payload?: { chatId?: string }) => requireOrchestrator().getActiveThreadSummary(payload?.chatId),
+  );
+  registerIpcHandler(
+    "rightPanel:getGitChangeSummary",
+    (_event, payload?: { workspacePath?: string | null }) => readGitChangeSummary(payload?.workspacePath),
+  );
+  registerIpcHandler(
+    "rightPanel:previewTarget",
+    (_event, payload: RightPanelPreviewRequest) => previewRightPanelTarget(payload),
+  );
+  registerIpcHandler(
+    "rightPanel:openTarget",
+    (_event, payload: RightPanelOpenTarget) => openRightPanelTarget(payload),
   );
   registerIpcHandler("voiceTools:execCommand", (_event, payload: VoiceExecCommandArgs) =>
     requireOrchestrator().execCommandForVoice(payload),

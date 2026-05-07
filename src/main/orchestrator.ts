@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import type {
   AppEvent,
+  ActiveThreadSummary,
   CodexApprovalPolicy,
   CodexApprovalsReviewer,
   AppState,
@@ -24,6 +25,11 @@ import type {
   PendingCodexRequest,
   RealtimeReasoningEffort,
   ReasoningEffort,
+  ThreadArtifactCandidate,
+  ThreadProgressItem,
+  ThreadSourceCandidate,
+  ThreadSummaryItem,
+  ThreadSummaryTurn,
   ToolQuestionAnswer,
   VoiceExecCommandArgs,
   VoiceExecCommandResult,
@@ -49,7 +55,9 @@ type TurnWaiter = {
 
 type ThreadReadResponse = {
   thread?: {
+    id?: string;
     turns?: CodexThreadTurn[];
+    status?: unknown;
   };
 };
 
@@ -61,12 +69,16 @@ type CodexThreadTurn = {
   startedAt?: number | null;
   completedAt?: number | null;
   durationMs?: number | null;
+  [key: string]: unknown;
 };
 
 type CodexThreadItem = {
   type?: string;
   text?: string;
   phase?: string | null;
+  status?: string;
+  id?: string;
+  [key: string]: unknown;
 };
 
 type ChatContext = {
@@ -713,6 +725,61 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const project = chatId ? await this.requireProjectForChat(chatId) : await this.requireProject();
     const runtimes = this.chatRuntimeStates(project);
     return chatId ? runtimes.filter((runtime) => runtime.chatId === chatId) : runtimes;
+  }
+
+  async getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary> {
+    let project: VoiceProject | null = null;
+    let chat: VoiceChat | null = null;
+    try {
+      project = chatId ? await this.requireProjectForChat(chatId) : await this.getActiveProject();
+      chat = project
+        ? chatId
+          ? project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt) ?? null
+          : activeChatForProject(project)
+        : null;
+    } catch (error) {
+      return emptyActiveThreadSummary({
+        status: "error",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!project) {
+      return emptyActiveThreadSummary({
+        status: "empty",
+        errorMessage: "No active project.",
+      });
+    }
+    if (!chat) {
+      return emptyActiveThreadSummary({
+        status: "empty",
+        project,
+        errorMessage: "No active chat.",
+      });
+    }
+    if (!chat.codexThreadId) {
+      return emptyActiveThreadSummary({
+        status: "empty",
+        project,
+        chat,
+        errorMessage: "Active chat does not have a Codex thread yet.",
+      });
+    }
+
+    try {
+      const response = (await this.codex.request("thread/read", {
+        threadId: chat.codexThreadId,
+        includeTurns: true,
+      })) as ThreadReadResponse;
+      return activeThreadSummaryFromRead(project, chat, response);
+    } catch (error) {
+      return emptyActiveThreadSummary({
+        status: "error",
+        project,
+        chat,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async setCodexSettings(
@@ -1822,6 +1889,770 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 }
 
+function emptyActiveThreadSummary({
+  status = "empty",
+  project = null,
+  chat = null,
+  errorMessage,
+}: {
+  status?: ActiveThreadSummary["status"];
+  project?: VoiceProject | null;
+  chat?: VoiceChat | null;
+  errorMessage?: string;
+}): ActiveThreadSummary {
+  return {
+    status,
+    ...(errorMessage ? { errorMessage } : {}),
+    projectId: project?.id ?? null,
+    projectName: project?.displayName ?? null,
+    workspacePath: project ? projectWorkspacePath(project) : null,
+    chatId: chat?.id ?? null,
+    chatName: chat?.displayName ?? null,
+    threadId: chat?.codexThreadId ?? null,
+    turnCount: 0,
+    latestTurnStatus: null,
+    latestAssistantText: chat?.lastTurnOutput?.finalAssistantText ?? null,
+    progress: [],
+    artifacts: [],
+    sources: [],
+    referencedFiles: [],
+    turns: [],
+    rawUnknownItems: [],
+  };
+}
+
+function activeThreadSummaryFromRead(
+  project: VoiceProject,
+  chat: VoiceChat,
+  response: ThreadReadResponse,
+): ActiveThreadSummary {
+  const rawTurns = response.thread?.turns ?? [];
+  const turns = rawTurns.map((turn, index) => summarizeThreadTurn(turn, index));
+  const rawItems = rawTurns.flatMap((turn) => turn.items ?? []);
+  const artifacts = dedupeArtifacts([
+    ...rawTurns.flatMap((turn, index) => artifactCandidatesFromTurn(turn, index)),
+    ...rawItems.flatMap((item, index) => artifactCandidatesFromItem(item, index)),
+  ]);
+  const sources = dedupeSources(rawItems.flatMap((item, index) => sourceCandidatesFromItem(item, index)));
+  const referencedFiles = artifacts.filter((artifact) => artifact.kind === "file");
+  const latestAssistantText =
+    [...turns].reverse().find((turn) => turn.assistantText?.trim())?.assistantText ??
+    chat.lastTurnOutput?.finalAssistantText ??
+    null;
+  const latestTurn = rawTurns.at(-1) ?? null;
+
+  return {
+    status: "ready",
+    projectId: project.id,
+    projectName: project.displayName,
+    workspacePath: projectWorkspacePath(project),
+    chatId: chat.id,
+    chatName: chat.displayName,
+    threadId: chat.codexThreadId,
+    turnCount: rawTurns.length,
+    latestTurnStatus: latestTurn?.status ?? null,
+    latestAssistantText,
+    progress: progressItemsFromThread(rawTurns, rawItems),
+    artifacts,
+    sources,
+    referencedFiles,
+    turns,
+    rawUnknownItems: rawItems
+      .filter((item) => !knownThreadItemTypes.has(normalizeThreadItemType(item)))
+      .slice(-40),
+  };
+}
+
+function summarizeThreadTurn(turn: CodexThreadTurn, index: number): ThreadSummaryTurn {
+  const items = turn.items ?? [];
+  return {
+    id: turn.id ?? `turn-${index + 1}`,
+    status: turn.status ?? "unknown",
+    startedAt: numberOrNull(turn.startedAt),
+    completedAt: numberOrNull(turn.completedAt),
+    durationMs: numberOrNull(turn.durationMs),
+    assistantText: finalAssistantTextFromTurn(turn),
+    itemCount: items.length,
+    items: items.map((item, itemIndex) => summarizeThreadItem(item, turn.id ?? `turn-${index + 1}`, itemIndex)),
+    ...(turn.error?.message ? { errorMessage: turn.error.message } : {}),
+  };
+}
+
+function summarizeThreadItem(item: CodexThreadItem, turnId: string, itemIndex: number): ThreadSummaryItem {
+  const type = rawThreadItemType(item);
+  return {
+    id: itemId(item, `${turnId}:item-${itemIndex + 1}`),
+    type,
+    status: stringField(item.status) ?? stringField(item.phase) ?? null,
+    label: labelForThreadItem(item),
+    detail: detailForThreadItem(item),
+    raw: item,
+  };
+}
+
+function progressItemsFromThread(
+  turns: CodexThreadTurn[],
+  rawItems: CodexThreadItem[],
+): ThreadProgressItem[] {
+  const progress: ThreadProgressItem[] = [];
+  for (const [index, item] of rawItems.entries()) {
+    const type = normalizeThreadItemType(item);
+    const status = normalizeProgressStatus(item.status ?? item.phase);
+    if (type === "todo-list") {
+      const tasks = taskRecords(item);
+      const completed = tasks.filter((task) => normalizeProgressStatus(task.status) === "completed").length;
+      progress.push({
+        id: itemId(item, `progress-${index}`),
+        label: "To do list",
+        detail: tasks.length > 0 ? `${completed} of ${tasks.length} tasks completed` : detailForThreadItem(item),
+        status: tasks.length > 0 && completed === tasks.length ? "completed" : status,
+        sourceType: type,
+        raw: item,
+      });
+      continue;
+    }
+    if (type === "proposed-plan" || type === "plan-implementation") {
+      progress.push({
+        id: itemId(item, `progress-${index}`),
+        label: type === "proposed-plan" ? "Plan proposed" : "Plan implementation",
+        detail: firstTextField(item, ["text", "summary", "description", "title"]),
+        status,
+        sourceType: type,
+        raw: item,
+      });
+      continue;
+    }
+    if (type === "reasoning") {
+      const summary = reasoningSummary(item);
+      if (summary) {
+        progress.push({
+          id: itemId(item, `progress-${index}`),
+          label: "Reasoning",
+          detail: summary,
+          status,
+          sourceType: type,
+          raw: item,
+        });
+      }
+      continue;
+    }
+    if (
+      status === "in_progress" ||
+      type === "exec" ||
+      type === "patch" ||
+      type === "web-search" ||
+      type === "mcp-tool-call" ||
+      type === "sub-agent" ||
+      type === "generated-image"
+    ) {
+      progress.push({
+        id: itemId(item, `progress-${index}`),
+        label: labelForThreadItem(item),
+        detail: detailForThreadItem(item),
+        status,
+        sourceType: type,
+        raw: item,
+      });
+    }
+  }
+
+  const latestTurn = turns.at(-1);
+  if (latestTurn && latestTurn.status && normalizeProgressStatus(latestTurn.status) === "in_progress") {
+    progress.push({
+      id: latestTurn.id ?? "latest-turn",
+      label: "Turn in progress",
+      detail: latestTurn.items?.at(-1) ? labelForThreadItem(latestTurn.items.at(-1)!) : null,
+      status: "in_progress",
+      sourceType: "turn",
+      raw: latestTurn,
+    });
+  }
+
+  return progress.slice(-18);
+}
+
+function artifactCandidatesFromTurn(turn: CodexThreadTurn, index: number): ThreadArtifactCandidate[] {
+  const candidates: ThreadArtifactCandidate[] = [];
+  const turnId = turn.id ?? `turn-${index + 1}`;
+  const artifacts = recordField(turn, "artifacts");
+  if (artifacts) {
+    for (const target of targetStringsFromFields(artifacts, ["editedFilePaths", "edited_file_paths"])) {
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-edited-${turnId}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Edited file",
+        mimeType: null,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+    for (const target of targetStringsFromFields(artifacts, [
+      "referencedFilePaths",
+      "referenced_file_paths",
+      "filePaths",
+      "file_paths",
+      "files",
+    ])) {
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-referenced-${turnId}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Referenced file",
+        mimeType: null,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+    for (const resource of recordsFromFields(artifacts, [
+      "endResources",
+      "end_resources",
+      "resources",
+      "generatedImages",
+      "generated_images",
+      "images",
+    ])) {
+      const target = firstStringField(resource, ["uri", "url", "path", "filePath", "target", "src"]);
+      if (!target) continue;
+      const mimeType = firstStringField(resource, ["mimeType", "mime_type", "contentType", "content_type"]);
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-resource-${turnId}:${target}`,
+        title: firstStringField(resource, ["name", "title"]) ?? titleFromTarget(target),
+        subtitle: mimeType ?? "Turn resource",
+        mimeType,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+    for (const target of collectTargets(artifacts).slice(0, 16)) {
+      candidates.push(artifactFromTarget(target.value, {
+        id: `turn-artifact-target-${turnId}:${target.value}`,
+        title: titleFromTarget(target.value),
+        subtitle: target.label,
+        mimeType: null,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+  }
+
+  const assistantText = finalAssistantTextFromTurn(turn);
+  if (assistantText) {
+    for (const target of extractTargetsFromText(assistantText).slice(0, 12)) {
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-text-${turnId}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Assistant output reference",
+        mimeType: null,
+        sourceType: "assistant-message",
+        raw: turn,
+      }));
+    }
+  }
+
+  return candidates;
+}
+
+function artifactCandidatesFromItem(item: CodexThreadItem, index: number): ThreadArtifactCandidate[] {
+  const candidates: ThreadArtifactCandidate[] = [];
+  const type = normalizeThreadItemType(item);
+  const directResource = recordField(item, "resource");
+  if (directResource) {
+    const uri = firstStringField(directResource, ["uri", "url", "target"]);
+    const mimeType = firstStringField(directResource, ["mimeType", "mime_type"]);
+    if (uri) {
+      candidates.push(artifactFromTarget(uri, {
+        id: itemId(item, `artifact-resource-${index}`),
+        title: firstStringField(directResource, ["name", "title"]) ?? titleFromTarget(uri),
+        subtitle: mimeType ?? "Embedded resource",
+        mimeType,
+        sourceType: type,
+        raw: item,
+      }));
+    }
+  }
+
+  if (type === "generated-image") {
+    for (const target of targetStringsFromFields(item, ["url", "imageUrl", "image_url", "path", "filePath", "src"])) {
+      candidates.push(artifactFromTarget(target, {
+        id: `${itemId(item, `artifact-image-${index}`)}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Generated image",
+        mimeType: firstStringField(item, ["mimeType", "mime_type"]) ?? "image",
+        sourceType: type,
+        raw: item,
+      }));
+    }
+  }
+
+  for (const filePath of fileChangePaths(item)) {
+    candidates.push({
+      id: `${itemId(item, `artifact-file-${index}`)}:${filePath}`,
+      kind: "file",
+      title: titleFromTarget(filePath),
+      subtitle: "Edited or referenced file",
+      path: filePath,
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  for (const target of collectTargets(item).slice(0, 12)) {
+    candidates.push(artifactFromTarget(target.value, {
+      id: `${itemId(item, `artifact-target-${index}`)}:${target.value}`,
+      title: titleFromTarget(target.value),
+      subtitle: target.label,
+      mimeType: null,
+      sourceType: type,
+      raw: item,
+    }));
+  }
+
+  return candidates;
+}
+
+function sourceCandidatesFromItem(item: CodexThreadItem, index: number): ThreadSourceCandidate[] {
+  const type = normalizeThreadItemType(item);
+  const sources: ThreadSourceCandidate[] = [];
+  if (type === "web-search") {
+    const query = firstStringField(item, ["query", "searchQuery", "text"]);
+    sources.push({
+      id: itemId(item, `source-web-${index}`),
+      kind: "web",
+      title: query ? `Web search: ${query}` : "Web search",
+      subtitle: normalizeProgressStatus(item.status) === "in_progress" ? "Searching" : "Search result",
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  if (type === "mcp-tool-call" || type === "sub-agent" || type === "exec") {
+    const server = firstStringField(item, ["server", "namespace"]);
+    if (server !== "node_repl") {
+      sources.push({
+        id: itemId(item, `source-tool-${index}`),
+        kind: "tool",
+        title: labelForThreadItem(item),
+        subtitle: detailForThreadItem(item),
+        sourceType: type,
+        raw: item,
+      });
+    }
+  }
+
+  if (type === "generated-image") {
+    sources.push({
+      id: itemId(item, `source-image-${index}`),
+      kind: "resource",
+      title: labelForThreadItem(item),
+      subtitle: detailForThreadItem(item),
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  for (const target of collectTargets(item).slice(0, 16)) {
+    const artifact = artifactFromTarget(target.value, {
+      id: `${itemId(item, `source-target-${index}`)}:${target.value}`,
+      title: titleFromTarget(target.value),
+      subtitle: target.label,
+      mimeType: null,
+      sourceType: type,
+      raw: item,
+    });
+    sources.push({
+      id: artifact.id,
+      kind: artifact.kind === "url" ? "web" : artifact.kind === "file" ? "file" : "resource",
+      title: artifact.title,
+      subtitle: artifact.subtitle,
+      url: artifact.url,
+      path: artifact.path,
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  return sources;
+}
+
+function artifactFromTarget(
+  target: string,
+  base: Omit<ThreadArtifactCandidate, "kind" | "path" | "url">,
+): ThreadArtifactCandidate {
+  if (isUrl(target)) {
+    return {
+      ...base,
+      kind: "url",
+      url: target,
+    };
+  }
+  if (looksLikeFilePath(target)) {
+    return {
+      ...base,
+      kind: "file",
+      path: target,
+    };
+  }
+  return {
+    ...base,
+    kind: "resource",
+    url: target,
+  };
+}
+
+function collectTargets(value: unknown, depth = 0, label = "Reference"): Array<{ value: string; label: string }> {
+  if (depth > 4 || value == null) return [];
+  if (Array.isArray(value)) return value.flatMap((entry) => collectTargets(entry, depth + 1, label));
+  if (typeof value !== "object") return [];
+
+  const targets: Array<{ value: string; label: string }> = [];
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const nextLabel = humanizeKey(key);
+    if (typeof entry === "string" && targetKeyNames.has(key.toLowerCase())) {
+      const trimmed = entry.trim();
+      if (isUrl(trimmed) || looksLikeFilePath(trimmed)) {
+        targets.push({ value: trimmed, label: nextLabel });
+      }
+    }
+    if (entry && typeof entry === "object") {
+      targets.push(...collectTargets(entry, depth + 1, nextLabel));
+    }
+  }
+  return dedupeTargets(targets);
+}
+
+function fileChangePaths(item: CodexThreadItem): string[] {
+  const paths = new Set<string>();
+  for (const key of ["path", "filePath", "filepath", "filename", "target"]) {
+    const value = firstStringField(item, [key]);
+    if (value && looksLikeFilePath(value)) paths.add(value);
+  }
+  for (const key of [
+    "editedFilePaths",
+    "edited_file_paths",
+    "referencedFilePaths",
+    "referenced_file_paths",
+    "filePaths",
+    "file_paths",
+    "fileChanges",
+    "changes",
+    "diff",
+    "files",
+    "edits",
+  ]) {
+    const value = (item as Record<string, unknown>)[key];
+    if (typeof value === "string") {
+      if (looksLikeFilePath(value)) paths.add(value);
+      for (const candidate of extractTargetsFromText(value)) {
+        if (looksLikeFilePath(candidate)) paths.add(candidate);
+      }
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const name of Object.keys(value)) {
+        if (looksLikeFilePath(name)) paths.add(name);
+      }
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry === "string" && looksLikeFilePath(entry)) paths.add(entry);
+        if (entry && typeof entry === "object") {
+          for (const field of ["path", "filePath", "filepath", "filename", "target", "name"]) {
+            const candidate = firstStringField(entry as Record<string, unknown>, [field]);
+            if (candidate && looksLikeFilePath(candidate)) paths.add(candidate);
+          }
+        }
+      }
+    }
+  }
+  return [...paths];
+}
+
+function dedupeArtifacts(candidates: ThreadArtifactCandidate[]): ThreadArtifactCandidate[] {
+  const seen = new Set<string>();
+  const output: ThreadArtifactCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = candidate.path ?? candidate.url ?? candidate.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(candidate);
+  }
+  return output.slice(-60);
+}
+
+function dedupeSources(candidates: ThreadSourceCandidate[]): ThreadSourceCandidate[] {
+  const seen = new Set<string>();
+  const output: ThreadSourceCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = candidate.url ?? candidate.path ?? candidate.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(candidate);
+  }
+  return output.slice(-60);
+}
+
+function dedupeTargets(targets: Array<{ value: string; label: string }>): Array<{ value: string; label: string }> {
+  const seen = new Set<string>();
+  const output: Array<{ value: string; label: string }> = [];
+  for (const target of targets) {
+    if (seen.has(target.value)) continue;
+    seen.add(target.value);
+    output.push(target);
+  }
+  return output;
+}
+
+function rawThreadItemType(item: CodexThreadItem): string {
+  return String(item.type ?? "unknown");
+}
+
+function normalizeThreadItemType(itemOrType: CodexThreadItem | string | null | undefined): string {
+  const raw = typeof itemOrType === "string" ? itemOrType : itemOrType?.type;
+  if (!raw) return "unknown";
+  const normalized = raw
+    .replace(/([a-z])([A-Z])/g, "$1-$2")
+    .replace(/_/g, "-")
+    .toLowerCase();
+  if (normalized === "agent-message" || normalized === "assistant-message") return "assistant-message";
+  if (normalized === "user-message" || normalized === "user-input") return "user-message";
+  if (normalized === "command-execution" || normalized === "exec") return "exec";
+  if (normalized === "file-change" || normalized === "patch" || normalized === "turn-diff") return "patch";
+  if (normalized === "mcp-tool-call" || normalized === "tool-call" || normalized === "dynamic-tool-call") {
+    return "mcp-tool-call";
+  }
+  if (normalized === "mcp-server-elicitation") return "mcp-tool-call";
+  if (normalized === "web-search") return "web-search";
+  if (normalized === "todo-list") return "todo-list";
+  if (normalized === "proposed-plan") return "proposed-plan";
+  if (normalized === "plan-implementation") return "plan-implementation";
+  if (
+    normalized === "collab-agent-tool-call" ||
+    normalized === "multi-agent-action" ||
+    normalized === "remote-task-created" ||
+    normalized === "worked-for"
+  ) {
+    return "sub-agent";
+  }
+  if (normalized === "generated-image" || normalized === "image-generation") return "generated-image";
+  if (normalized === "automation-update" || normalized === "system-event") return "system-event";
+  if (normalized === "tool-output") return "tool-output";
+  return normalized;
+}
+
+function labelForThreadItem(item: CodexThreadItem): string {
+  const type = normalizeThreadItemType(item);
+  if (type === "assistant-message") return "Assistant message";
+  if (type === "user-message") return "User message";
+  if (type === "exec") return "Command";
+  if (type === "patch") return "File change";
+  if (type === "mcp-tool-call") return "Tool call";
+  if (type === "web-search") return "Web search";
+  if (type === "todo-list") return "To do list";
+  if (type === "proposed-plan") return "Proposed plan";
+  if (type === "plan-implementation") return "Plan implementation";
+  if (type === "reasoning") return "Reasoning";
+  if (type === "sub-agent") return "Sub-agent";
+  if (type === "generated-image") return "Generated image";
+  return humanizeKey(rawThreadItemType(item));
+}
+
+function detailForThreadItem(item: CodexThreadItem): string | null {
+  const type = normalizeThreadItemType(item);
+  if (type === "exec") return firstStringField(item, ["command", "cmd", "aggregatedOutput", "output", "text"]);
+  if (type === "web-search") return firstStringField(item, ["query", "searchQuery", "text"]);
+  if (type === "mcp-tool-call" || type === "sub-agent") {
+    return [firstStringField(item, ["server", "namespace"]), firstStringField(item, ["tool", "name"])]
+      .filter(Boolean)
+      .join(".") || null;
+  }
+  if (type === "todo-list") {
+    const tasks = taskRecords(item);
+    if (tasks.length > 0) return `${tasks.length} tasks`;
+  }
+  if (type === "patch") {
+    const paths = fileChangePaths(item);
+    if (paths.length === 1) return paths[0];
+    if (paths.length > 1) return `${paths.length} files`;
+  }
+  if (type === "generated-image") {
+    return firstStringField(item, ["prompt", "description", "url", "path", "filePath"]);
+  }
+  return firstTextField(item, ["title", "summary", "text", "message", "description", "content"]);
+}
+
+function firstTextField(record: Record<string, unknown>, fields: string[]): string | null {
+  const value = firstStringField(record, fields);
+  if (!value) return null;
+  return value.length > 240 ? `${value.slice(0, 240)}...` : value;
+}
+
+function firstStringField(record: Record<string, unknown>, fields: string[]): string | null {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function recordField(record: Record<string, unknown>, field: string): Record<string, unknown> | null {
+  const value = record[field];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function targetStringsFromFields(record: Record<string, unknown>, fields: string[]): string[] {
+  const output = new Set<string>();
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed && (isUrl(trimmed) || looksLikeFilePath(trimmed))) output.add(trimmed);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry === "string") {
+          const trimmed = entry.trim();
+          if (trimmed && (isUrl(trimmed) || looksLikeFilePath(trimmed))) output.add(trimmed);
+        } else if (entry && typeof entry === "object") {
+          const target = firstStringField(entry as Record<string, unknown>, ["uri", "url", "path", "filePath", "target", "src"]);
+          if (target && (isUrl(target) || looksLikeFilePath(target))) output.add(target);
+        }
+      }
+    }
+  }
+  return [...output];
+}
+
+function recordsFromFields(record: Record<string, unknown>, fields: string[]): Array<Record<string, unknown>> {
+  const output: Array<Record<string, unknown>> = [];
+  for (const field of fields) {
+    const value = record[field];
+    if (Array.isArray(value)) {
+      output.push(...value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object" && !Array.isArray(entry))));
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      output.push(value as Record<string, unknown>);
+    }
+  }
+  return output;
+}
+
+function itemId(item: CodexThreadItem, fallback: string): string {
+  return firstStringField(item, ["id", "itemId", "callId", "requestId", "taskId"]) ?? fallback;
+}
+
+function taskRecords(item: CodexThreadItem): Array<Record<string, unknown>> {
+  for (const field of ["items", "tasks", "todos"]) {
+    const value = item[field];
+    if (Array.isArray(value)) {
+      return value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object"));
+    }
+  }
+  return [];
+}
+
+function reasoningSummary(item: CodexThreadItem): string | null {
+  const summary = item.summary;
+  if (Array.isArray(summary)) {
+    const parts = summary
+      .map((entry) => typeof entry === "string" ? entry : firstTextField(entry as Record<string, unknown>, ["text", "summary"]))
+      .filter(Boolean);
+    return parts.at(-1) ?? null;
+  }
+  return firstTextField(item, ["summary", "text"]);
+}
+
+function normalizeProgressStatus(value: unknown): ThreadProgressItem["status"] {
+  const normalized = typeof value === "string" ? value.toLowerCase().replace(/-/g, "_") : "";
+  if (normalized === "completed" || normalized === "done" || normalized === "success") return "completed";
+  if (normalized === "failed" || normalized === "error") return "failed";
+  if (normalized === "pending" || normalized === "queued") return "pending";
+  if (normalized === "in_progress" || normalized === "inprogress" || normalized === "running") return "in_progress";
+  return "unknown";
+}
+
+function isUrl(value: string): boolean {
+  return /^(https?|file):\/\//i.test(value);
+}
+
+function extractTargetsFromText(value: string): string[] {
+  const targets = new Set<string>();
+  for (const match of value.matchAll(/\b(?:https?|file):\/\/[^\s<>"')]+/gi)) {
+    targets.add(cleanTrailingTargetPunctuation(match[0]));
+  }
+  for (const match of value.matchAll(/(?:^|[\s"'`(])((?:\.{1,2}\/|\/|~\/)[^\s"'`)]+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8})/g)) {
+    const candidate = cleanTrailingTargetPunctuation(match[1] ?? "");
+    if (candidate && looksLikeFilePath(candidate)) targets.add(candidate);
+  }
+  return [...targets];
+}
+
+function cleanTrailingTargetPunctuation(value: string): string {
+  return value.replace(/[),.;:]+$/g, "");
+}
+
+function looksLikeFilePath(value: string): boolean {
+  if (!value || /\n/.test(value)) return false;
+  if (/^(https?|data):\/\//i.test(value)) return false;
+  if (/^(file):\/\//i.test(value)) return true;
+  return (
+    value.startsWith("/") ||
+    value.startsWith("~/") ||
+    value.startsWith("./") ||
+    value.startsWith("../") ||
+    /\.[A-Za-z0-9]{1,8}$/.test(value)
+  );
+}
+
+function titleFromTarget(value: string): string {
+  try {
+    if (isUrl(value)) {
+      const url = new URL(value);
+      return url.pathname.split("/").filter(Boolean).at(-1) ?? url.hostname;
+    }
+  } catch {
+    // Fall through to path handling.
+  }
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+function humanizeKey(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^./, (letter) => letter.toUpperCase()) || "Item";
+}
+
+const targetKeyNames = new Set([
+  "file",
+  "filepath",
+  "filename",
+  "href",
+  "path",
+  "source",
+  "target",
+  "uri",
+  "url",
+]);
+
+const knownThreadItemTypes = new Set([
+  "assistant-message",
+  "exec",
+  "generated-image",
+  "mcp-tool-call",
+  "patch",
+  "plan-implementation",
+  "proposed-plan",
+  "reasoning",
+  "sub-agent",
+  "system-event",
+  "todo-list",
+  "tool-output",
+  "user-message",
+  "web-search",
+]);
+
 function commandVectorFromVoiceArgs(args: VoiceExecCommandArgs): string[] {
   const cmd = args.cmd.trim();
   if (!cmd) throw new Error("exec_command cmd is required.");
@@ -1914,15 +2745,46 @@ function approximateTokenCount(text: string): number {
 }
 
 function finalAssistantTextFromTurn(turn: CodexThreadTurn): string | null {
-  const agentMessages = (turn.items ?? []).filter(
-    (item): item is CodexThreadItem & { text: string } =>
-      item.type === "agentMessage" && typeof item.text === "string" && item.text.trim().length > 0,
-  );
+  const agentMessages = (turn.items ?? []).filter((item) => {
+    return normalizeThreadItemType(item) === "assistant-message" && textFromThreadMessageItem(item) !== null;
+  });
   const finalMessage =
-    [...agentMessages].reverse().find((item) => item.phase === "final_answer") ??
+    [...agentMessages].reverse().find((item) => isFinalAssistantPhase(item.phase ?? item.status)) ??
     agentMessages[agentMessages.length - 1] ??
     null;
-  return finalMessage?.text ?? null;
+  return finalMessage ? textFromThreadMessageItem(finalMessage) : firstTextField(turn, [
+    "finalAssistantText",
+    "assistantText",
+    "output",
+    "message",
+    "text",
+  ]);
+}
+
+function textFromThreadMessageItem(item: CodexThreadItem): string | null {
+  const direct = firstStringField(item, ["text", "message", "content"]);
+  if (direct) return direct;
+  const content = item.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : part && typeof part === "object" && !Array.isArray(part)
+            ? firstStringField(part as Record<string, unknown>, ["text", "content"])
+            : null,
+      )
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    return text || null;
+  }
+  return null;
+}
+
+function isFinalAssistantPhase(value: unknown): boolean {
+  const normalized = typeof value === "string" ? value.toLowerCase().replace(/-/g, "_") : "";
+  return normalized === "final_answer" || normalized === "final" || normalized === "completed" || normalized === "complete";
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -2446,19 +3308,22 @@ function statusFromNotification(method: string, params?: Record<string, unknown>
   }
   if (method === "item/started") {
     const item = (params?.item ?? {}) as { type?: string; command?: string; server?: string; tool?: string; query?: string };
-    if (item.type === "commandExecution") return `Codex is running: ${item.command ?? "a command"}`;
-    if (item.type === "fileChange") return "Codex is preparing file changes.";
-    if (item.type === "mcpToolCall") return `Codex is using ${item.server ?? "an app"} ${item.tool ?? "tool"}.`;
-    if (item.type === "webSearch") return `Codex is searching: ${item.query ?? "the web"}`;
-    if (item.type === "collabAgentToolCall") return "Codex is coordinating a sub-agent.";
-    if (item.type === "agentMessage") return "Codex is writing a response.";
+    const type = normalizeThreadItemType(item.type);
+    if (type === "exec") return `Codex is running: ${item.command ?? "a command"}`;
+    if (type === "patch") return "Codex is preparing file changes.";
+    if (type === "mcp-tool-call") return `Codex is using ${item.server ?? "an app"} ${item.tool ?? "tool"}.`;
+    if (type === "web-search") return `Codex is searching: ${item.query ?? "the web"}`;
+    if (type === "sub-agent") return "Codex is coordinating a sub-agent.";
+    if (type === "assistant-message") return "Codex is writing a response.";
     return `Codex started ${item.type ?? "work"}.`;
   }
   if (method === "item/completed") {
     const item = (params?.item ?? {}) as { type?: string };
-    if (item.type === "commandExecution") return "Codex finished a command.";
-    if (item.type === "fileChange") return "Codex finished file changes.";
-    if (item.type === "mcpToolCall") return "Codex finished using an app tool.";
+    const type = normalizeThreadItemType(item.type);
+    if (type === "exec") return "Codex finished a command.";
+    if (type === "patch") return "Codex finished file changes.";
+    if (type === "mcp-tool-call") return "Codex finished using an app tool.";
+    if (type === "generated-image") return "Codex generated an image.";
   }
   if (method === "serverRequest/resolved") return "Codex request resolved.";
   if (method === "error") return "Codex reported an error.";

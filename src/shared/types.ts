@@ -171,6 +171,134 @@ export type CodexTurnOutput = {
   errorMessage?: string;
 };
 
+export type ThreadSummaryItem = {
+  id: string;
+  type: string;
+  status: string | null;
+  label: string;
+  detail: string | null;
+  raw: unknown;
+};
+
+export type ThreadProgressItem = {
+  id: string;
+  label: string;
+  detail: string | null;
+  status: "pending" | "in_progress" | "completed" | "failed" | "unknown";
+  sourceType: string;
+  raw: unknown;
+};
+
+export type ThreadArtifactCandidate = {
+  id: string;
+  kind: "file" | "url" | "resource" | "text" | "unknown";
+  title: string;
+  subtitle: string | null;
+  path?: string;
+  url?: string;
+  mimeType?: string | null;
+  sourceType: string;
+  raw: unknown;
+};
+
+export type ThreadSourceCandidate = {
+  id: string;
+  kind: "web" | "file" | "tool" | "resource" | "unknown";
+  title: string;
+  subtitle: string | null;
+  url?: string;
+  path?: string;
+  sourceType: string;
+  raw: unknown;
+};
+
+export type ThreadSummaryTurn = {
+  id: string;
+  status: string;
+  startedAt: number | null;
+  completedAt: number | null;
+  durationMs: number | null;
+  assistantText: string | null;
+  itemCount: number;
+  items: ThreadSummaryItem[];
+  errorMessage?: string;
+};
+
+export type ActiveThreadSummary = {
+  status: "ready" | "empty" | "error";
+  errorMessage?: string;
+  projectId: string | null;
+  projectName: string | null;
+  workspacePath: string | null;
+  chatId: string | null;
+  chatName: string | null;
+  threadId: string | null;
+  turnCount: number;
+  latestTurnStatus: string | null;
+  latestAssistantText: string | null;
+  progress: ThreadProgressItem[];
+  artifacts: ThreadArtifactCandidate[];
+  sources: ThreadSourceCandidate[];
+  referencedFiles: ThreadArtifactCandidate[];
+  turns: ThreadSummaryTurn[];
+  rawUnknownItems: unknown[];
+};
+
+export type RightPanelPreviewRequest = {
+  kind: "file" | "url";
+  path?: string;
+  url?: string;
+  workspacePath?: string | null;
+};
+
+export type RightPanelPreviewResult = {
+  status: "ready" | "empty" | "too_large" | "unsupported" | "external" | "error";
+  kind: "text" | "markdown" | "code" | "image" | "iframe" | "external" | "unsupported" | "empty";
+  title: string;
+  subtitle: string | null;
+  path?: string;
+  url?: string;
+  mimeType?: string | null;
+  sizeBytes?: number | null;
+  text?: string;
+  dataUrl?: string;
+  truncated?: boolean;
+  errorMessage?: string;
+};
+
+export type RightPanelOpenTarget = {
+  kind: "file" | "folder" | "url";
+  path?: string;
+  url?: string;
+  workspacePath?: string | null;
+};
+
+export type GitPullRequestSummary = {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  headRefName?: string | null;
+  baseRefName?: string | null;
+};
+
+export type GitChangeSummary = {
+  status: "ready" | "empty" | "not_git" | "error";
+  workspacePath: string | null;
+  gitRoot: string | null;
+  branch: string | null;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  dirtyCount: number;
+  changedFiles: string[];
+  diffStat: string | null;
+  stagedDiffStat: string | null;
+  recentCommits: Array<{ sha: string; title: string; decorated: string }>;
+  pullRequest: GitPullRequestSummary | null;
+  errorMessage?: string;
+};
+
 export type VoiceChat = {
   id: string;
   displayName: string;
@@ -331,6 +459,10 @@ export type AppEvent = {
   raw?: unknown;
 };
 
+export type WindowChromeState = {
+  isFullScreen: boolean;
+};
+
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 
 export type ToolQuestionAnswer = {
@@ -375,6 +507,7 @@ export type VoiceExecCommandResult = {
 export type CodexVoiceApi = {
   getState(): Promise<AppState>;
   openVoiceWindow(): Promise<void>;
+  getWindowChromeState(): Promise<WindowChromeState>;
   openDebugWindow(): Promise<void>;
   getEvents(): Promise<AppEvent[]>;
   clearEvents(): Promise<void>;
@@ -401,6 +534,10 @@ export type CodexVoiceApi = {
   ): Promise<CodexSettings>;
   answerApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
+  getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary>;
+  getGitChangeSummary(workspacePath?: string | null): Promise<GitChangeSummary>;
+  previewRightPanelTarget(target: RightPanelPreviewRequest): Promise<RightPanelPreviewResult>;
+  openRightPanelTarget(target: RightPanelOpenTarget): Promise<void>;
   execCommand(args: VoiceExecCommandArgs): Promise<VoiceExecCommandResult>;
   writeStdin(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult>;
   terminateExecSession(sessionId: number): Promise<void>;
@@ -414,6 +551,7 @@ export type CodexVoiceApi = {
     voice?: RealtimeVoiceId | null;
     reasoningEffort?: RealtimeReasoningEffort | null;
   }): Promise<AppState["realtime"]>;
+  onWindowChromeState(listener: (state: WindowChromeState) => void): () => void;
   onAppState(listener: (state: AppState) => void): () => void;
   onAppEvent(listener: (event: AppEvent) => void): () => void;
 };

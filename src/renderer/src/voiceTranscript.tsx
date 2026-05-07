@@ -129,16 +129,16 @@ const emptyCounts: ActivityCounts = {
   denied: 0,
 };
 
-export function VoiceTranscriptPane({
-  open,
+export function VoiceTranscriptContent({
+  open = true,
   state,
   events,
-  orbPresetId,
+  className,
 }: {
-  open: boolean;
+  open?: boolean;
   state: AppState;
   events: AppEvent[];
-  orbPresetId: string;
+  className?: string;
 }): React.ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const entries = useMemo(() => buildTranscriptEntries(events, state), [events, state]);
@@ -152,26 +152,17 @@ export function VoiceTranscriptPane({
   }, [latestEntryId, open]);
 
   return (
-    <aside
-      className={`voice-future-pane ${orbPresetId}`}
-      aria-hidden={!open}
-      inert={!open}
-      aria-label="Conversation"
-    >
-      <div className="voice-future-inner">
-        <div ref={scrollRef} className="voice-transcript-list">
-          {entries.length === 0 ? (
-            <div className="voice-transcript-empty">
-              <TranscriptIcon icon="spark" />
-              <strong>No messages yet</strong>
-              <small>Your conversation and Codex activity will appear here.</small>
-            </div>
-          ) : (
-            entries.map((entry) => <VoiceConversationEntry key={entry.id} entry={entry} />)
-          )}
+    <div ref={scrollRef} className={["voice-transcript-list", className].filter(Boolean).join(" ")}>
+      {entries.length === 0 ? (
+        <div className="voice-transcript-empty">
+          <TranscriptIcon icon="spark" />
+          <strong>No messages yet</strong>
+          <small>Your conversation and Codex activity will appear here.</small>
         </div>
-      </div>
-    </aside>
+      ) : (
+        entries.map((entry) => <VoiceConversationEntry key={entry.id} entry={entry} />)
+      )}
+    </div>
   );
 }
 

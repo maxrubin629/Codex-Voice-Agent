@@ -25,9 +25,10 @@ import {
   type ToolQuestionAnswer,
   type VoiceChat,
   type VoiceProject,
+  type WindowChromeState,
 } from "../../shared/types";
 import { RealtimeVoiceClient } from "./realtimeClient";
-import { VoiceTranscriptPane } from "./voiceTranscript";
+import { RightPanel } from "./rightPanel";
 import "./styles.css";
 
 const emptyState: AppState = {
@@ -96,6 +97,7 @@ type VoiceOrbCustomization = {
 };
 
 const voiceOrbStorageKey = "codexVoice.orbPreset";
+const rightPanelWidthStorageKey = "codexVoice.rightPanel.width";
 const voiceOrbCustomizationStorageKey = "codexVoice.orbCustomization";
 const voiceOnboardingSeenStorageKey = "codexVoice.onboardingSeen";
 const dualPaneLayoutMediaQuery = "(min-width: 1420px)";
@@ -234,6 +236,23 @@ function saveVoiceOrbCustomization(customization: VoiceOrbCustomization): void {
   }
 }
 
+function loadRightPanelWidth(): number {
+  try {
+    const value = Number(window.localStorage.getItem(rightPanelWidthStorageKey));
+    return Number.isFinite(value) ? Math.max(320, Math.min(720, value)) : 420;
+  } catch {
+    return 420;
+  }
+}
+
+function saveRightPanelWidth(width: number): void {
+  try {
+    window.localStorage.setItem(rightPanelWidthStorageKey, String(width));
+  } catch {
+    // Visual preferences should never block the voice UI.
+  }
+}
+
 function loadVoiceOnboardingSeen(): boolean {
   try {
     return window.localStorage.getItem(voiceOnboardingSeenStorageKey) === "true";
@@ -280,6 +299,7 @@ function App(): React.ReactElement {
   const [voiceOutputLevel, setVoiceOutputLevel] = useState(0);
   const [realtimeIssue, setRealtimeIssue] = useState<string | null>(null);
   const [onboardingRequestId, setOnboardingRequestId] = useState(0);
+  const [windowChromeState, setWindowChromeState] = useState<WindowChromeState>({ isFullScreen: false });
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
   const outputLevelUpdateRef = useRef(0);
   const outputLevelValueRef = useRef(0);
@@ -294,6 +314,10 @@ function App(): React.ReactElement {
     document.title = windowKind === "debug" ? "Codex Voice Debug" : "Codex Voice";
     void refreshState();
     void refreshEvents();
+    void window.codexVoice.getWindowChromeState().then(setWindowChromeState).catch(() => {
+      setWindowChromeState({ isFullScreen: false });
+    });
+    const offWindowChromeState = window.codexVoice.onWindowChromeState(setWindowChromeState);
     const offState = window.codexVoice.onAppState((nextState) => {
       setState(nextState);
       setStateLoaded(true);
@@ -313,6 +337,7 @@ function App(): React.ReactElement {
       }
     });
     return () => {
+      offWindowChromeState();
       offState();
       offEvent();
       voiceRef.current?.disconnect();
@@ -469,6 +494,7 @@ function App(): React.ReactElement {
     <VoiceHome
       state={state}
       events={events}
+      windowChromeState={windowChromeState}
       stateLoaded={stateLoaded}
       voiceOutputLevel={voiceOutputLevel}
       realtimeIssue={realtimeIssue}
@@ -492,6 +518,7 @@ function App(): React.ReactElement {
 function VoiceHome({
   state,
   events,
+  windowChromeState,
   stateLoaded,
   voiceOutputLevel,
   realtimeIssue,
@@ -511,6 +538,7 @@ function VoiceHome({
 }: {
   state: AppState;
   events: AppEvent[];
+  windowChromeState: WindowChromeState;
   stateLoaded: boolean;
   voiceOutputLevel: number;
   realtimeIssue: string | null;
@@ -531,6 +559,7 @@ function VoiceHome({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [futureOpen, setFutureOpen] = useState(false);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => loadRightPanelWidth());
   const [newOpen, setNewOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [switchChatOpen, setSwitchChatOpen] = useState(false);
@@ -606,6 +635,10 @@ function VoiceHome({
   useEffect(() => {
     saveVoiceOrbCustomization(orbCustomization);
   }, [orbCustomization]);
+
+  useEffect(() => {
+    saveRightPanelWidth(rightPanelWidth);
+  }, [rightPanelWidth]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia(dualPaneLayoutMediaQuery);
@@ -954,8 +987,13 @@ function VoiceHome({
 
   return (
     <main
-      className={`voice-home ${settingsOpen ? "settings-open" : ""} ${futureOpen ? "future-open" : ""}`}
-      style={voiceAccentStyle(orbCustomization.accentColor)}
+      className={`voice-home ${settingsOpen ? "settings-open" : ""} ${futureOpen ? "future-open" : ""} ${
+        windowChromeState.isFullScreen ? "window-fullscreen" : ""
+      }`}
+      style={{
+        ...voiceAccentStyle(orbCustomization.accentColor),
+        "--right-pane-width": `${rightPanelWidth}px`,
+      } as React.CSSProperties}
     >
       <button
         className="voice-pane-toggle left"
@@ -1155,7 +1193,15 @@ function VoiceHome({
         </footer>
         </div>
 
-        <VoiceTranscriptPane open={futureOpen} state={state} events={events} orbPresetId={orbPresetId} />
+        <RightPanel
+          open={futureOpen}
+          state={state}
+          events={events}
+          width={rightPanelWidth}
+          onWidthChange={setRightPanelWidth}
+          onClose={() => setFutureOpen(false)}
+          onAction={onAction}
+        />
       </div>
 
       {newOpen && (
