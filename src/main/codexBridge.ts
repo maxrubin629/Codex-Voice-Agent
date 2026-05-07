@@ -68,7 +68,7 @@ export class CodexBridge extends EventEmitter {
     this.initialized = true;
   }
 
-  async request(method: string, params?: unknown): Promise<unknown> {
+  async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
     if (!this.proc) {
       throw new Error("Codex app-server is not running.");
     }
@@ -82,7 +82,7 @@ export class CodexBridge extends EventEmitter {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Timed out waiting for app-server method ${method}.`));
-      }, 120_000);
+      }, timeoutMs);
       this.pending.set(id, { method, resolve, reject, timeout });
       this.write(message);
     });

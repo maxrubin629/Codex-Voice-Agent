@@ -77,7 +77,7 @@ export class ProjectStore {
     return projects[0] ?? null;
   }
 
-  async createProject(displayName?: string): Promise<VoiceProject> {
+  async createProject(displayName?: string, workspacePath?: string | null): Promise<VoiceProject> {
     const now = new Date();
     const id = randomUUID();
     const safeName = sanitizeProjectName(displayName || "Voice Project");
@@ -90,6 +90,7 @@ export class ProjectStore {
       id,
       displayName: displayName?.trim() || "Voice Project",
       folderPath,
+      workspacePath: normalizeStoredPath(workspacePath, folderPath),
       activeChatId: null,
       chats: [],
       codexThreadId: null,
@@ -438,6 +439,7 @@ function normalizeProject(value: unknown): VoiceProject {
     createdAt,
     updatedAt,
     archivedAt: stringOrNull(project.archivedAt),
+    workspacePath: normalizeStoredPath((project as { workspacePath?: unknown }).workspacePath, project.folderPath),
     activeChatId,
     chats,
     codexThreadId: activeChat?.codexThreadId ?? null,
@@ -499,6 +501,13 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+function normalizeStoredPath(value: unknown, fallback: string): string {
+  const raw = stringOrNull(value);
+  if (!raw) return fallback;
+  const expanded = raw === "~" ? process.env.HOME ?? raw : raw.startsWith("~/") ? path.join(process.env.HOME ?? "~", raw.slice(2)) : raw;
+  return path.resolve(expanded);
+}
+
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -510,7 +519,7 @@ function reasoningEffortOrNull(value: unknown): ReasoningEffort | null {
 }
 
 function permissionModeOrDefault(value: unknown, fallback = DEFAULT_CODEX_PERMISSION_MODE): CodexPermissionMode {
-  return typeof value === "string" && ["default", "auto-review", "full-access"].includes(value)
+  return typeof value === "string" && ["default", "auto-review", "full-access", "custom-config"].includes(value)
     ? (value as CodexPermissionMode)
     : fallback;
 }

@@ -8,6 +8,8 @@ import type {
   CodexVoiceApi,
   ReasoningEffort,
   ToolQuestionAnswer,
+  VoiceExecCommandArgs,
+  VoiceWriteStdinArgs,
 } from "../shared/types";
 
 const api: CodexVoiceApi = {
@@ -16,7 +18,8 @@ const api: CodexVoiceApi = {
   getEvents: () => ipcRenderer.invoke("app:getEvents"),
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
   logEvent: (event: AppEvent) => ipcRenderer.invoke("app:logEvent", event),
-  createProject: (name?: string) => ipcRenderer.invoke("projects:create", { name }),
+  createProject: (name?: string, workspacePath?: string | null) =>
+    ipcRenderer.invoke("projects:create", { name, workspacePath }),
   resumeProject: (projectId: string) => ipcRenderer.invoke("projects:resume", { projectId }),
   archiveProject: (projectId: string) => ipcRenderer.invoke("projects:archive", { projectId }),
   restoreProject: (projectId: string) => ipcRenderer.invoke("projects:restore", { projectId }),
@@ -32,7 +35,8 @@ const api: CodexVoiceApi = {
   showProjectChats: (open?: boolean) => ipcRenderer.invoke("projects:showChats", { open }),
   summarizeProject: (projectId?: string, chatId?: string) =>
     ipcRenderer.invoke("projects:summarize", { projectId, chatId }),
-  sendToCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:send", { text, chatId }),
+  sendToCodex: (text: string, chatId?: string, workspacePath?: string | null) =>
+    ipcRenderer.invoke("codex:send", { text, chatId, workspacePath }),
   steerCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:steer", { text, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
@@ -44,6 +48,10 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:answerApproval", { requestId, decision }),
   answerToolQuestion: (requestId: string | number, answers: ToolQuestionAnswer[]) =>
     ipcRenderer.invoke("codex:answerToolQuestion", { requestId, answers }),
+  execCommand: (args: VoiceExecCommandArgs) => ipcRenderer.invoke("voiceTools:execCommand", args),
+  writeStdin: (args: VoiceWriteStdinArgs) => ipcRenderer.invoke("voiceTools:writeStdin", args),
+  applyPatch: (input: string) => ipcRenderer.invoke("voiceTools:applyPatch", { input }),
+  getOpenAiApiKey: () => ipcRenderer.invoke("settings:getOpenAiApiKey"),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),

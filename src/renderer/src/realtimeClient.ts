@@ -13,6 +13,7 @@ import type {
 type RealtimeCallbacks = {
   onLog: (event: AppEvent) => void;
   onConnectionChange: (connected: boolean, label: string) => void;
+  onOutputLevel?: (level: number) => void;
 };
 
 type FunctionCallItem = {
@@ -27,6 +28,12 @@ export class RealtimeVoiceClient {
   private dc: RTCDataChannel | null = null;
   private localStream: MediaStream | null = null;
   private audioEl: HTMLAudioElement | null = null;
+  private outputAudioContext: AudioContext | null = null;
+  private outputAudioSource: MediaStreamAudioSourceNode | null = null;
+  private outputAnalyser: AnalyserNode | null = null;
+  private outputSamples: Uint8Array<ArrayBuffer> | null = null;
+  private outputLevelFrame: number | null = null;
+  private smoothedOutputLevel = 0;
   private isPaused = false;
 
   constructor(private readonly callbacks: RealtimeCallbacks) {}
@@ -50,7 +57,9 @@ export class RealtimeVoiceClient {
     this.audioEl = audioEl;
     audioEl.autoplay = true;
     pc.ontrack = (event) => {
-      audioEl.srcObject = event.streams[0];
+      const [remoteStream] = event.streams;
+      audioEl.srcObject = remoteStream;
+      if (remoteStream) this.setupOutputAnalyser(remoteStream);
     };
 
     try {
@@ -106,6 +115,7 @@ export class RealtimeVoiceClient {
     this.dc = null;
     this.localStream = null;
     this.audioEl = null;
+    this.teardownOutputAnalyser();
     this.isPaused = false;
     this.callbacks.onConnectionChange(false, "Realtime disconnected.");
   }
@@ -119,6 +129,7 @@ export class RealtimeVoiceClient {
     if (this.audioEl) {
       this.audioEl.muted = paused;
     }
+    if (paused) this.callbacks.onOutputLevel?.(0);
     if (changed) {
       this.log(paused ? "voicePaused" : "voiceResumed", paused ? "Realtime voice paused." : "Realtime voice resumed.");
     }
@@ -274,6 +285,78 @@ export class RealtimeVoiceClient {
     this.dc.send(JSON.stringify(payload));
   }
 
+  private setupOutputAnalyser(stream: MediaStream): void {
+    this.teardownOutputAnalyser();
+    const AudioContextConstructor =
+      window.AudioContext ??
+      (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextConstructor) return;
+
+    try {
+      const audioContext = new AudioContextConstructor();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.12;
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      this.outputAudioContext = audioContext;
+      this.outputAudioSource = source;
+      this.outputAnalyser = analyser;
+      this.outputSamples = new Uint8Array(analyser.fftSize);
+      this.smoothedOutputLevel = 0;
+      void audioContext.resume().catch(() => undefined);
+      this.startOutputLevelLoop();
+    } catch (error) {
+      this.log("audioAnalyserError", error instanceof Error ? error.message : String(error));
+      this.teardownOutputAnalyser();
+    }
+  }
+
+  private teardownOutputAnalyser(): void {
+    if (this.outputLevelFrame !== null) {
+      window.cancelAnimationFrame(this.outputLevelFrame);
+      this.outputLevelFrame = null;
+    }
+    this.outputAudioSource?.disconnect();
+    this.outputAudioSource = null;
+    this.outputAnalyser = null;
+    this.outputSamples = null;
+    this.smoothedOutputLevel = 0;
+    const audioContext = this.outputAudioContext;
+    this.outputAudioContext = null;
+    if (audioContext && audioContext.state !== "closed") {
+      void audioContext.close().catch(() => undefined);
+    }
+    this.callbacks.onOutputLevel?.(0);
+  }
+
+  private startOutputLevelLoop(): void {
+    if (!this.outputAnalyser || !this.outputSamples || this.outputLevelFrame !== null) return;
+
+    const tick = () => {
+      if (!this.outputAnalyser || !this.outputSamples) {
+        this.outputLevelFrame = null;
+        return;
+      }
+
+      this.outputAnalyser.getByteTimeDomainData(this.outputSamples);
+      let sumSquares = 0;
+      for (const sample of this.outputSamples) {
+        const centered = (sample - 128) / 128;
+        sumSquares += centered * centered;
+      }
+      const rms = Math.sqrt(sumSquares / this.outputSamples.length);
+      const rawLevel = Math.max(0, Math.min(1, (rms - 0.012) / 0.16));
+      const smoothing = rawLevel > this.smoothedOutputLevel ? 0.36 : 0.12;
+      this.smoothedOutputLevel += (rawLevel - this.smoothedOutputLevel) * smoothing;
+      this.callbacks.onOutputLevel?.(this.isPaused ? 0 : this.smoothedOutputLevel);
+      this.outputLevelFrame = window.requestAnimationFrame(tick);
+    };
+
+    this.outputLevelFrame = window.requestAnimationFrame(tick);
+  }
+
   private log(kind: string, message: string, raw?: unknown): void {
     this.callbacks.onLog({
       at: new Date().toISOString(),
@@ -293,6 +376,7 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
     const result = await window.codexVoice.sendToCodex(
       context ? `${request}\n\nVoice conversation context:\n${context}` : request,
       chatId,
+      optionalString(args.workspacePath),
     );
     return {
       ok: true,
@@ -326,6 +410,34 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
       runtime: state.runtime,
       codexSettings: state.codexSettings,
     };
+  }
+
+  if (name === "exec_command") {
+    const result = await window.codexVoice.execCommand({
+      cmd: stringArg(args.cmd),
+      workdir: optionalString(args.workdir),
+      shell: optionalString(args.shell),
+      tty: optionalBoolean(args.tty),
+      login: optionalBoolean(args.login),
+      yield_time_ms: optionalNumber(args.yield_time_ms),
+      max_output_tokens: optionalNumber(args.max_output_tokens),
+    });
+    return { ok: true, ...result };
+  }
+
+  if (name === "write_stdin") {
+    const result = await window.codexVoice.writeStdin({
+      session_id: numberArg(args.session_id),
+      chars: typeof args.chars === "string" ? args.chars : "",
+      yield_time_ms: optionalNumber(args.yield_time_ms),
+      max_output_tokens: optionalNumber(args.max_output_tokens),
+    });
+    return { ok: true, ...result };
+  }
+
+  if (name === "apply_patch") {
+    const result = await window.codexVoice.applyPatch(stringArg(args.input));
+    return { ok: true, ...result };
   }
 
   if (name === "answer_codex_approval") {
@@ -389,7 +501,7 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
   }
 
   if (name === "create_new_codex_project") {
-    const project = await window.codexVoice.createProject(optionalString(args.name));
+    const project = await window.codexVoice.createProject(optionalString(args.name), optionalString(args.workspacePath));
     return { ok: true, project };
   }
 
@@ -439,6 +551,7 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
         displayName: project.displayName,
         updatedAt: project.updatedAt,
         folderPath: project.folderPath,
+        workspacePath: project.workspacePath,
         lastSummary: project.lastSummary,
         activeChatId: project.activeChatId,
         chats: visibleChats(project.chats),
@@ -480,6 +593,21 @@ function stringArg(value: unknown): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberArg(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error("Tool argument must be a finite number.");
+  }
+  return value;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
 }
 
 async function resolveChatId(
@@ -536,6 +664,13 @@ function permissionModeArg(value: unknown): CodexPermissionMode {
   if (["default", "default-permissions", "normal"].includes(normalized)) return "default";
   if (["auto", "auto-review", "autoreview"].includes(normalized)) return "auto-review";
   if (["full", "full-access", "danger", "danger-full-access"].includes(normalized)) return "full-access";
+  if (
+    ["custom", "custom-config", "custom-config-toml", "custom-config.toml", "config", "config-toml", "config.toml"].includes(
+      normalized,
+    )
+  ) {
+    return "custom-config";
+  }
   throw new Error(`Unknown permission mode: ${mode}`);
 }
 

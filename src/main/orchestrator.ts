@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
+import { stat } from "node:fs/promises";
+import path from "node:path";
 import type {
   AppEvent,
   CodexApprovalPolicy,
+  CodexApprovalsReviewer,
   AppState,
   ApprovalDecision,
   CodexActionResult,
@@ -21,6 +24,9 @@ import type {
   PendingCodexRequest,
   ReasoningEffort,
   ToolQuestionAnswer,
+  VoiceExecCommandArgs,
+  VoiceExecCommandResult,
+  VoiceWriteStdinArgs,
   VoiceProject,
 } from "../shared/types";
 import {
@@ -68,11 +74,45 @@ type ChatContext = {
   recovered?: boolean;
 };
 
+const CODEX_VOICE_DEVELOPER_INSTRUCTIONS = [
+  "This request came through a local Realtime voice interface.",
+  "Codex owns the actual planning, computer use, tool use, browser use, and execution.",
+  "For requests that may require controlling desktop apps, use tool_search to discover computer-use before choosing an approach; do this only once per new tool or plugin requested by the user.",
+  "If the user's request mentions the Computer Use plugin, satisfy that request by discovering and using the actual computer-use plugin. Do not replace it with shell commands, open -a, AppleScript via terminal, or other terminal workarounds.",
+  "Ask for clarification or approval when needed, and keep final status concise enough to relay by voice.",
+].join("\n");
+
 type ReviewTarget =
   | { type: "uncommittedChanges" }
   | { type: "baseBranch"; branch: string }
   | { type: "commit"; sha: string; title: string | null }
   | { type: "custom"; instructions: string };
+
+type CommandExecResponse = {
+  exitCode?: number;
+  exit_code?: number;
+  stdout?: string;
+  stderr?: string;
+};
+
+type VoiceExecSession = {
+  sessionId: number;
+  processId: string;
+  output: string;
+  readOffset: number;
+  startedAt: number;
+  completedAt: number | null;
+  exitCode: number | null;
+  error: Error | null;
+  done: Promise<void>;
+};
+
+type VoiceToolContext = {
+  project: VoiceProject | null;
+  chat: VoiceChat | null;
+  permissionMode: CodexPermissionMode;
+  permissionProfile: unknown | null;
+};
 
 export class VoiceCodexOrchestrator extends EventEmitter {
   private activeProjectId: string | null = null;
@@ -94,6 +134,11 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private threadByTurn = new Map<string, string>();
   private tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
   private threadStatusByThread = new Map<string, string>();
+  private threadPermissionProfileByThread = new Map<string, unknown>();
+  private voiceExecNextSessionId = 1;
+  private voiceExecNextProcessId = 1;
+  private voiceExecSessions = new Map<number, VoiceExecSession>();
+  private voiceExecSessionByProcessId = new Map<string, VoiceExecSession>();
 
   constructor(
     private readonly store: ProjectStore,
@@ -145,8 +190,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     };
   }
 
-  async createProject(name?: string): Promise<VoiceProject> {
-    const project = await this.store.createProject(name);
+  async createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject> {
+    const resolvedWorkspacePath = await resolveWorkspacePathInput(workspacePath);
+    const project = await this.store.createProject(name, resolvedWorkspacePath);
     this.activeProjectId = project.id;
     this.showProjectChatsFlag = false;
     this.status = `Active project: ${project.displayName}`;
@@ -280,7 +326,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
-  async sendToCodex(text: string, chatId?: string): Promise<CodexActionResult> {
+  async sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult> {
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Cannot send an empty request to Codex.");
 
@@ -288,8 +334,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       return this.handleNativeSlashCommand(trimmed);
     }
 
+    const resolvedWorkspacePath = workspacePath?.trim()
+      ? await resolveWorkspacePathInput(workspacePath)
+      : await inferWorkspacePathFromText(trimmed);
     let context: ChatContext;
-    if (!this.activeProjectId && !chatId) {
+    if (resolvedWorkspacePath && !chatId) {
+      const project = await this.projectForWorkspace(titleFromText(trimmed), resolvedWorkspacePath);
+      const chat = activeChatForProject(project);
+      const updated = chat ? project : await this.startChatThread(project, titleFromText(trimmed));
+      context = this.requireActiveChatContextFromProject(updated);
+    } else if (!this.activeProjectId && !chatId) {
       const project = await this.createProject(titleFromText(trimmed));
       const updated = await this.startChatThread(project, titleFromText(trimmed));
       context = this.requireActiveChatContextFromProject(updated);
@@ -300,10 +354,11 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     if (!chat.codexThreadId) throw new Error("Active chat is missing a Codex thread id.");
 
     const turnSettings = this.resolveTurnSettings(project, chat);
+    const cwd = projectWorkspacePath(project);
     const result = (await this.codex.request("turn/start", {
       threadId: chat.codexThreadId,
-      cwd: project.folderPath,
-      ...permissionParams(turnSettings.permissionMode),
+      cwd,
+      ...turnPermissionParams(turnSettings.permissionMode),
       personality: "friendly",
       ...(turnSettings.model ? { model: turnSettings.model } : {}),
       ...(turnSettings.reasoningEffort ? { effort: turnSettings.reasoningEffort } : {}),
@@ -403,8 +458,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const turnSettings = this.resolveTurnSettings(resumed.project, resumed.chat);
     const result = (await this.codex.request("turn/start", {
       threadId: resumedThreadId,
-      cwd: resumed.project.folderPath,
-      ...permissionParams(turnSettings.permissionMode),
+      cwd: projectWorkspacePath(resumed.project),
+      ...turnPermissionParams(turnSettings.permissionMode),
       personality: "friendly",
       ...(turnSettings.model ? { model: turnSettings.model } : {}),
       ...(turnSettings.reasoningEffort ? { effort: turnSettings.reasoningEffort } : {}),
@@ -605,6 +660,40 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
+  async execCommandForVoice(args: VoiceExecCommandArgs): Promise<VoiceExecCommandResult> {
+    const command = commandVectorFromVoiceArgs(args);
+    return this.runVoiceCommand(command, args);
+  }
+
+  async writeStdinForVoice(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult> {
+    const session = this.voiceExecSessions.get(args.session_id);
+    if (!session) throw new Error(`Unknown exec_command session: ${args.session_id}`);
+
+    const startedAt = Date.now();
+    const chars = args.chars ?? "";
+    if (chars && session.completedAt) {
+      throw new Error(`exec_command session ${args.session_id} is no longer running.`);
+    }
+    if (chars) {
+      await this.codex.request("command/exec/write", {
+        processId: session.processId,
+        deltaBase64: Buffer.from(chars).toString("base64"),
+      });
+    }
+
+    await waitForVoiceSession(session, normalizeYieldMs(args.yield_time_ms));
+    return formatVoiceExecResult(session, startedAt, args.max_output_tokens, true);
+  }
+
+  async applyPatchForVoice(input: string): Promise<VoiceExecCommandResult> {
+    if (!input.trim()) throw new Error("apply_patch input is required.");
+    return this.runVoiceCommand(["apply_patch", input], {
+      cmd: "apply_patch",
+      yield_time_ms: 1_000,
+      max_output_tokens: 6_000,
+    });
+  }
+
   async getChatStatus(chatId?: string): Promise<CodexChatRuntime[]> {
     const project = chatId ? await this.requireProjectForChat(chatId) : await this.requireProject();
     const runtimes = this.chatRuntimeStates(project);
@@ -684,6 +773,94 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
   createRealtimeClientSecret = createRealtimeClientSecret;
 
+  private async runVoiceCommand(
+    command: string[],
+    args: VoiceExecCommandArgs,
+  ): Promise<VoiceExecCommandResult> {
+    if (command.length === 0) throw new Error("exec_command command must not be empty.");
+
+    const startedAt = Date.now();
+    const context = await this.resolveVoiceToolContext();
+    const cwd = resolveVoiceWorkdir(args.workdir, context.project ? projectWorkspacePath(context.project) : null);
+    const processId = `voice-exec-${Date.now()}-${this.voiceExecNextProcessId++}`;
+    const sessionId = this.voiceExecNextSessionId++;
+    const session: VoiceExecSession = {
+      sessionId,
+      processId,
+      output: "",
+      readOffset: 0,
+      startedAt,
+      completedAt: null,
+      exitCode: null,
+      error: null,
+      done: Promise.resolve(),
+    };
+
+    this.voiceExecSessions.set(sessionId, session);
+    this.voiceExecSessionByProcessId.set(processId, session);
+    const request = this.codex.request(
+      "command/exec",
+      {
+        command,
+        processId,
+        tty: Boolean(args.tty),
+        streamStdin: true,
+        streamStdoutStderr: true,
+        cwd,
+        ...(context.permissionProfile ? { permissionProfile: context.permissionProfile } : {}),
+      },
+      60 * 60 * 1_000,
+    ) as Promise<CommandExecResponse>;
+
+    session.done = request
+      .then((response) => {
+        session.exitCode = numberField(response.exitCode) ?? numberField(response.exit_code) ?? null;
+        if (response.stdout) session.output += response.stdout;
+        if (response.stderr) session.output += response.stderr;
+      })
+      .catch((error) => {
+        session.error = error instanceof Error ? error : new Error(String(error));
+      })
+      .finally(() => {
+        session.completedAt = Date.now();
+        const cleanupTimer = setTimeout(() => {
+          this.voiceExecSessions.delete(session.sessionId);
+          this.voiceExecSessionByProcessId.delete(session.processId);
+        }, 10 * 60 * 1_000);
+        if (typeof cleanupTimer === "object" && "unref" in cleanupTimer) {
+          cleanupTimer.unref();
+        }
+      });
+
+    await waitForVoiceSession(session, normalizeYieldMs(args.yield_time_ms));
+    return formatVoiceExecResult(session, startedAt, args.max_output_tokens, true);
+  }
+
+  private async resolveVoiceToolContext(): Promise<VoiceToolContext> {
+    const project = await this.getActiveProject();
+    const chat = project ? activeChatForProject(project) : null;
+    const settings = project
+      ? this.threadSettingsForChat(project, chat)
+      : {
+          model: this.defaultModel,
+          reasoningEffort: this.defaultReasoningEffort,
+          permissionMode: this.defaultPermissionMode,
+        };
+    const storedProfile = chat?.codexThreadId
+      ? this.threadPermissionProfileByThread.get(chat.codexThreadId) ?? null
+      : null;
+    return {
+      project,
+      chat,
+      permissionMode: settings.permissionMode,
+      permissionProfile: voicePermissionProfile(
+        settings.permissionMode,
+        project ? projectWorkspacePath(project) : null,
+        storedProfile,
+      ),
+    };
+  }
+
   private async getActiveProject(): Promise<VoiceProject | null> {
     return this.activeProjectId ? this.store.getProject(this.activeProjectId) : null;
   }
@@ -709,6 +886,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         candidate.chats.some((chat) => chat.id === chatId && (includeArchived || !chat.archivedAt)),
       ) ?? null
     );
+  }
+
+  private async projectForWorkspace(displayName: string, workspacePath: string): Promise<VoiceProject> {
+    const projects = await this.store.listProjects();
+    const existing = projects.find((project) => samePath(projectWorkspacePath(project), workspacePath));
+    if (existing) {
+      this.activeProjectId = existing.id;
+      return existing;
+    }
+    return this.createProject(displayName, workspacePath);
   }
 
   private async requireActiveProject(): Promise<VoiceProject> {
@@ -755,29 +942,35 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const chatSettings = this.threadSettingsForChat(project, chat);
 
     try {
-      await this.codex.request("thread/resume", {
+      const resumeResult = await this.codex.request("thread/resume", {
         threadId: chat.codexThreadId,
-        cwd: project.folderPath,
-        ...permissionParams(chatSettings.permissionMode),
+        cwd: projectWorkspacePath(project),
+        ...threadPermissionParams(chatSettings.permissionMode),
+        developerInstructions: CODEX_VOICE_DEVELOPER_INSTRUCTIONS,
         personality: "friendly",
         excludeTurns: true,
         ...(chatSettings.model ? { model: chatSettings.model } : {}),
       });
+      this.recordThreadPermissionProfile(chat.codexThreadId, resumeResult);
+      await this.syncThreadName(chat.codexThreadId, chat.displayName);
       return { project, chat };
     } catch (error) {
       if (!isMissingCodexThreadError(error)) throw error;
     }
 
     const result = (await this.codex.request("thread/start", {
-      cwd: project.folderPath,
+      cwd: projectWorkspacePath(project),
       ...(chatSettings.model ? { model: chatSettings.model } : {}),
-      ...permissionParams(chatSettings.permissionMode),
+      ...threadPermissionParams(chatSettings.permissionMode),
+      developerInstructions: CODEX_VOICE_DEVELOPER_INSTRUCTIONS,
       personality: "friendly",
       serviceName: "codex_voice",
     })) as { thread?: { id?: string } };
 
     const codexThreadId = result.thread?.id;
     if (!codexThreadId) throw new Error("Codex did not return a replacement thread id.");
+    this.recordThreadPermissionProfile(codexThreadId, result);
+    await this.syncThreadName(codexThreadId, chat.displayName);
 
     const updatedProject = await this.store.updateChat(project.id, chat.id, {
       codexThreadId,
@@ -798,17 +991,38 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private async startChatThread(project: VoiceProject, displayName: string): Promise<VoiceProject> {
     const chatSettings = this.initialChatSettings(project);
     const result = (await this.codex.request("thread/start", {
-      cwd: project.folderPath,
+      cwd: projectWorkspacePath(project),
       ...(chatSettings.model ? { model: chatSettings.model } : {}),
-      ...permissionParams(chatSettings.permissionMode),
+      ...threadPermissionParams(chatSettings.permissionMode),
+      developerInstructions: CODEX_VOICE_DEVELOPER_INSTRUCTIONS,
       personality: "friendly",
       serviceName: "codex_voice",
     })) as { thread?: { id?: string } };
 
     const codexThreadId = result.thread?.id;
     if (!codexThreadId) throw new Error("Codex did not return a thread id.");
+    this.recordThreadPermissionProfile(codexThreadId, result);
+    await this.syncThreadName(codexThreadId, displayName);
 
     return this.store.addChat(project.id, displayName, codexThreadId, chatSettings);
+  }
+
+  private async syncThreadName(threadId: string, name: string): Promise<void> {
+    try {
+      await this.codex.request("thread/name/set", { threadId, name });
+    } catch (error) {
+      this.emitEvent("app", "threadNameSyncFailed", `Could not sync Codex thread name: ${error instanceof Error ? error.message : String(error)}`, {
+        threadId,
+      });
+    }
+  }
+
+  private recordThreadPermissionProfile(threadId: string, response: unknown): void {
+    const record = response as { permissionProfile?: unknown; permission_profile?: unknown } | null;
+    const profile = record?.permissionProfile ?? record?.permission_profile;
+    if (profile) {
+      this.threadPermissionProfileByThread.set(threadId, profile);
+    }
   }
 
   private handleServerRequest(message: CodexJsonMessage): void {
@@ -826,13 +1040,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private handleNotification(message: CodexJsonMessage): void {
     const method = message.method ?? "notification";
     const params = message.params as Record<string, unknown> | undefined;
+    if (method === "command/exec/outputDelta") {
+      this.handleVoiceCommandOutputDelta(params);
+    }
     const threadId = stringField(params?.threadId);
     const status = statusFromNotification(method, params);
     if (status) {
       this.status = status;
       this.emitEvent("codex", method, status, message.params);
       if (threadId) this.updateChatForThread(threadId, { lastStatus: status });
-    } else if (method !== "item/agentMessage/delta") {
+    } else if (method !== "item/agentMessage/delta" && method !== "command/exec/outputDelta") {
       this.emitEvent("codex", method, method, message.params);
     }
 
@@ -911,6 +1128,19 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     }
 
     this.emitState();
+  }
+
+  private handleVoiceCommandOutputDelta(params: Record<string, unknown> | undefined): void {
+    const processId = stringField(params?.processId);
+    const deltaBase64 = stringField(params?.deltaBase64);
+    if (!processId || !deltaBase64) return;
+    const session = this.voiceExecSessionByProcessId.get(processId);
+    if (!session) return;
+    try {
+      session.output += Buffer.from(deltaBase64, "base64").toString("utf8");
+    } catch {
+      session.output += deltaBase64;
+    }
   }
 
   private waitForTurnText(turnId: string): Promise<string> {
@@ -1231,7 +1461,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     if (lowerCommand === "new") {
       const project = await this.createProject(rest || undefined);
-      return this.commandResult(`Created new Codex voice project: ${project.displayName}\n${project.folderPath}`, project);
+      return this.commandResult(
+        `Created new Codex voice project: ${project.displayName}\nWorkspace: ${projectWorkspacePath(project)}\nVoice folder: ${project.folderPath}`,
+        project,
+      );
     }
 
     if (lowerCommand === "resume") {
@@ -1286,7 +1519,11 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           "Permission modes",
           ...CODEX_PERMISSION_PROFILES.map(
             (profile) =>
-              `${profile.mode} - ${profile.displayName}: approval ${profile.approvalPolicy}, sandbox ${profile.sandbox}`,
+              `${profile.mode} - ${profile.displayName}: approval ${formatPermissionValue(
+                profile.approvalPolicy,
+              )}, reviewer ${formatPermissionValue(profile.approvalsReviewer)}, sandbox ${formatPermissionValue(
+                profile.sandbox,
+              )}`,
           ),
         ].join("\n"),
         activeProject,
@@ -1363,7 +1600,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private async handlePluginsSlash(): Promise<CodexActionResult> {
     const project = await this.getActiveProject();
     const result = (await this.codex.request("plugin/list", {
-      cwds: project?.folderPath ? [project.folderPath] : null,
+      cwds: project ? [projectWorkspacePath(project)] : null,
     })) as {
       marketplaces?: Array<{
         name: string;
@@ -1396,7 +1633,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       "Codex /status",
       `Chat: ${chat?.displayName ?? "none"}`,
       `Thread: ${threadId ?? "none"}`,
-      `Folder: ${project?.folderPath ?? "none"}`,
+      `Workspace: ${project ? projectWorkspacePath(project) : "none"}`,
+      `Voice folder: ${project?.folderPath ?? "none"}`,
       `Runtime: ${this.threadStatusByThread.get(threadId ?? "") ?? this.status}`,
       `Active turn: ${threadId ? this.activeTurnByThread.get(threadId) ?? "none" : "none"}`,
       `Effective next turn: model ${resolved.model ?? "default"}, reasoning ${resolved.reasoningEffort ?? "default"}, permissions ${permissionProfile(resolved.permissionMode).displayName}`,
@@ -1413,12 +1651,14 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     try {
       const result = (await this.codex.request("config/read", {
         includeLayers: false,
-        cwd: project?.folderPath ?? null,
+        cwd: project ? projectWorkspacePath(project) : null,
       })) as { config?: Record<string, unknown> };
       const config = result.config ?? {};
       return `Config defaults: model ${formatConfigValue(config.model)}, reasoning ${formatConfigValue(
         config.model_reasoning_effort,
-      )}, approval ${formatConfigValue(config.approval_policy)}, sandbox ${formatConfigValue(config.sandbox_mode)}.`;
+      )}, approval ${formatConfigValue(config.approval_policy)}, reviewer ${formatConfigValue(
+        config.approvals_reviewer,
+      )}, sandbox ${formatConfigValue(config.sandbox_mode)}.`;
     } catch (error) {
       return `Config defaults: unavailable (${error instanceof Error ? error.message : String(error)}).`;
     }
@@ -1520,6 +1760,97 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       raw,
     } satisfies AppEvent);
   }
+}
+
+function commandVectorFromVoiceArgs(args: VoiceExecCommandArgs): string[] {
+  const cmd = args.cmd.trim();
+  if (!cmd) throw new Error("exec_command cmd is required.");
+  const shell = args.shell?.trim() || process.env.SHELL || "/bin/zsh";
+  const flag = args.login === false ? "-c" : "-lc";
+  return [shell, flag, cmd];
+}
+
+function resolveVoiceWorkdir(workdir: string | null | undefined, projectFolderPath: string | null): string {
+  const base = projectFolderPath ?? process.cwd();
+  if (!workdir?.trim()) return base;
+  return path.isAbsolute(workdir) ? workdir : path.resolve(base, workdir);
+}
+
+function voicePermissionProfile(
+  mode: CodexPermissionMode,
+  projectFolderPath: string | null,
+  storedProfile: unknown | null,
+): unknown | null {
+  if (mode === "custom-config") return storedProfile;
+  if (mode === "full-access") return { type: "disabled" };
+
+  return workspaceWritePermissionProfile(projectFolderPath ?? process.cwd());
+}
+
+function workspaceWritePermissionProfile(projectFolderPath: string): unknown {
+  const protectedSubpaths = [".git", ".agents", ".codex"].map((subpath) => path.join(projectFolderPath, subpath));
+  return {
+    type: "managed",
+    network: { enabled: false },
+    fileSystem: {
+      type: "restricted",
+      entries: [
+        { path: { type: "special", value: { kind: "root" } }, access: "read" },
+        { path: { type: "path", path: projectFolderPath }, access: "write" },
+        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+        ...protectedSubpaths.map((protectedPath) => ({
+          path: { type: "path", path: protectedPath },
+          access: "read",
+        })),
+      ],
+    },
+  };
+}
+
+function normalizeYieldMs(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 1_000;
+  return Math.max(0, Math.min(30_000, Math.floor(value)));
+}
+
+async function waitForVoiceSession(session: VoiceExecSession, yieldMs: number): Promise<void> {
+  if (session.completedAt) return;
+  await Promise.race([session.done, sleep(yieldMs)]);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatVoiceExecResult(
+  session: VoiceExecSession,
+  startedAt: number,
+  maxOutputTokens: number | null | undefined,
+  consume: boolean,
+): VoiceExecCommandResult {
+  if (session.error) throw session.error;
+  const output = consume ? session.output.slice(session.readOffset) : session.output;
+  if (consume) session.readOffset = session.output.length;
+  const approxTokens = approximateTokenCount(output);
+  return {
+    wall_time_seconds: (Date.now() - startedAt) / 1_000,
+    ...(session.completedAt ? { exit_code: session.exitCode ?? 0 } : { session_id: session.sessionId }),
+    original_token_count: approxTokens,
+    output: truncateOutput(output, maxOutputTokens),
+  };
+}
+
+function truncateOutput(output: string, maxOutputTokens: number | null | undefined): string {
+  const maxTokens = typeof maxOutputTokens === "number" && Number.isFinite(maxOutputTokens)
+    ? Math.max(1, Math.floor(maxOutputTokens))
+    : 6_000;
+  const maxChars = maxTokens * 4;
+  if (output.length <= maxChars) return output;
+  return `${output.slice(0, maxChars)}\n[output truncated]`;
+}
+
+function approximateTokenCount(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 function finalAssistantTextFromTurn(turn: CodexThreadTurn): string | null {
@@ -2078,6 +2409,10 @@ function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function activeChatForProject(project: VoiceProject): VoiceChat | null {
   const chats = project.chats.filter((chat) => !chat.archivedAt);
   return (
@@ -2110,7 +2445,7 @@ function nativeSlashHelpText(): string {
     "/mcp [verbose] - list MCP servers reported by app-server.",
     "/apps - list apps/connectors reported by app-server.",
     "/plugins - list plugins reported by app-server.",
-    "/permissions [default|auto-review|full-access] - show or update chat permission mode.",
+    "/permissions [default|auto-review|full-access|custom-config] - show or update chat permission mode.",
     "/new [name] and /resume [projectId] - voice-project equivalents of Codex conversation controls.",
     "Recognized but UI-only or not wired yet: /feedback, /plan-mode, /diff, /init, /agent, /mention, /stop, /fork, /side, /clear, /copy, /quit.",
   ].join("\n");
@@ -2393,15 +2728,32 @@ function permissionProfile(mode: CodexPermissionMode) {
   );
 }
 
-function permissionParams(mode: CodexPermissionMode): {
-  approvalPolicy: CodexApprovalPolicy;
-  sandbox: CodexSandboxMode;
+function threadPermissionParams(mode: CodexPermissionMode): {
+  approvalPolicy?: CodexApprovalPolicy;
+  approvalsReviewer?: CodexApprovalsReviewer;
+  sandbox?: CodexSandboxMode;
 } {
   const profile = permissionProfile(mode);
   return {
-    approvalPolicy: profile.approvalPolicy,
-    sandbox: profile.sandbox,
+    ...(profile.approvalPolicy ? { approvalPolicy: profile.approvalPolicy } : {}),
+    ...(profile.approvalsReviewer ? { approvalsReviewer: profile.approvalsReviewer } : {}),
+    ...(profile.sandbox ? { sandbox: profile.sandbox } : {}),
   };
+}
+
+function turnPermissionParams(mode: CodexPermissionMode): {
+  approvalPolicy?: CodexApprovalPolicy;
+  approvalsReviewer?: CodexApprovalsReviewer;
+} {
+  const profile = permissionProfile(mode);
+  return {
+    ...(profile.approvalPolicy ? { approvalPolicy: profile.approvalPolicy } : {}),
+    ...(profile.approvalsReviewer ? { approvalsReviewer: profile.approvalsReviewer } : {}),
+  };
+}
+
+function formatPermissionValue(value: string | null): string {
+  return value ?? "config.toml";
 }
 
 function permissionModeFromText(text: string): CodexPermissionMode {
@@ -2409,7 +2761,14 @@ function permissionModeFromText(text: string): CodexPermissionMode {
   if (["default", "default-permissions", "normal"].includes(normalized)) return "default";
   if (["auto", "auto-review", "autoreview"].includes(normalized)) return "auto-review";
   if (["full", "full-access", "danger", "danger-full-access"].includes(normalized)) return "full-access";
-  throw new Error("Unknown permission mode. Use default, auto-review, or full-access.");
+  if (
+    ["custom", "custom-config", "custom-config-toml", "custom-config.toml", "config", "config-toml", "config.toml"].includes(
+      normalized,
+    )
+  ) {
+    return "custom-config";
+  }
+  throw new Error("Unknown permission mode. Use default, auto-review, full-access, or custom-config.");
 }
 
 function isMissingCodexThreadError(error: unknown): boolean {
@@ -2417,16 +2776,70 @@ function isMissingCodexThreadError(error: unknown): boolean {
   return /no rollout found for thread id/i.test(message) || /unknown thread/i.test(message);
 }
 
+function projectWorkspacePath(project: VoiceProject): string {
+  return project.workspacePath || project.folderPath;
+}
+
+async function resolveWorkspacePathInput(value: string | null | undefined): Promise<string | null> {
+  const raw = value?.trim();
+  if (!raw) return null;
+  const resolved = path.resolve(expandHomePath(raw));
+  const info = await stat(resolved).catch((error: unknown) => {
+    throw new Error(
+      `Workspace path is not accessible: ${resolved} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  });
+  if (!info.isDirectory()) {
+    throw new Error(`Workspace path is not a directory: ${resolved}`);
+  }
+  return resolved;
+}
+
+async function inferWorkspacePathFromText(text: string): Promise<string | null> {
+  const candidates = workspacePathCandidates(text);
+  for (const candidate of candidates) {
+    try {
+      return await resolveWorkspacePathInput(candidate);
+    } catch {
+      // Ignore path-like phrases that do not resolve to a real directory.
+    }
+  }
+  return null;
+}
+
+function workspacePathCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  const quotedPath = /["'`]((?:~\/|\/)[^"'`]+)["'`]/g;
+  for (const match of text.matchAll(quotedPath)) {
+    candidates.push(match[1]);
+  }
+
+  const pathLike = /(?:^|\s)((?:~\/|\/)[^\s,.;:!?]+)/g;
+  for (const match of text.matchAll(pathLike)) {
+    candidates.push(match[1]);
+  }
+
+  const workspaceRelative = /(?:^|\s)(workspace\/[A-Za-z0-9._/-]+)/gi;
+  for (const match of text.matchAll(workspaceRelative)) {
+    candidates.push(`~/${match[1]}`);
+  }
+
+  return [...new Set(candidates.map((candidate) => candidate.replace(/[)\]}]+$/, "")))];
+}
+
+function expandHomePath(value: string): string {
+  if (value === "~") return process.env.HOME ?? value;
+  if (value.startsWith("~/")) {
+    const home = process.env.HOME;
+    return home ? path.join(home, value.slice(2)) : value;
+  }
+  return value;
+}
+
+function samePath(left: string, right: string): boolean {
+  return path.resolve(left) === path.resolve(right);
+}
+
 function codexTurnText(userText: string): string {
-  return [
-    "This request came through a local Realtime voice interface.",
-    "Treat the current working directory as this voice project's workspace.",
-    "Codex owns the actual planning, computer use, tool use, browser use, and execution.",
-    "For requests that may require controlling desktop apps, the model should use tool_search to discover computer-use before choosing an approach; do this only once per new tool or plugin requested by the user.",
-    "If the user's request mentions the Computer Use plugin, Codex must satisfy that request by discovering and using the actual computer-use plugin. Do not replace it with shell commands, open -a, AppleScript via terminal, or other terminal workarounds.",
-    "Ask for clarification or approval when needed, and keep final status concise enough to relay by voice.",
-    "",
-    "User's spoken request:",
-    userText,
-  ].join("\n");
+  return userText;
 }

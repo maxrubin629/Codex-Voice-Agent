@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
-import { clearOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
+import { clearOpenAiApiKey, getOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
 import appIcon from "./assets/app-icon.png?asset";
 import { CodexBridge } from "./codexBridge";
 import { VoiceCodexOrchestrator } from "./orchestrator";
@@ -12,9 +12,12 @@ import type {
   CodexSettingsScope,
   ReasoningEffort,
   ToolQuestionAnswer,
+  VoiceExecCommandArgs,
+  VoiceWriteStdinArgs,
 } from "../shared/types";
 
 const maxBufferedEvents = 250;
+const appName = "Codex Voice";
 
 let voiceWindow: BrowserWindow | null = null;
 let debugWindow: BrowserWindow | null = null;
@@ -35,6 +38,12 @@ function createVoiceWindow(): void {
     minWidth: 410,
     minHeight: 640,
     title: "Codex Voice",
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset" as const,
+          trafficLightPosition: { x: 14, y: 18 },
+        }
+      : {}),
     icon: appIcon,
     backgroundColor: "#121212",
     webPreferences: {
@@ -152,7 +161,10 @@ function registerIpcHandler(
   ipcMain.handle(channel, listener);
 }
 
+app.setName(appName);
+
 app.whenReady().then(() => {
+  app.setAboutPanelOptions({ applicationName: appName });
   app.dock?.setIcon(appIcon);
   registerIpc();
   void boot();
@@ -184,7 +196,8 @@ function registerIpc(): void {
   });
   registerIpcHandler(
     "projects:create",
-    (_event, payload: { name?: string }) => requireOrchestrator().createProject(payload.name),
+    (_event, payload: { name?: string; workspacePath?: string | null }) =>
+      requireOrchestrator().createProject(payload.name, payload.workspacePath),
   );
   registerIpcHandler(
     "projects:resume",
@@ -234,8 +247,10 @@ function registerIpc(): void {
     (_event, payload: { projectId?: string; chatId?: string }) =>
       requireOrchestrator().summarizeProject(payload.projectId, payload.chatId),
   );
-  registerIpcHandler("codex:send", (_event, payload: { text: string; chatId?: string }) =>
-    requireOrchestrator().sendToCodex(payload.text, payload.chatId),
+  registerIpcHandler(
+    "codex:send",
+    (_event, payload: { text: string; chatId?: string; workspacePath?: string | null }) =>
+      requireOrchestrator().sendToCodex(payload.text, payload.chatId, payload.workspacePath),
   );
   registerIpcHandler("codex:steer", (_event, payload: { text: string; chatId?: string }) =>
     requireOrchestrator().steerCodex(payload.text, payload.chatId),
@@ -267,6 +282,16 @@ function registerIpc(): void {
     (_event, payload: { requestId: string | number; answers: ToolQuestionAnswer[] }) =>
       requireOrchestrator().answerToolQuestion(payload.requestId, payload.answers),
   );
+  registerIpcHandler("voiceTools:execCommand", (_event, payload: VoiceExecCommandArgs) =>
+    requireOrchestrator().execCommandForVoice(payload),
+  );
+  registerIpcHandler("voiceTools:writeStdin", (_event, payload: VoiceWriteStdinArgs) =>
+    requireOrchestrator().writeStdinForVoice(payload),
+  );
+  registerIpcHandler("voiceTools:applyPatch", (_event, payload: { input: string }) =>
+    requireOrchestrator().applyPatchForVoice(payload.input),
+  );
+  registerIpcHandler("settings:getOpenAiApiKey", () => getOpenAiApiKey());
   registerIpcHandler("settings:saveOpenAiApiKey", (_event, payload: { apiKey: string }) => {
     saveOpenAiApiKey(payload.apiKey);
   });

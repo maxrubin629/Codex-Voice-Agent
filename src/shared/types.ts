@@ -1,14 +1,16 @@
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type CodexApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
+export type CodexApprovalsReviewer = "user" | "auto_review";
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
-export type CodexPermissionMode = "default" | "auto-review" | "full-access";
+export type CodexPermissionMode = "default" | "auto-review" | "full-access" | "custom-config";
 
 export type CodexPermissionProfile = {
   mode: CodexPermissionMode;
   displayName: string;
   description: string;
-  approvalPolicy: CodexApprovalPolicy;
-  sandbox: CodexSandboxMode;
+  approvalPolicy: CodexApprovalPolicy | null;
+  approvalsReviewer: CodexApprovalsReviewer | null;
+  sandbox: CodexSandboxMode | null;
 };
 
 export const DEFAULT_CODEX_MODEL = "gpt-5.5";
@@ -21,13 +23,15 @@ export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
     displayName: "Default permissions",
     description: "Ask when Codex decides approval is needed.",
     approvalPolicy: "on-request",
+    approvalsReviewer: "user",
     sandbox: "workspace-write",
   },
   {
     mode: "auto-review",
     displayName: "Auto-review",
-    description: "Work automatically inside the workspace sandbox.",
-    approvalPolicy: "never",
+    description: "Route eligible approval prompts through Codex auto-review.",
+    approvalPolicy: "on-request",
+    approvalsReviewer: "auto_review",
     sandbox: "workspace-write",
   },
   {
@@ -35,7 +39,16 @@ export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
     displayName: "Full access",
     description: "Run without approval prompts or filesystem sandboxing.",
     approvalPolicy: "never",
+    approvalsReviewer: "user",
     sandbox: "danger-full-access",
+  },
+  {
+    mode: "custom-config",
+    displayName: "Custom (config.toml)",
+    description: "Use approval and sandbox settings from config.toml.",
+    approvalPolicy: null,
+    approvalsReviewer: null,
+    sandbox: null,
   },
 ];
 
@@ -101,6 +114,7 @@ export type VoiceProject = {
   id: string;
   displayName: string;
   folderPath: string;
+  workspacePath: string;
   activeChatId: string | null;
   chats: VoiceChat[];
   /** Compatibility alias for the active chat's Codex thread id. */
@@ -249,13 +263,39 @@ export type RealtimeClientSecret = {
   voice: string;
 };
 
+export type VoiceExecCommandArgs = {
+  cmd: string;
+  workdir?: string | null;
+  shell?: string | null;
+  tty?: boolean | null;
+  login?: boolean | null;
+  yield_time_ms?: number | null;
+  max_output_tokens?: number | null;
+};
+
+export type VoiceWriteStdinArgs = {
+  session_id: number;
+  chars?: string | null;
+  yield_time_ms?: number | null;
+  max_output_tokens?: number | null;
+};
+
+export type VoiceExecCommandResult = {
+  chunk_id?: string;
+  wall_time_seconds: number;
+  exit_code?: number;
+  session_id?: number;
+  original_token_count?: number;
+  output: string;
+};
+
 export type CodexVoiceApi = {
   getState(): Promise<AppState>;
   openDebugWindow(): Promise<void>;
   getEvents(): Promise<AppEvent[]>;
   clearEvents(): Promise<void>;
   logEvent(event: AppEvent): Promise<void>;
-  createProject(name?: string): Promise<VoiceProject>;
+  createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject>;
   resumeProject(projectId: string): Promise<VoiceProject>;
   archiveProject(projectId: string): Promise<VoiceProject>;
   restoreProject(projectId: string): Promise<VoiceProject>;
@@ -266,7 +306,7 @@ export type CodexVoiceApi = {
   listChats(projectId?: string): Promise<VoiceChat[]>;
   showProjectChats(open?: boolean): Promise<void>;
   summarizeProject(projectId?: string, chatId?: string): Promise<string>;
-  sendToCodex(text: string, chatId?: string): Promise<CodexActionResult>;
+  sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult>;
   steerCodex(text: string, chatId?: string): Promise<{ turnId: string }>;
   interruptCodex(chatId?: string): Promise<void>;
   getChatStatus(chatId?: string): Promise<CodexChatRuntime[]>;
@@ -276,6 +316,10 @@ export type CodexVoiceApi = {
   ): Promise<CodexSettings>;
   answerApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
+  execCommand(args: VoiceExecCommandArgs): Promise<VoiceExecCommandResult>;
+  writeStdin(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult>;
+  applyPatch(input: string): Promise<VoiceExecCommandResult>;
+  getOpenAiApiKey(): Promise<string | null>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;

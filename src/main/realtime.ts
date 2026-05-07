@@ -92,14 +92,23 @@ function realtimeInstructions(): string {
     "You are the voice communication layer for a local Codex desktop app.",
     "",
     "# Boundary",
-    "- You do NOT do computer tasks yourself.",
-    "- You do NOT inspect files, infer computer state, choose Codex tools, or invent context.",
-    "- Codex is the actual computer-use agent. Your job is to pass the user's request to Codex.",
-    "- If the user asks for a computer task, call submit_to_codex with the user's request as faithfully as possible.",
+    "- Codex is the primary computer-use agent. Use submit_to_codex for substantial, ambiguous, or multi-step coding work.",
+    "- You may inspect/search files and run focused local commands with exec_command when that helps you answer or triage quickly.",
+    "- You may edit files with apply_patch for small, clear, well-scoped changes. Larger changes should be handed to Codex.",
+    "- Multi-file edits are not a separate tool. They are just repeated apply_patch calls, or one patch that contains several file sections.",
+    "- Do not invent hard tool-side size, risk, or file-count limits. Use judgment in guidance: inspect first, edit deliberately, and delegate bigger work to Codex.",
+    "- The active Codex permission mode also governs your file/command tools. Full access means no filesystem sandbox; custom config follows Codex config when available.",
+    "- Prefer rg for search, read files before editing them, keep workdir explicit when it matters, and verify edits with targeted commands when reasonable.",
+    "- Reading project docs, plan files, AGENTS.md, README files, tests, and nearby source is often the best use of your file tools before deciding what to do.",
+    "- A strong voice workflow is to turn the user's live thinking into a concise plan file, then ask Codex to implement that plan. Use apply_patch for the plan file when the plan is clear, and submit_to_codex when implementation begins.",
+    "- When several Codex chats are running at once, act as the coordinator: create or switch chats, read or update per-workstream plan files, submit focused tasks to the right chat, steer running chats with new context, and use get_codex_chat_status before summarizing progress.",
+    "- Keep plan files practical: current goal, relevant files, decisions, open questions, and the next concrete Codex task. Do not bloat them with generic process text.",
+    "- If the user asks for a computer task beyond a small direct inspection or edit, call submit_to_codex with the user's request as faithfully as possible.",
     "- If the user asks to create a project or chat and gives an explicit name, use that name.",
     "- If the user asks to create a project or chat with useful context but without an explicit name, create a short, clear, relevant 2-6 word name from that context.",
     "- If the user asks to create a project or chat without a name or useful context, or the name would be ambiguous, ask: What would you like to use this chat or project for?",
-    "- Creating a project only creates the project folder. Do not create a chat or submit a task unless the user separately asks you to add a chat or start work.",
+    "- Creating a project only creates the project record. Do not create a chat or submit a task unless the user separately asks you to add a chat or start work.",
+    "- When the user names a repo, folder, cwd, or workspace path, pass it as workspacePath so Codex threads are filed under that real workspace in the Codex app.",
     "- Creating a chat with context only creates, names, and switches to the chat. Do not submit that context to Codex as work unless the user separately asks you to start the task.",
     "- If the user asks to show open chats, show chats, list chats, switch chats, or get updates on a chat, use the chat tools instead of submit_to_codex.",
     "- Only add context that came from the current live voice conversation.",
@@ -123,13 +132,21 @@ function realtimeInstructions(): string {
   ].join("\n");
 }
 
+const APPLY_PATCH_DESCRIPTION = [
+  "Use the apply_patch tool to edit files. Pass the patch text in the input field.",
+  "The patch must start with *** Begin Patch and end with *** End Patch.",
+  "Supported operations are *** Add File, *** Delete File, and *** Update File.",
+  "For updates, use @@ hunks with enough surrounding context to identify the lines. File paths are relative to the active project working directory.",
+  "A patch may touch more than one file; multi-file edits do not require a separate tool.",
+].join("\n");
+
 function realtimeTools(): unknown[] {
   return [
     {
       type: "function",
       name: "submit_to_codex",
       description:
-        "Pass the user's spoken request to Codex, the actual computer-use agent. Use for nearly all requests to do something on the computer.",
+        "Pass the user's spoken request to Codex, the actual computer-use agent. Use for implementation work, and target a named chat when coordinating parallel workstreams.",
       parameters: {
         type: "object",
         properties: {
@@ -139,7 +156,7 @@ function realtimeTools(): unknown[] {
           },
           context: {
             type: "string",
-            description: "Brief relevant context from the current voice conversation only.",
+            description: "Brief relevant context from the current voice conversation only. Include plan file paths or workstream names when they matter.",
           },
           chatId: {
             type: "string",
@@ -149,6 +166,11 @@ function realtimeTools(): unknown[] {
             type: "string",
             description: "Optional target chat name when the user explicitly names an existing chat.",
           },
+          workspacePath: {
+            type: "string",
+            description:
+              "Optional real workspace/repo directory for this Codex task, such as ~/workspace/codex-voice. Use when the user names a path or repo so the thread appears under that workspace in Codex.",
+          },
         },
         required: ["request"],
       },
@@ -156,7 +178,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "steer_codex",
-      description: "Append an update, correction, or extra instruction to the currently running Codex turn.",
+      description: "Append an update, correction, or extra instruction to a running Codex turn. Use chatId or chatName when several chats are active.",
       parameters: {
         type: "object",
         properties: {
@@ -188,6 +210,87 @@ function realtimeTools(): unknown[] {
       parameters: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      type: "function",
+      name: "exec_command",
+      description: "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+      parameters: {
+        type: "object",
+        properties: {
+          cmd: {
+            type: "string",
+            description: "Shell command to execute.",
+          },
+          workdir: {
+            type: "string",
+            description: "Optional working directory to run the command in; defaults to the active project's workspace.",
+          },
+          shell: {
+            type: "string",
+            description: "Shell binary to launch. Defaults to the user's default shell.",
+          },
+          tty: {
+            type: "boolean",
+            description: "Whether to allocate a TTY for the command. Defaults to false.",
+          },
+          login: {
+            type: "boolean",
+            description: "Whether to run the shell with login-shell semantics. Defaults to true.",
+          },
+          yield_time_ms: {
+            type: "number",
+            description: "How long to wait in milliseconds for output before yielding.",
+          },
+          max_output_tokens: {
+            type: "number",
+            description: "Maximum number of approximate tokens to return. Excess output will be truncated.",
+          },
+        },
+        required: ["cmd"],
+      },
+    },
+    {
+      type: "function",
+      name: "write_stdin",
+      description: "Writes characters to an existing exec_command session and returns recent output.",
+      parameters: {
+        type: "object",
+        properties: {
+          session_id: {
+            type: "number",
+            description: "Identifier of the running exec_command session.",
+          },
+          chars: {
+            type: "string",
+            description: "Bytes to write to stdin. Omit or pass an empty string to poll.",
+          },
+          yield_time_ms: {
+            type: "number",
+            description: "How long to wait in milliseconds for output before yielding.",
+          },
+          max_output_tokens: {
+            type: "number",
+            description: "Maximum number of approximate tokens to return. Excess output will be truncated.",
+          },
+        },
+        required: ["session_id"],
+      },
+    },
+    {
+      type: "function",
+      name: "apply_patch",
+      description: APPLY_PATCH_DESCRIPTION,
+      parameters: {
+        type: "object",
+        properties: {
+          input: {
+            type: "string",
+            description: "Patch text using the Codex apply_patch format.",
+          },
+        },
+        required: ["input"],
       },
     },
     {
@@ -281,13 +384,13 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "set_codex_permissions",
       description:
-        "Set the Codex permission mode for the current chat, or next turn only if the user explicitly asks. Default permissions asks when Codex decides approval is needed; auto-review runs automatically inside the workspace sandbox; full access runs without approval prompts or filesystem sandboxing.",
+        "Set the Codex permission mode for the current chat, or next turn only if the user explicitly asks. Default permissions asks when Codex decides approval is needed; auto-review routes eligible approval prompts through Codex auto-review; full access runs without approval prompts or filesystem sandboxing; custom config.toml defers approval and sandbox settings to the active Codex config.",
       parameters: {
         type: "object",
         properties: {
           permissionMode: {
             type: "string",
-            enum: ["default", "auto-review", "full-access"],
+            enum: ["default", "auto-review", "full-access", "custom-config"],
           },
           scope: {
             type: "string",
@@ -302,11 +405,16 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "create_new_codex_project",
       description:
-        "Create a new Codex voice project with a fresh Documents workspace folder, without creating a chat/thread or submitting work. Provide a short name when available or infer one from useful context; ask the user what the project is for if no useful name/context exists.",
+        "Create a new Codex voice project record, without creating a chat/thread or submitting work. Provide a short name when available or infer one from useful context; pass workspacePath when the user names a real repo/folder so future Codex threads appear under that workspace.",
       parameters: {
         type: "object",
         properties: {
           name: { type: "string" },
+          workspacePath: {
+            type: "string",
+            description:
+              "Optional real workspace/repo directory, such as ~/workspace/codex-voice. Omit only when the user wants a blank scratch voice project.",
+          },
         },
       },
     },
@@ -314,7 +422,7 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "create_new_codex_chat",
       description:
-        "Create a new chat/thread inside the current Codex voice project, make it active, and do not submit work to Codex. Requires a short clear name; ask the user what the chat is for if no useful name/context exists.",
+        "Create a new chat/thread inside the current Codex voice project for a distinct workstream, make it active, and do not submit work to Codex. Requires a short clear name; ask the user what the chat is for if no useful name/context exists.",
       parameters: {
         type: "object",
         properties: {
@@ -351,7 +459,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "get_codex_chat_status",
-      description: "Get updates/status for one chat or all chats in the current project.",
+      description: "Get updates/status for one chat or all chats in the current project. Use this before coordinating or summarizing parallel Codex work.",
       parameters: {
         type: "object",
         properties: {
