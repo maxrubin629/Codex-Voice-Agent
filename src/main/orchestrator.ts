@@ -2128,6 +2128,7 @@ function summarizeThreadTurn(turn: CodexThreadTurn, index: number): ThreadSummar
     startedAt: numberOrNull(turn.startedAt),
     completedAt: numberOrNull(turn.completedAt),
     durationMs: numberOrNull(turn.durationMs),
+    userText: userTextFromTurn(turn),
     assistantText: finalAssistantTextFromTurn(turn),
     itemCount: items.length,
     items: items.map((item, itemIndex) => summarizeThreadItem(item, turn.id ?? `turn-${index + 1}`, itemIndex)),
@@ -2916,6 +2917,15 @@ function finalAssistantTextFromTurn(turn: CodexThreadTurn): string | null {
     "message",
     "text",
   ]);
+}
+
+function userTextFromTurn(turn: CodexThreadTurn): string | null {
+  const userMessages = (turn.items ?? [])
+    .filter((item) => normalizeThreadItemType(item) === "user-message")
+    .map(textFromThreadMessageItem)
+    .filter((text): text is string => Boolean(text));
+  if (userMessages.length > 0) return userMessages.join("\n\n");
+  return firstTextField(turn, ["userText", "input", "prompt", "request"]);
 }
 
 function textFromThreadMessageItem(item: CodexThreadItem): string | null {

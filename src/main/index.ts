@@ -37,6 +37,16 @@ let bufferedEvents: AppEvent[] = [];
 
 type RendererWindowKind = "voice" | "debug";
 
+guardConsoleStream(process.stdout);
+guardConsoleStream(process.stderr);
+
+function guardConsoleStream(stream: NodeJS.WriteStream): void {
+  stream.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EIO" || error.code === "EPIPE") return;
+    throw error;
+  });
+}
+
 function createVoiceWindow(): void {
   if (voiceWindow && !voiceWindow.isDestroyed()) {
     voiceWindow.show();

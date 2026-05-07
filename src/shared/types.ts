@@ -240,6 +240,7 @@ export type ThreadSummaryTurn = {
   startedAt: number | null;
   completedAt: number | null;
   durationMs: number | null;
+  userText: string | null;
   assistantText: string | null;
   itemCount: number;
   items: ThreadSummaryItem[];

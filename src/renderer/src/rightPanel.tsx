@@ -62,7 +62,7 @@ const builtInTabs: Array<RightPanelTab & { id: BuiltInTabId; kind: "builtIn" }> 
 const defaultTabs = builtInTabs.filter((tab) => tab.id === "transcript");
 const tabsStorageKey = "codexVoice.rightPanel.tabs";
 const tabsStorageVersionKey = "codexVoice.rightPanel.tabsVersion";
-const tabsStorageVersion = "3";
+const tabsStorageVersion = "4";
 const activeTabStorageKey = "codexVoice.rightPanel.activeTab";
 const minPanelWidth = 320;
 const maxPanelWidth = 720;
@@ -487,7 +487,7 @@ function RightPanelTabContent({
   if (tab.id === "transcript") {
     return (
       <div className="voice-right-transcript-tab">
-        <VoiceTranscriptContent open state={state} events={events} />
+        <VoiceTranscriptContent open state={state} events={events} summary={summaryState.data} />
       </div>
     );
   }

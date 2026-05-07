@@ -1,5 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import type { AppEvent, AppState, PendingCodexRequest, PendingRequestDetail, VoiceChat } from "../../shared/types";
+import type {
+  ActiveThreadSummary,
+  AppEvent,
+  AppState,
+  PendingCodexRequest,
+  PendingRequestDetail,
+  ThreadSummaryItem,
+  ThreadSummaryTurn,
+  VoiceChat,
+} from "../../shared/types";
 
 type MessageTone = "user" | "assistant";
 type ActivityIcon = "terminal" | "edit" | "search" | "list" | "globe" | "tool" | "check" | "alert" | "branch" | "spark";
@@ -133,15 +142,17 @@ export function VoiceTranscriptContent({
   open = true,
   state,
   events,
+  summary,
   className,
 }: {
   open?: boolean;
   state: AppState;
   events: AppEvent[];
+  summary?: ActiveThreadSummary | null;
   className?: string;
 }): React.ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const entries = useMemo(() => buildTranscriptEntries(events, state), [events, state]);
+  const entries = useMemo(() => buildTranscriptEntries(events, state, summary ?? null), [events, state, summary]);
   const latestEntryId = entries.length > 0 ? entries[entries.length - 1].id : "";
 
   useEffect(() => {
@@ -427,7 +438,11 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[
   return nodes;
 }
 
-function buildTranscriptEntries(events: AppEvent[], state: AppState): TranscriptEntry[] {
+function buildTranscriptEntries(
+  events: AppEvent[],
+  state: AppState,
+  summary: ActiveThreadSummary | null,
+): TranscriptEntry[] {
   const activeChat = activeChatFromState(state);
   const activeChatId = state.runtime.activeChatId ?? activeChat?.id ?? null;
   const activeThreadId = activeChat?.codexThreadId ?? state.activeProject?.codexThreadId ?? null;
@@ -468,6 +483,8 @@ function buildTranscriptEntries(events: AppEvent[], state: AppState): Transcript
   const pushEntry = (entry: TranscriptEntry): void => {
     timeline.push({ kind: "entry", entry });
   };
+
+  hydrateThreadSummary(summary, activeChatId, activeThreadId, ensureTurn);
 
   for (const event of chronologicalEvents) {
     const raw = recordFromUnknown(event.raw);
@@ -607,7 +624,68 @@ function buildTranscriptEntries(events: AppEvent[], state: AppState): Transcript
     return turn ? entriesFromTurn(turn) : [];
   });
 
-  return entries.slice(-120);
+  return entries;
+}
+
+function hydrateThreadSummary(
+  summary: ActiveThreadSummary | null,
+  activeChatId: string | null,
+  activeThreadId: string | null,
+  ensureTurn: (turnId: string) => TurnDraft,
+): void {
+  if (!summary || summary.status !== "ready") return;
+  if (summary.chatId && activeChatId && summary.chatId !== activeChatId) return;
+  if (summary.threadId && activeThreadId && summary.threadId !== activeThreadId) return;
+
+  for (const summaryTurn of summary.turns) {
+    const turn = ensureTurn(summaryTurn.id);
+    turn.chatId = summary.chatId;
+    turn.threadId = summary.threadId;
+    turn.status = summaryTurn.status;
+    turn.startedAtMs = codexTimestampMs(summaryTurn.startedAt) ?? turn.startedAtMs;
+    turn.completedAtMs = codexTimestampMs(summaryTurn.completedAt) ?? turn.completedAtMs;
+    turn.durationMs = summaryTurn.durationMs ?? turn.durationMs;
+
+    const userText = summaryTurn.userText ?? userTextFromSummaryItems(summaryTurn.items);
+    if (userText) {
+      pushUniqueMessage(turn.userMessages, {
+        kind: "message",
+        id: `summary-user-${summaryTurn.id}`,
+        tone: "user",
+        body: userText,
+      });
+    }
+
+    hydrateSummaryItems(turn, summaryTurn);
+    if (summaryTurn.assistantText?.trim()) {
+      turn.assistantFinal = summaryTurn.assistantText.trim();
+    }
+  }
+}
+
+function hydrateSummaryItems(turn: TurnDraft, summaryTurn: ThreadSummaryTurn): void {
+  const timestamp =
+    codexTimestampMs(summaryTurn.completedAt) ?? codexTimestampMs(summaryTurn.startedAt) ?? Date.now();
+  const at = new Date(timestamp).toISOString();
+  for (const item of summaryTurn.items) {
+    const raw = recordFromUnknown(item.raw) ?? {};
+    mergeTurnItem(
+      turn,
+      {
+        ...raw,
+        id: itemId(raw) ?? item.id,
+        type: stringFromUnknown(raw.type) ?? item.type,
+        status: stringFromUnknown(raw.status) ?? item.status ?? undefined,
+      },
+      {
+        at,
+        source: "codex",
+        kind: "item/completed",
+        message: "stored thread item",
+        raw: { item: raw },
+      },
+    );
+  }
 }
 
 function entriesFromTurn(turn: TurnDraft): TranscriptEntry[] {
@@ -618,8 +696,8 @@ function entriesFromTurn(turn: TurnDraft): TranscriptEntry[] {
       kind: "work",
       id: `work-${turn.id}`,
       summary: workSummary(turn),
-      active: turn.status === "in_progress" || workChildren.some((entry) => entryActive(entry)),
-      defaultExpanded: turn.status === "in_progress" || !turn.assistantFinal,
+      active: turnIsInProgress(turn.status) || workChildren.some((entry) => entryActive(entry)),
+      defaultExpanded: turnIsInProgress(turn.status) || !turn.assistantFinal,
       children: workChildren,
     });
   }
@@ -713,8 +791,12 @@ function normalizeTurnItem(item: TurnItemDraft): NormalizedTurnEntry | null {
       return webSearchActivity(item);
     case "collabAgentToolCall":
       return collabActivity(item);
+    case "todoList":
+      return todoListEntry(item);
     case "plan":
-      return statusEntry(`plan-${item.id}`, "check", "Updated plan", stringFromUnknown(raw.text) ?? undefined, false);
+      return statusEntry(`plan-${item.id}`, "check", "Updated plan", planText(raw) ?? undefined, false);
+    case "generatedImage":
+      return generatedImageEntry(item);
     case "contextCompaction":
       return statusEntry(`context-${item.id}`, "spark", "Compacted context", undefined, false);
     default:
@@ -915,6 +997,36 @@ function collabActivity(item: TurnItemDraft): ActivitySource {
   };
 }
 
+function todoListEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "status" }> {
+  const tasks = todoTaskRecords(item.raw);
+  const completed = tasks.filter((task) => taskIsCompleted(task)).length;
+  const rows = tasks.slice(0, 12).map((task, index) => ({
+    id: `${item.id}-todo-${index}`,
+    icon: taskIsCompleted(task) ? "check" as ActivityIcon : "list" as ActivityIcon,
+    label: taskTitle(task) ?? `Task ${index + 1}`,
+    meta: stringFromUnknown(task.status) ?? undefined,
+    tone: taskIsCompleted(task) ? "success" as ActivityTone : "normal" as ActivityTone,
+  }));
+  return statusEntry(
+    `todo-${item.id}`,
+    "list",
+    "Updated to do list",
+    tasks.length > 0 ? `${completed} of ${tasks.length} complete` : planText(item.raw) ?? undefined,
+    itemIsActive(item),
+    rows.length > 0 ? rows : undefined,
+  );
+}
+
+function generatedImageEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "status" }> {
+  return statusEntry(
+    `image-${item.id}`,
+    "spark",
+    itemIsActive(item) ? "Generating image" : "Generated image",
+    firstText(item.raw, ["prompt", "description", "url", "path", "filePath"]) ?? undefined,
+    itemIsActive(item),
+  );
+}
+
 function reasoningEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "reasoning" }> {
   const active = itemIsActive(item);
   const content = reasoningText(item.raw);
@@ -1071,11 +1183,12 @@ function handleCodexDeltaEvent(
 }
 
 function mergeTurnItem(turn: TurnDraft, rawItem: Record<string, unknown>, event: AppEvent): void {
-  const id = itemId(rawItem) ?? `${stringFromUnknown(rawItem.type) ?? "item"}-${turn.itemOrder.length + 1}`;
-  const type = stringFromUnknown(rawItem.type) ?? "unknown";
+  const rawType = stringFromUnknown(rawItem.type) ?? "unknown";
+  const type = normalizeTranscriptItemType(rawType);
+  const id = itemId(rawItem) ?? `${type}-${turn.itemOrder.length + 1}`;
   if (type === "agentMessage") {
-    const text = stringFromUnknown(rawItem.text);
-    if (text && (rawItem.phase === "final_answer" || rawItem.phase === "finalAnswer")) turn.assistantFinal = text;
+    const text = messageItemText(rawItem);
+    if (text && isFinalMessagePhase(rawItem.phase ?? rawItem.status)) turn.assistantFinal = text;
     else if (text) turn.assistantDraft = text;
     return;
   }
@@ -1093,7 +1206,7 @@ function mergeTurnItem(turn: TurnDraft, rawItem: Record<string, unknown>, event:
   }
   const item = ensureTurnItem(turn, id, type, event);
   item.type = type;
-  item.raw = { ...item.raw, ...rawItem };
+  item.raw = { ...item.raw, ...rawItem, originalType: rawType, type };
   if (event.kind === "item/completed") item.completedAtMs = dateMs(event.at);
 }
 
@@ -1169,9 +1282,19 @@ function hydrateStoredItems(turn: TurnDraft, value: unknown): void {
 }
 
 function itemIsActive(item: TurnItemDraft): boolean {
-  const status = stringFromUnknown(item.raw.status);
-  if (status === "inProgress" || status === "running") return true;
-  if (status === "completed" || status === "failed" || status === "declined") return false;
+  const status = normalizeStatusName(item.raw.status);
+  if (status === "inprogress" || status === "running" || status === "pending") return true;
+  if (
+    status === "completed" ||
+    status === "complete" ||
+    status === "done" ||
+    status === "failed" ||
+    status === "declined" ||
+    status === "cancelled" ||
+    status === "canceled"
+  ) {
+    return false;
+  }
   return item.completedAtMs == null;
 }
 
@@ -1185,7 +1308,7 @@ function entryActive(entry: TranscriptEntry): boolean {
 
 function workSummary(turn: TurnDraft): string {
   const duration = turn.durationMs ?? elapsedMs(turn.startedAtMs, turn.completedAtMs);
-  if (turn.status === "in_progress") {
+  if (turnIsInProgress(turn.status)) {
     return duration && duration >= 1000 ? `Working for ${formatDuration(duration)}` : "Working";
   }
   return duration ? `Worked for ${formatDuration(duration)}` : "Worked";
@@ -1254,6 +1377,17 @@ function commandCountsForAction(action: Record<string, unknown>): Partial<Activi
   return { commands: 1 };
 }
 
+function userTextFromSummaryItems(items: ThreadSummaryItem[]): string | null {
+  const messages = items
+    .filter((item) => normalizeTranscriptItemType(item.type) === "userMessage")
+    .map((item) => {
+      const raw = recordFromUnknown(item.raw);
+      return raw ? userMessageText(raw) : null;
+    })
+    .filter((text): text is string => Boolean(text));
+  return messages.length > 0 ? messages.join("\n\n") : null;
+}
+
 function searchLabel(action: Record<string, unknown>, active: boolean): string {
   const query = stringFromUnknown(action.query);
   const path = stringFromUnknown(action.path);
@@ -1262,14 +1396,95 @@ function searchLabel(action: Record<string, unknown>, active: boolean): string {
   return active ? "Searching" : "Searched";
 }
 
+function normalizeTranscriptItemType(value: string): string {
+  const normalized = value
+    .replace(/([a-z])([A-Z])/g, "$1-$2")
+    .replace(/_/g, "-")
+    .toLowerCase();
+  if (normalized === "agent-message" || normalized === "assistant-message") return "agentMessage";
+  if (normalized === "user-message" || normalized === "user-input") return "userMessage";
+  if (normalized === "command-execution" || normalized === "exec") return "commandExecution";
+  if (normalized === "file-change" || normalized === "patch" || normalized === "turn-diff") return "fileChange";
+  if (normalized === "mcp-tool-call" || normalized === "tool-call" || normalized === "mcp-server-elicitation") {
+    return "mcpToolCall";
+  }
+  if (normalized === "dynamic-tool-call") return "dynamicToolCall";
+  if (normalized === "web-search") return "webSearch";
+  if (
+    normalized === "collab-agent-tool-call" ||
+    normalized === "multi-agent-action" ||
+    normalized === "remote-task-created" ||
+    normalized === "worked-for" ||
+    normalized === "sub-agent"
+  ) {
+    return "collabAgentToolCall";
+  }
+  if (normalized === "todo-list") return "todoList";
+  if (normalized === "proposed-plan" || normalized === "plan-implementation") return "plan";
+  if (normalized === "context-compaction") return "contextCompaction";
+  if (normalized === "generated-image" || normalized === "image-generation") return "generatedImage";
+  return value;
+}
+
+function firstText(record: Record<string, unknown>, fields: string[]): string | null {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (Array.isArray(value)) {
+      const text = arrayStrings(value).join("\n").trim();
+      if (text) return text;
+    }
+  }
+  return null;
+}
+
+function messageItemText(item: Record<string, unknown>): string | null {
+  return firstText(item, ["text", "message", "content"]);
+}
+
+function isFinalMessagePhase(value: unknown): boolean {
+  const normalized = normalizeStatusName(value);
+  return normalized === "finalanswer" || normalized === "final" || normalized === "completed" || normalized === "complete";
+}
+
+function normalizeStatusName(value: unknown): string {
+  return typeof value === "string" ? value.toLowerCase().replace(/[_\s-]+/g, "") : "";
+}
+
+function turnIsInProgress(status: string | null): boolean {
+  return normalizeStatusName(status) === "inprogress";
+}
+
+function planText(raw: Record<string, unknown>): string | null {
+  return firstText(raw, ["text", "summary", "description", "title"]);
+}
+
+function todoTaskRecords(raw: Record<string, unknown>): Record<string, unknown>[] {
+  for (const field of ["items", "tasks", "todos"]) {
+    const value = raw[field];
+    if (Array.isArray(value)) return value.map(recordFromUnknown).filter((task): task is Record<string, unknown> => Boolean(task));
+  }
+  return [];
+}
+
+function taskTitle(task: Record<string, unknown>): string | null {
+  return firstText(task, ["title", "text", "content", "label", "description"]);
+}
+
+function taskIsCompleted(task: Record<string, unknown>): boolean {
+  const status = normalizeStatusName(task.status);
+  return status === "completed" || status === "complete" || status === "done";
+}
+
 function userMessageText(item: Record<string, unknown>): string | null {
+  const direct = firstText(item, ["text", "message", "content"]);
+  if (direct) return direct;
   const content = item.content;
-  if (typeof content === "string") return content.trim() || null;
   if (!Array.isArray(content)) return null;
   const parts = content
     .map((part) => {
       const record = recordFromUnknown(part);
-      return stringFromUnknown(record?.text) ?? stringFromUnknown(record?.content);
+      return typeof part === "string" ? part : stringFromUnknown(record?.text) ?? stringFromUnknown(record?.content);
     })
     .filter((part): part is string => Boolean(part));
   return parts.join("\n").trim() || null;
@@ -1278,7 +1493,7 @@ function userMessageText(item: Record<string, unknown>): string | null {
 function reasoningText(raw: Record<string, unknown>): string {
   const summary = arrayStrings(raw.summary);
   const content = arrayStrings(raw.content);
-  return [...summary, ...content].join("\n\n").trim();
+  return [...summary, ...content, ...arrayStrings(raw.text)].join("\n\n").trim();
 }
 
 function stripReasoningHeading(value: string): string {
@@ -1593,7 +1808,15 @@ function arrayRecords(value: unknown): Record<string, unknown>[] {
 }
 
 function arrayStrings(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (typeof item === "string") return item.trim();
+      const record = recordFromUnknown(item);
+      return record ? firstText(record, ["text", "summary", "content", "message"]) : null;
+    })
+    .filter((item): item is string => Boolean(item));
 }
 
 function recordFromUnknown(value: unknown): Record<string, unknown> | null {
