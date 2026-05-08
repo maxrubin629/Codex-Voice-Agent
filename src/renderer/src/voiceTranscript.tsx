@@ -1139,7 +1139,7 @@ function handleCodexDeltaEvent(
   if (!turnId) return false;
 
   if (event.kind === "item/agentMessage/delta") {
-    const delta = stringFromUnknown(raw.delta);
+    const delta = streamedStringFromUnknown(raw.delta);
     if (!delta) return true;
     const turn = ensureTurn(turnId);
     turn.assistantDraft += delta;
@@ -1148,7 +1148,7 @@ function handleCodexDeltaEvent(
   }
 
   if (event.kind === "item/reasoning/textDelta" || event.kind === "item/reasoning/summaryTextDelta") {
-    const delta = stringFromUnknown(raw.delta);
+    const delta = streamedStringFromUnknown(raw.delta);
     const itemId = stringFromUnknown(raw.itemId);
     if (!delta || !itemId) return true;
     const turn = ensureTurn(turnId);
@@ -1738,7 +1738,7 @@ function realtimeStreamingEntryFromEvent(
 ): { key: string; delta: string; entry: Extract<TranscriptEntry, { kind: "message" }> } | null {
   if (event.source !== "realtime") return null;
   const raw = recordFromUnknown(event.raw);
-  const delta = stringFromUnknown(raw?.delta) ?? stringFromUnknown(event.message);
+  const delta = realtimeDeltaText(event, raw);
   if (!delta) return null;
 
   if (isRealtimeUserTranscriptDelta(event.kind)) {
@@ -1777,6 +1777,14 @@ function realtimeTranscriptText(event: AppEvent, raw: Record<string, unknown> | 
   if (text) return text;
   const fallback = stringFromUnknown(event.message);
   if (!fallback || fallback === event.kind || fallback.includes("_audio_transcript")) return null;
+  return fallback;
+}
+
+function realtimeDeltaText(event: AppEvent, raw: Record<string, unknown> | null): string | null {
+  const delta = streamedStringFromUnknown(raw?.delta);
+  if (delta) return delta;
+  const fallback = streamedStringFromUnknown(event.message);
+  if (!fallback || fallback === event.kind) return null;
   return fallback;
 }
 
@@ -1830,6 +1838,10 @@ function recordFromUnknown(value: unknown): Record<string, unknown> | null {
 
 function stringFromUnknown(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function streamedStringFromUnknown(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function numberFromUnknown(value: unknown): number | null {
