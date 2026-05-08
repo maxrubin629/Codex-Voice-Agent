@@ -64,6 +64,8 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:answerToolQuestion", { requestId, answers }),
   getActiveThreadSummary: (chatId?: string) =>
     ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
+  getTranscriptMessages: (chatId?: string) =>
+    ipcRenderer.invoke("rightPanel:getTranscriptMessages", { chatId }),
   getGitChangeSummary: (workspacePath?: string | null) =>
     ipcRenderer.invoke("rightPanel:getGitChangeSummary", { workspacePath }),
   previewRightPanelTarget: (target: RightPanelPreviewRequest) =>

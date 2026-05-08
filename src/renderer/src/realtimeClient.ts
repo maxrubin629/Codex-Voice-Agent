@@ -8,12 +8,14 @@ import type {
   PendingCodexRequest,
   ToolQuestionAnswer,
   VoiceChat,
+  VoiceTranscriptMessage,
 } from "../../shared/types";
 
 type RealtimeCallbacks = {
   onLog: (event: AppEvent) => void;
   onConnectionChange: (connected: boolean, label: string) => void;
   onOutputLevel?: (level: number) => void;
+  getTranscriptMessages?: () => Promise<VoiceTranscriptMessage[]>;
 };
 
 type FunctionCallItem = {
@@ -100,6 +102,7 @@ export class RealtimeVoiceClient {
           `Connected to ${secret.model} (${secret.voice}, reasoning ${secret.reasoningEffort}).`,
         );
         this.log("connection", "Realtime data channel opened.");
+        void this.injectTranscriptHistoryContext();
       });
       dc.addEventListener("close", () => {
         this.callbacks.onConnectionChange(false, "Realtime data channel closed.");
@@ -263,6 +266,23 @@ export class RealtimeVoiceClient {
         ],
       },
     });
+  }
+
+  private async injectTranscriptHistoryContext(): Promise<void> {
+    if (!this.callbacks.getTranscriptMessages || !this.connected) return;
+    try {
+      const context = transcriptHistoryContext(await this.callbacks.getTranscriptMessages());
+      if (!context || !this.connected) return;
+      this.sendConversationText(context.text);
+      this.log("transcriptHistoryContext", `Injected ${context.count} prior transcript messages.`, {
+        count: context.count,
+      });
+    } catch (error) {
+      this.log(
+        "transcriptHistoryContextFailed",
+        error instanceof Error ? error.message : "Unable to inject transcript history.",
+      );
+    }
   }
 
   private handleMessage(event: MessageEvent<string>): void {
@@ -1143,6 +1163,44 @@ function codexCompletionSpeechInstructions(event: AppEvent): string {
     "Use one short natural sentence.",
     "Do not call tools.",
   ].join("\n");
+}
+
+function transcriptHistoryContext(
+  messages: VoiceTranscriptMessage[],
+): { text: string; count: number } | null {
+  const recent = messages
+    .filter((message) => message.status === "completed" && message.text.trim())
+    .slice(-32);
+  if (recent.length === 0) return null;
+
+  let remainingChars = 10_000;
+  const lines: string[] = [];
+  for (const message of recent) {
+    const label = message.role === "user" ? "User" : "Voice assistant";
+    const text = truncateTranscriptContextLine(message.text.trim(), Math.min(1_200, remainingChars));
+    if (!text) continue;
+    lines.push(`${label}: ${text}`);
+    remainingChars -= text.length;
+    if (remainingChars <= 0) break;
+  }
+  if (lines.length === 0) return null;
+
+  return {
+    count: lines.length,
+    text: [
+      "App-provided prior voice transcript, not a new user request.",
+      "Use this only as conversational memory if the user refers back to earlier speech.",
+      "Do not summarize it aloud unless asked, and do not call tools because of this context.",
+      lines.join("\n"),
+    ].join("\n\n"),
+  };
+}
+
+function truncateTranscriptContextLine(value: string, maxLength: number): string {
+  if (maxLength <= 0) return "";
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
 function codexTurnOutputContextText(output: CodexTurnOutput): string {

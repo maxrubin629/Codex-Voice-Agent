@@ -155,6 +155,9 @@ function recordEvent(event: AppEvent): void {
 
 function publishEvent(event: AppEvent): void {
   recordEvent(event);
+  void orchestrator?.recordTranscriptEvent(event).catch(() => {
+    // Transcript persistence should never break live event delivery.
+  });
   broadcastToAppWindows("app:event", event);
 }
 
@@ -349,6 +352,10 @@ function registerIpc(): void {
   registerIpcHandler(
     "rightPanel:getActiveThreadSummary",
     (_event, payload?: { chatId?: string }) => requireOrchestrator().getActiveThreadSummary(payload?.chatId),
+  );
+  registerIpcHandler(
+    "rightPanel:getTranscriptMessages",
+    (_event, payload?: { chatId?: string }) => requireOrchestrator().getTranscriptMessages(payload?.chatId),
   );
   registerIpcHandler(
     "rightPanel:getGitChangeSummary",

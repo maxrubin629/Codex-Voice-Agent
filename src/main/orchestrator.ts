@@ -36,6 +36,7 @@ import type {
   VoiceExecCommandResult,
   VoiceWriteStdinArgs,
   VoiceProject,
+  VoiceTranscriptMessage,
 } from "../shared/types";
 import {
   CODEX_PERMISSION_PROFILES,
@@ -45,6 +46,7 @@ import {
   DEFAULT_CODEX_SERVICE_TIER,
   FAST_CODEX_SERVICE_TIER,
 } from "../shared/types";
+import { transcriptMessageFromEvent } from "../shared/transcriptMessages";
 import { CodexBridge, type CodexJsonMessage } from "./codexBridge";
 import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
 import { ProjectStore } from "./projectStore";
@@ -828,6 +830,24 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         errorMessage: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  async getTranscriptMessages(chatId?: string): Promise<VoiceTranscriptMessage[]> {
+    const project = chatId ? await this.requireProjectForChat(chatId) : await this.getActiveProject();
+    const chat = project
+      ? chatId
+        ? project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt) ?? null
+        : activeChatForProject(project)
+      : null;
+    if (!project || !chat) return [];
+    return this.store.listTranscriptMessages(project.id, chat.id);
+  }
+
+  async recordTranscriptEvent(event: AppEvent): Promise<void> {
+    const message = transcriptMessageFromEvent(event);
+    if (!message) return;
+    const project = await this.requireProjectForChat(message.chatId);
+    await this.store.upsertTranscriptMessage(project.id, message.chatId, message);
   }
 
   async setCodexSettings(

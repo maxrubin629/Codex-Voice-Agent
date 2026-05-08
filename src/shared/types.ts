@@ -485,6 +485,26 @@ export type AppEvent = {
   raw?: unknown;
 };
 
+export type VoiceTranscriptMessageSource = "realtime" | "codex" | "app";
+export type VoiceTranscriptMessageRole = "user" | "assistant";
+export type VoiceTranscriptMessageStatus = "completed" | "streaming" | "interrupted" | "error";
+
+export type VoiceTranscriptMessage = {
+  id: string;
+  chatId: string;
+  threadId: string | null;
+  source: VoiceTranscriptMessageSource;
+  role: VoiceTranscriptMessageRole;
+  text: string;
+  createdAt: string;
+  completedAt: string | null;
+  status: VoiceTranscriptMessageStatus;
+  turnId?: string;
+  responseId?: string;
+  itemId?: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type WindowChromeState = {
   isFullScreen: boolean;
 };
@@ -567,6 +587,7 @@ export type CodexVoiceApi = {
   answerApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
   getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary>;
+  getTranscriptMessages(chatId?: string): Promise<VoiceTranscriptMessage[]>;
   getGitChangeSummary(workspacePath?: string | null): Promise<GitChangeSummary>;
   previewRightPanelTarget(target: RightPanelPreviewRequest): Promise<RightPanelPreviewResult>;
   openRightPanelTarget(target: RightPanelOpenTarget): Promise<void>;

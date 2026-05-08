@@ -11,6 +11,7 @@ import type {
   ThreadSourceCandidate,
   ToolQuestionAnswer,
   VoiceChat,
+  VoiceTranscriptMessage,
 } from "../../shared/types";
 import { VoiceTranscriptContent } from "./voiceTranscript";
 
@@ -98,6 +99,11 @@ export function RightPanel({
     data: null,
     error: null,
   });
+  const [transcriptState, setTranscriptState] = useState<RemoteState<VoiceTranscriptMessage[]>>({
+    status: "idle",
+    data: null,
+    error: null,
+  });
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
   const activeProject = state.activeProject;
   const activeChat = useMemo(() => activeChatForState(state), [state]);
@@ -141,6 +147,11 @@ export function RightPanel({
 
   useEffect(() => {
     if (!open) return;
+    void refreshTranscriptMessages();
+  }, [activeChat?.id, open]);
+
+  useEffect(() => {
+    if (!open) return;
     void refreshSummary();
   }, [
     open,
@@ -173,6 +184,28 @@ export function RightPanel({
       setGitState({ status: "ready", data, error: null });
     } catch (caught) {
       setGitState({ status: "error", data: null, error: errorMessage(caught) });
+    }
+  }
+
+  async function refreshTranscriptMessages(): Promise<void> {
+    if (!activeChat?.id) {
+      setTranscriptState({ status: "ready", data: [], error: null });
+      return;
+    }
+    setTranscriptState((current) =>
+      current.status === "ready"
+        ? { status: "ready", data: current.data, error: null }
+        : { status: "loading", data: current.data, error: null },
+    );
+    try {
+      const messages = await window.codexVoice.getTranscriptMessages(activeChat.id);
+      setTranscriptState({ status: "ready", data: messages, error: null });
+    } catch (error) {
+      setTranscriptState({
+        status: "error",
+        data: transcriptState.data,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -417,6 +450,7 @@ export function RightPanel({
               events={events}
               activeChat={activeChat}
               summaryState={summaryState}
+              transcriptMessages={transcriptState.data ?? []}
               gitState={gitState}
               workspacePath={workspacePath}
               onAction={onAction}
@@ -439,6 +473,7 @@ function RightPanelTabContent({
   events,
   activeChat,
   summaryState,
+  transcriptMessages,
   gitState,
   workspacePath,
   onAction,
@@ -453,6 +488,7 @@ function RightPanelTabContent({
   events: AppEvent[];
   activeChat: VoiceChat | null;
   summaryState: RemoteState<ActiveThreadSummary>;
+  transcriptMessages: VoiceTranscriptMessage[];
   gitState: RemoteState<GitChangeSummary>;
   workspacePath: string | null;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
@@ -480,7 +516,13 @@ function RightPanelTabContent({
   if (tab.id === "transcript") {
     return (
       <div className="voice-right-transcript-tab">
-        <VoiceTranscriptContent open state={state} events={events} summary={summaryState.data} />
+        <VoiceTranscriptContent
+          open
+          state={state}
+          events={events}
+          summary={summaryState.data}
+          messages={transcriptMessages}
+        />
       </div>
     );
   }

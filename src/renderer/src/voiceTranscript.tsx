@@ -8,7 +8,9 @@ import type {
   ThreadSummaryItem,
   ThreadSummaryTurn,
   VoiceChat,
+  VoiceTranscriptMessage,
 } from "../../shared/types";
+import { transcriptMessageIdFromEvent } from "../../shared/transcriptMessages";
 
 type MessageTone = "user" | "assistant";
 type ActivityIcon = "terminal" | "edit" | "search" | "list" | "globe" | "tool" | "check" | "alert" | "branch" | "spark";
@@ -143,16 +145,21 @@ export function VoiceTranscriptContent({
   state,
   events,
   summary,
+  messages = [],
   className,
 }: {
   open?: boolean;
   state: AppState;
   events: AppEvent[];
   summary?: ActiveThreadSummary | null;
+  messages?: VoiceTranscriptMessage[];
   className?: string;
 }): React.ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const entries = useMemo(() => buildTranscriptEntries(events, state, summary ?? null), [events, state, summary]);
+  const entries = useMemo(
+    () => buildTranscriptEntries(events, state, summary ?? null, messages),
+    [events, messages, state, summary],
+  );
   const latestEntryId = entries.length > 0 ? entries[entries.length - 1].id : "";
 
   useEffect(() => {
@@ -442,6 +449,7 @@ function buildTranscriptEntries(
   events: AppEvent[],
   state: AppState,
   summary: ActiveThreadSummary | null,
+  messages: VoiceTranscriptMessage[] = [],
 ): TranscriptEntry[] {
   const activeChat = activeChatFromState(state);
   const activeChatId = state.runtime.activeChatId ?? activeChat?.id ?? null;
@@ -449,6 +457,7 @@ function buildTranscriptEntries(
   const chronologicalEvents = [...events].reverse();
   const completedRealtimeStreams = new Set<string>();
   const realtimeStreamingEntryIndexes = new Map<string, number>();
+  const storedTranscriptMessageIds = new Set<string>();
   const seenPendingRequestIds = new Set<string>();
   const turns = new Map<string, TurnDraft>();
   const timeline: TimelineItem[] = [];
@@ -485,6 +494,7 @@ function buildTranscriptEntries(
   };
 
   hydrateThreadSummary(summary, activeChatId, activeThreadId, ensureTurn);
+  hydrateTranscriptMessages(messages, activeChatId, activeThreadId, storedTranscriptMessageIds, pushEntry);
 
   for (const event of chronologicalEvents) {
     const raw = recordFromUnknown(event.raw);
@@ -603,6 +613,8 @@ function buildTranscriptEntries(
     }
 
     const entry = looseEntryFromEvent(event);
+    const transcriptMessageId = transcriptMessageIdFromEvent(event);
+    if (transcriptMessageId && storedTranscriptMessageIds.has(transcriptMessageId)) continue;
     if (entry) pushEntry(entry);
   }
 
@@ -661,6 +673,37 @@ function hydrateThreadSummary(
       turn.assistantFinal = summaryTurn.assistantText.trim();
     }
   }
+}
+
+function hydrateTranscriptMessages(
+  messages: VoiceTranscriptMessage[],
+  activeChatId: string | null,
+  activeThreadId: string | null,
+  seenMessageIds: Set<string>,
+  pushEntry: (entry: TranscriptEntry) => void,
+): void {
+  const sortedMessages = [...messages].sort(compareStoredTranscriptMessages);
+  for (const message of sortedMessages) {
+    if (activeChatId && message.chatId !== activeChatId) continue;
+    if (message.threadId && activeThreadId && message.threadId !== activeThreadId) continue;
+    const body = message.text.trim();
+    if (!body) continue;
+    seenMessageIds.add(message.id);
+    pushEntry({
+      kind: "message",
+      id: `stored-${message.id}`,
+      tone: message.role,
+      body,
+      streaming: message.status === "streaming",
+    });
+  }
+}
+
+function compareStoredTranscriptMessages(left: VoiceTranscriptMessage, right: VoiceTranscriptMessage): number {
+  const leftTime = dateMs(left.createdAt) ?? 0;
+  const rightTime = dateMs(right.createdAt) ?? 0;
+  if (leftTime !== rightTime) return leftTime - rightTime;
+  return left.id.localeCompare(right.id);
 }
 
 function hydrateSummaryItems(turn: TurnDraft, summaryTurn: ThreadSummaryTurn): void {

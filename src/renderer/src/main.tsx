@@ -197,13 +197,7 @@ function eventWithActiveContext(event: AppEvent, state: AppState): AppEvent {
   if (event.source !== "realtime") return event;
   const project = state.activeProject;
   if (!project) return event;
-  const chats = project.chats.filter((chat) => !chat.archivedAt);
-  const chat =
-    chats.find((candidate) => candidate.id === state.runtime.activeChatId) ??
-    chats.find((candidate) => candidate.id === project.activeChatId) ??
-    chats.find((candidate) => candidate.codexThreadId === project.codexThreadId) ??
-    chats[0] ??
-    null;
+  const chat = activeVoiceChatForState(state);
   if (!chat) return event;
   const raw = event.raw && typeof event.raw === "object" && !Array.isArray(event.raw) ? event.raw : {};
   return {
@@ -215,6 +209,24 @@ function eventWithActiveContext(event: AppEvent, state: AppState): AppEvent {
       threadId: chat.codexThreadId,
     },
   };
+}
+
+function activeVoiceChatForState(state: AppState): VoiceChat | null {
+  const project = state.activeProject;
+  if (!project) return null;
+  const chats = project.chats.filter((chat) => !chat.archivedAt);
+  return (
+    chats.find((candidate) => candidate.id === state.runtime.activeChatId) ??
+    chats.find((candidate) => candidate.id === project.activeChatId) ??
+    chats.find((candidate) => candidate.codexThreadId === project.codexThreadId) ??
+    chats[0] ??
+    null
+  );
+}
+
+async function activeTranscriptMessages(state: AppState) {
+  const chat = activeVoiceChatForState(state);
+  return chat ? window.codexVoice.getTranscriptMessages(chat.id) : [];
 }
 
 function isVoiceOrbPresetId(value: string | null): value is VoiceOrbPresetId {
@@ -462,6 +474,7 @@ function App(): React.ReactElement {
           void window.codexVoice.logEvent(eventWithActiveContext(event, stateRef.current));
         },
         onOutputLevel: updateVoiceOutputLevel,
+        getTranscriptMessages: () => activeTranscriptMessages(stateRef.current),
       });
       voiceRef.current = client;
       try {
