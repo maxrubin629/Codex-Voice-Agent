@@ -10,6 +10,7 @@ import {
   previewRightPanelTarget,
   readGitChangeSummary,
 } from "./rightPanelData";
+import { appendBufferedEvent } from "../shared/eventBuffer";
 import type {
   ApprovalDecision,
   AppEvent,
@@ -27,7 +28,6 @@ import type {
   WindowChromeState,
 } from "../shared/types";
 
-const maxBufferedEvents = 250;
 const appName = "Codex Voice";
 
 let voiceWindow: BrowserWindow | null = null;
@@ -150,7 +150,7 @@ function publishWindowChromeState(window: BrowserWindow): void {
 }
 
 function recordEvent(event: AppEvent): void {
-  bufferedEvents = [event, ...bufferedEvents].slice(0, maxBufferedEvents);
+  bufferedEvents = appendBufferedEvent(bufferedEvents, event);
 }
 
 function publishEvent(event: AppEvent): void {

@@ -30,6 +30,7 @@ import {
   type VoiceProject,
   type WindowChromeState,
 } from "../../shared/types";
+import { appendBufferedEvent } from "../../shared/eventBuffer";
 import { RealtimeVoiceClient } from "./realtimeClient";
 import { RightPanel } from "./rightPanel";
 import "./styles.css";
@@ -192,6 +193,30 @@ function appWindowKind(): AppWindowKind {
   return kind === "debug" ? "debug" : "voice";
 }
 
+function eventWithActiveContext(event: AppEvent, state: AppState): AppEvent {
+  if (event.source !== "realtime") return event;
+  const project = state.activeProject;
+  if (!project) return event;
+  const chats = project.chats.filter((chat) => !chat.archivedAt);
+  const chat =
+    chats.find((candidate) => candidate.id === state.runtime.activeChatId) ??
+    chats.find((candidate) => candidate.id === project.activeChatId) ??
+    chats.find((candidate) => candidate.codexThreadId === project.codexThreadId) ??
+    chats[0] ??
+    null;
+  if (!chat) return event;
+  const raw = event.raw && typeof event.raw === "object" && !Array.isArray(event.raw) ? event.raw : {};
+  return {
+    ...event,
+    raw: {
+      ...raw,
+      projectId: project.id,
+      chatId: chat.id,
+      threadId: chat.codexThreadId,
+    },
+  };
+}
+
 function isVoiceOrbPresetId(value: string | null): value is VoiceOrbPresetId {
   return voiceOrbPresets.some((preset) => preset.id === value);
 }
@@ -317,8 +342,13 @@ function App(): React.ReactElement {
   const [onboardingRequestId, setOnboardingRequestId] = useState(0);
   const [windowChromeState, setWindowChromeState] = useState<WindowChromeState>({ isFullScreen: false });
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
+  const stateRef = useRef<AppState>(emptyState);
   const outputLevelUpdateRef = useRef(0);
   const outputLevelValueRef = useRef(0);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   useEffect(() => {
     if (!error) return undefined;
@@ -335,11 +365,12 @@ function App(): React.ReactElement {
     });
     const offWindowChromeState = window.codexVoice.onWindowChromeState(setWindowChromeState);
     const offState = window.codexVoice.onAppState((nextState) => {
+      stateRef.current = nextState;
       setState(nextState);
       setStateLoaded(true);
     });
     const offEvent = window.codexVoice.onAppEvent((event) => {
-      setEvents((current) => [event, ...current].slice(0, 250));
+      setEvents((current) => appendBufferedEvent(current, event));
       if (event.source === "app" && event.kind === "debug/startOnboarding") {
         setOnboardingRequestId((current) => current + 1);
       } else if (event.source === "codex" && event.kind === "serverRequest") {
@@ -428,7 +459,7 @@ function App(): React.ReactElement {
           setVoiceStatus(label);
         },
         onLog: (event) => {
-          void window.codexVoice.logEvent(event);
+          void window.codexVoice.logEvent(eventWithActiveContext(event, stateRef.current));
         },
         onOutputLevel: updateVoiceOutputLevel,
       });
