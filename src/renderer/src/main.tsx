@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   CODEX_PERMISSION_PROFILES,
@@ -24,6 +24,7 @@ import {
   type ReasoningEffort,
   type RealtimeModelId,
   type RealtimeReasoningEffort,
+  type RealtimeUserInput,
   type RealtimeVoiceId,
   type ToolQuestionAnswer,
   type VoiceChat,
@@ -32,7 +33,12 @@ import {
 } from "../../shared/types";
 import { appendBufferedEvent } from "../../shared/eventBuffer";
 import { RealtimeVoiceClient } from "./realtimeClient";
-import { RightPanel } from "./rightPanel";
+import { RightPanel, type RightPanelThreadOpenRequest } from "./rightPanel";
+import {
+  deriveRightPanelOpenIntents,
+  rightPanelIntentEventKey,
+  type RightPanelOpenIntent,
+} from "./rightPanelOpenIntents";
 import "./styles.css";
 
 const emptyState: AppState = {
@@ -50,6 +56,7 @@ const emptyState: AppState = {
     tokenUsage: null,
     pendingRequests: [],
     chats: [],
+    projectThreads: [],
     showProjectChats: false,
   },
   codexSettings: {
@@ -80,6 +87,13 @@ const emptyState: AppState = {
     apiKeySource: null,
     apiKeyEncrypted: false,
   },
+  webSearch: {
+    available: false,
+    provider: "exa",
+    reason: null,
+    apiKeySource: null,
+    apiKeyEncrypted: false,
+  },
 };
 
 type AppWindowKind = "voice" | "debug";
@@ -87,7 +101,7 @@ type ApiKeyDialogMode = "onboarding" | "settings";
 type OnboardingStep = "key" | "voice" | "orb" | "project";
 type PaneSide = "settings" | "future";
 type VoiceTone = "off" | "listening" | "working" | "connecting" | "paused" | "waiting";
-type VoiceSettingsTab = "general" | "appearance" | "configuration" | "archive";
+type VoiceSettingsTab = "projects" | "general" | "appearance" | "configuration";
 type VoiceOrbPresetId = "aurora" | "cloud" | "nocturne";
 
 type VoiceOrbPreset = {
@@ -112,9 +126,13 @@ const voiceOrbCustomizationStorageKey = "codexVoice.orbCustomization";
 const voiceOnboardingSeenStorageKey = "codexVoice.onboardingSeen";
 const dualPaneLayoutMediaQuery = "(min-width: 1420px)";
 const paneReplacementDelayMs = 120;
-const minPaneWidth = 320;
+const minPaneWidth = 260;
+const paneDragCloseThreshold = 228;
 const maxPaneWidth = 720;
 const defaultPaneWidth = 420;
+const titleCollisionGapPx = 14;
+const macTrafficLightSafeWidthPx = 96;
+const secretRevealTimeoutMs = 60_000;
 const defaultVoiceOrbCustomization: VoiceOrbCustomization = {
   accentColor: "#1d9bf0",
   glow: 52,
@@ -164,29 +182,6 @@ const iconCloudSourceBounds = {
 };
 const iconCloudRotationRadians = (-12 * Math.PI) / 180;
 let iconCloudPath: Path2D | null = null;
-
-type ContextMenuTarget =
-  | {
-      kind: "project";
-      projectId: string;
-      label: string;
-      x: number;
-      y: number;
-    }
-  | {
-      kind: "chat";
-      projectId: string;
-      chatId: string;
-      label: string;
-      x: number;
-      y: number;
-    };
-
-type ArchivedChat = {
-  projectId: string;
-  projectName: string;
-  chat: VoiceChat;
-};
 
 type VoiceEventContext = {
   projectId: string;
@@ -250,15 +245,21 @@ function shouldAutoOpenTranscriptForEvent(event: AppEvent): boolean {
   const rawType = stringFromUnknown(raw?.type);
   return [
     "userSpeechStarted",
+    "userSpeechStopped",
     "userTranscriptDelta",
     "userTranscript",
+    "userTranscriptFailed",
     "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
     "conversation.item.input_audio_transcription.delta",
     "conversation.item.input_audio_transcription.completed",
+    "conversation.item.input_audio_transcription.failed",
   ].includes(event.kind) || [
     "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
     "conversation.item.input_audio_transcription.delta",
     "conversation.item.input_audio_transcription.completed",
+    "conversation.item.input_audio_transcription.failed",
   ].includes(rawType ?? "");
 }
 
@@ -400,6 +401,39 @@ function voiceOrbPresetAtOffset(presetId: VoiceOrbPresetId, offset: number): Voi
   return voiceOrbPresets[nextIndex].id;
 }
 
+function waitForRealtimeClientOpen(client: RealtimeVoiceClient, timeoutMs = 10000): Promise<void> {
+  if (client.connected) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let pollTimeoutId: number | null = null;
+    const deadlineTimeoutId = window.setTimeout(() => {
+      settle(() => reject(new Error("Realtime data channel did not open.")));
+    }, timeoutMs);
+
+    function cleanup(): void {
+      window.clearTimeout(deadlineTimeoutId);
+      if (pollTimeoutId !== null) window.clearTimeout(pollTimeoutId);
+    }
+
+    function settle(callback: () => void): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    }
+
+    function poll(): void {
+      if (client.connected) {
+        settle(resolve);
+        return;
+      }
+      pollTimeoutId = window.setTimeout(poll, 50);
+    }
+
+    poll();
+  });
+}
+
 function App(): React.ReactElement {
   const [windowKind] = useState<AppWindowKind>(() => appWindowKind());
   const [state, setState] = useState<AppState>(emptyState);
@@ -418,6 +452,8 @@ function App(): React.ReactElement {
   const [onboardingRequestId, setOnboardingRequestId] = useState(0);
   const [windowChromeState, setWindowChromeState] = useState<WindowChromeState>({ isFullScreen: false });
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
+  const voiceConnectPromiseRef = useRef<Promise<RealtimeVoiceClient> | null>(null);
+  const voiceLifecycleIdRef = useRef(0);
   const stateRef = useRef<AppState>(emptyState);
   const outputLevelUpdateRef = useRef(0);
   const outputLevelValueRef = useRef(0);
@@ -489,7 +525,7 @@ function App(): React.ReactElement {
       await action();
       await refreshState();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(friendlyActionError(caught).message);
     }
   }
 
@@ -510,9 +546,38 @@ function App(): React.ReactElement {
     setVoiceOutputLevel(0);
   }
 
+  function isCurrentVoiceClient(client: RealtimeVoiceClient, lifecycleId: number): boolean {
+    return voiceLifecycleIdRef.current === lifecycleId && voiceRef.current === client;
+  }
+
+  function applyVoiceConnectionChange(
+    client: RealtimeVoiceClient,
+    lifecycleId: number,
+    connected: boolean,
+    label: string,
+  ): void {
+    if (!isCurrentVoiceClient(client, lifecycleId)) return;
+    const connecting = !connected && label === "Creating Realtime session.";
+    setVoiceConnected(connected);
+    setVoiceConnecting(connecting);
+    setVoiceStatus(label);
+    if (connected) {
+      setRealtimeIssue(null);
+      setVoicePaused(false);
+      return;
+    }
+    if (!connecting) {
+      setVoicePaused(false);
+      clearVoiceOutputLevel();
+    }
+  }
+
   function disconnectVoice(): void {
-    voiceRef.current?.disconnect();
+    voiceLifecycleIdRef.current += 1;
+    const client = voiceRef.current;
     voiceRef.current = null;
+    voiceConnectPromiseRef.current = null;
+    client?.disconnect();
     setVoiceConnected(false);
     setVoiceConnecting(false);
     setVoicePaused(false);
@@ -520,20 +585,33 @@ function App(): React.ReactElement {
     setVoiceStatus("Realtime disconnected.");
   }
 
-  async function connectVoice(): Promise<void> {
-    if (voiceConnecting) return;
-    await runAction(async () => {
+  async function connectVoice(): Promise<RealtimeVoiceClient> {
+    const existingClient = voiceRef.current;
+    if (existingClient?.connected) return existingClient;
+    if (voiceConnectPromiseRef.current) return voiceConnectPromiseRef.current;
+
+    const realtime = stateRef.current.realtime;
+    if (!realtime.available) {
+      const issue = realtime.reason ?? "No OpenAI API key is configured.";
+      setRealtimeIssue(issue);
+      setError(issue);
+      throw new Error(issue);
+    }
+
+    const lifecycleId = voiceLifecycleIdRef.current + 1;
+    voiceLifecycleIdRef.current = lifecycleId;
+
+    const connectionPromise = (async () => {
+      setError(null);
+      setRealtimeIssue(null);
+      setVoiceConnected(false);
+      setVoicePaused(false);
+      clearVoiceOutputLevel();
       setVoiceConnecting(true);
       const voiceEventContext = activeVoiceEventContext(stateRef.current);
       const client = new RealtimeVoiceClient({
         onConnectionChange: (connected, label) => {
-          setVoiceConnected(connected);
-          if (connected) setRealtimeIssue(null);
-          setVoiceConnecting(!connected && label !== "Realtime data channel closed.");
-          if (connected || label === "Realtime data channel closed." || label === "Realtime disconnected.") {
-            setVoicePaused(false);
-          }
-          setVoiceStatus(label);
+          applyVoiceConnectionChange(client, lifecycleId, connected, label);
         },
         onLog: (event) => {
           void window.codexVoice.logEvent(eventWithVoiceContext(event, voiceEventContext));
@@ -547,30 +625,74 @@ function App(): React.ReactElement {
       voiceRef.current = client;
       try {
         await client.connect();
+        if (!isCurrentVoiceClient(client, lifecycleId)) {
+          throw new Error("Realtime connection was cancelled.");
+        }
+        await waitForRealtimeClientOpen(client);
+        if (!isCurrentVoiceClient(client, lifecycleId)) {
+          throw new Error("Realtime connection was cancelled.");
+        }
+        return client;
       } catch (caught) {
-        if (voiceRef.current === client) voiceRef.current = null;
-        setVoicePaused(false);
-        clearVoiceOutputLevel();
-        setRealtimeIssue(caught instanceof Error ? caught.message : String(caught));
-        throw caught;
+        if (isCurrentVoiceClient(client, lifecycleId)) {
+          voiceRef.current = null;
+          client.disconnect();
+          setVoiceConnected(false);
+          setVoiceConnecting(false);
+          setVoiceStatus("Realtime disconnected.");
+          setVoicePaused(false);
+          clearVoiceOutputLevel();
+          const error = friendlyActionError(caught);
+          setError(error.message);
+          setRealtimeIssue(error.message);
+        }
+        throw friendlyActionError(caught);
       } finally {
-        setVoiceConnecting(false);
+        if (voiceLifecycleIdRef.current === lifecycleId) {
+          setVoiceConnecting(false);
+        }
       }
-    });
+    })();
+
+    voiceConnectPromiseRef.current = connectionPromise;
+    try {
+      return await connectionPromise;
+    } finally {
+      if (voiceConnectPromiseRef.current === connectionPromise) {
+        voiceConnectPromiseRef.current = null;
+      }
+    }
   }
 
   async function toggleVoice(): Promise<void> {
+    if (voiceConnectPromiseRef.current) return;
     if (voiceRef.current?.connected || voiceConnected) {
       disconnectVoice();
       return;
     }
-    await connectVoice();
+    try {
+      await connectVoice();
+    } catch {
+      // connectVoice already surfaces the issue in the UI.
+    }
   }
 
   async function restartVoice(): Promise<void> {
     if (!voiceRef.current?.connected && !voiceConnected) return;
     disconnectVoice();
-    await connectVoice();
+    try {
+      await connectVoice();
+    } catch {
+      // connectVoice already surfaces the issue in the UI.
+    }
+  }
+
+  async function sendRealtimeUserInput(input: RealtimeUserInput): Promise<void> {
+    const client = voiceRef.current?.connected ? voiceRef.current : await connectVoice();
+    if (!client?.connected) {
+      throw new Error("Realtime is not connected.");
+    }
+    client.sendUserInput(input);
   }
 
   async function handleOrbAction(): Promise<void> {
@@ -636,6 +758,7 @@ function App(): React.ReactElement {
       onShowDebug={openDebugWindow}
       onToggleVoice={toggleVoice}
       onRestartVoice={restartVoice}
+      onSendRealtimeInput={sendRealtimeUserInput}
       onClearRealtimeIssue={() => setRealtimeIssue(null)}
     />
   );
@@ -660,6 +783,7 @@ function VoiceHome({
   onShowDebug,
   onToggleVoice,
   onRestartVoice,
+  onSendRealtimeInput,
   onClearRealtimeIssue,
 }: {
   state: AppState;
@@ -680,53 +804,47 @@ function VoiceHome({
   onShowDebug: () => Promise<void>;
   onToggleVoice: () => Promise<void>;
   onRestartVoice: () => Promise<void>;
+  onSendRealtimeInput: (input: RealtimeUserInput) => Promise<void>;
   onClearRealtimeIssue: () => void;
 }): React.ReactElement {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [futureOpen, setFutureOpen] = useState(false);
   const [transcriptActivationRequest, setTranscriptActivationRequest] = useState(0);
+  const [threadOpenRequest, setThreadOpenRequest] = useState<RightPanelThreadOpenRequest | null>(null);
+  const [rightPanelOpenIntent, setRightPanelOpenIntent] = useState<RightPanelOpenIntent | null>(null);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
   const [leftPaneWidth, setLeftPaneWidth] = useState(() => loadPaneWidth(leftPanelWidthStorageKey));
   const [rightPanelWidth, setRightPanelWidth] = useState(() => loadPaneWidth(rightPanelWidthStorageKey));
   const [resizingPane, setResizingPane] = useState<PaneSide | null>(null);
   const [newOpen, setNewOpen] = useState(false);
-  const [newChatOpen, setNewChatOpen] = useState(false);
-  const [switchChatOpen, setSwitchChatOpen] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
-  const [archivedOpen, setArchivedOpen] = useState(false);
-  const [chatsOpen, setChatsOpen] = useState(false);
   const [permissionsOpen, setPermissionsOpen] = useState(false);
   const [orbPresetId, setOrbPresetId] = useState<VoiceOrbPresetId>(() => loadVoiceOrbPresetId());
   const [orbCustomization, setOrbCustomization] = useState<VoiceOrbCustomization>(() => loadVoiceOrbCustomization());
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingSeen, setOnboardingSeen] = useState(() => loadVoiceOnboardingSeen());
   const [apiKeyDialogMode, setApiKeyDialogMode] = useState<ApiKeyDialogMode | null>(null);
-  const [contextMenu, setContextMenu] = useState<ContextMenuTarget | null>(null);
   const [apiKey, setApiKey] = useState("");
+  const [exaApiKey, setExaApiKey] = useState("");
   const [newName, setNewName] = useState("");
-  const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
   const paneTogglePointerActivationRef = useRef<PaneSide | null>(null);
   const lastAutoTranscriptEventRef = useRef<string | null>(null);
+  const lastRightPanelOpenIntentEventRef = useRef<string | null>(null);
   const transcriptAutoActivatedRef = useRef(false);
   const paneReplacementTimeoutRef = useRef<number | null>(null);
   const paneResizeFrameRef = useRef<number | null>(null);
   const pendingPaneResizeRef = useRef<{ pane: PaneSide; width: number } | null>(null);
   const paneResizeCleanupRef = useRef<(() => void) | null>(null);
+  const voiceHomeContentRef = useRef<HTMLDivElement | null>(null);
   const lastOpenedPaneRef = useRef<PaneSide>("settings");
   const projects = state.projects;
-  const archivedProjects = state.archivedProjects;
   const activeProject = state.activeProject;
   const activeProjectId = state.runtime.activeProjectId;
-  const showProjectChats = state.runtime.showProjectChats;
-  const featuredProject = activeProject ?? projects[0] ?? null;
   const projectChats = useMemo(
     () => chatSummariesForProject(activeProject, state),
     [activeProject, state],
   );
-  const archivedChats = useMemo(() => archivedChatsForProjects(projects), [projects]);
-  const archivedCount = archivedProjects.length + archivedChats.length;
-  const recentProjects = projects.slice(0, 3);
   const modelScope = activeProject ? "chat" : "nextTurn";
   const effectiveModel =
     state.codexSettings.nextTurnModel ??
@@ -754,7 +872,7 @@ function VoiceHome({
   const primaryPendingRequest = pendingRequests[0] ?? null;
   const filteredProjects = projects.filter((project) => {
     const haystack = [
-      project.displayName,
+      projectDisplayName(project),
       project.folderPath,
       project.workspacePath,
       project.lastStatus ?? "",
@@ -811,6 +929,22 @@ function VoiceHome({
   }, [canShowBothPanes, events, futureOpen, state]);
 
   useEffect(() => {
+    const latestEvent = events[0];
+    if (!latestEvent) return;
+    const eventKey = rightPanelIntentEventKey(latestEvent);
+    if (lastRightPanelOpenIntentEventRef.current === eventKey) return;
+
+    const [intent] = deriveRightPanelOpenIntents({ event: latestEvent, state, summary: null });
+    if (!intent) return;
+
+    lastRightPanelOpenIntentEventRef.current = eventKey;
+    setRightPanelOpenIntent(intent);
+    if (intent.priority === "foreground") {
+      openFuturePaneForIntent();
+    }
+  }, [canShowBothPanes, events, futureOpen, settingsOpen, state]);
+
+  useEffect(() => {
     if (!voiceConnected) {
       transcriptAutoActivatedRef.current = false;
       lastAutoTranscriptEventRef.current = null;
@@ -840,14 +974,6 @@ function VoiceHome({
   }, [canShowBothPanes, futureOpen, settingsOpen]);
 
   useEffect(() => {
-    setChatsOpen(false);
-  }, [activeProject?.id]);
-
-  useEffect(() => {
-    setChatsOpen(showProjectChats);
-  }, [showProjectChats]);
-
-  useEffect(() => {
     if (stateLoaded && projects.length > 0 && !onboardingSeen) {
       saveVoiceOnboardingSeen(true);
       setOnboardingSeen(true);
@@ -874,23 +1000,64 @@ function VoiceHome({
     setApiKey("");
   }, [apiKeyDialogMode, onboardingOpen, settingsOpen]);
 
-  useEffect(() => {
-    if (!contextMenu) return undefined;
-    const close = () => setContextMenu(null);
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
+  useLayoutEffect(() => {
+    const content = voiceHomeContentRef.current;
+    if (!content) return undefined;
+
+    const root = content.closest(".voice-home");
+    const shell = root?.querySelector(".voice-shell");
+    let animationFrame = 0;
+    let transitionTimer = 0;
+
+    const updateTitleSafeWidth = () => {
+      const bounds = content.getBoundingClientRect();
+      const centerX = bounds.left + bounds.width / 2;
+      const leftToggle = root?.querySelector(".voice-pane-toggle.left")?.getBoundingClientRect();
+      const rightToggle = root?.querySelector(".voice-pane-toggle.right")?.getBoundingClientRect();
+      const leftSafeEdge = Math.max(
+        windowChromeState.isFullScreen ? 0 : macTrafficLightSafeWidthPx,
+        leftToggle?.right ?? 0,
+      ) + titleCollisionGapPx;
+      const rightSafeEdge = Math.min(
+        window.innerWidth - titleCollisionGapPx,
+        (rightToggle?.left ?? window.innerWidth) - titleCollisionGapPx,
+      );
+      const availableWidth = Math.max(
+        0,
+        Math.floor(Math.min(bounds.width, (centerX - leftSafeEdge) * 2, (rightSafeEdge - centerX) * 2)),
+      );
+      content.style.setProperty("--voice-title-safe-max", `${availableWidth}px`);
     };
-    window.addEventListener("click", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("scroll", close, true);
-    window.addEventListener("keydown", closeOnEscape);
+
+    const scheduleTitleSafeWidthUpdate = () => {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      animationFrame = window.requestAnimationFrame(updateTitleSafeWidth);
+    };
+
+    const resizeObserver = new ResizeObserver(scheduleTitleSafeWidthUpdate);
+    resizeObserver.observe(content);
+    if (shell) resizeObserver.observe(shell);
+    window.addEventListener("resize", scheduleTitleSafeWidthUpdate);
+    shell?.addEventListener("transitionend", scheduleTitleSafeWidthUpdate);
+    updateTitleSafeWidth();
+    scheduleTitleSafeWidthUpdate();
+    transitionTimer = window.setTimeout(updateTitleSafeWidth, 460);
+
     return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("scroll", close, true);
-      window.removeEventListener("keydown", closeOnEscape);
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", scheduleTitleSafeWidthUpdate);
+      shell?.removeEventListener("transitionend", scheduleTitleSafeWidthUpdate);
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      if (transitionTimer) {
+        window.clearTimeout(transitionTimer);
+      }
+      content.style.removeProperty("--voice-title-safe-max");
     };
-  }, [contextMenu]);
+  }, [futureOpen, leftPaneWidth, rightPanelWidth, settingsOpen, windowChromeState.isFullScreen]);
 
   async function createNewProject(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -929,75 +1096,18 @@ function VoiceHome({
     });
   }
 
+  async function createProjectFromFolder(): Promise<void> {
+    await onAction(async () => {
+      const folder = await window.codexVoice.selectWorkspaceFolder();
+      if (!folder) return;
+      await window.codexVoice.createProject(folder.name, folder.path);
+      await onRefresh();
+    });
+  }
+
   async function resumeProject(projectId: string): Promise<void> {
     await onAction(() => window.codexVoice.resumeProject(projectId));
     setBrowseOpen(false);
-  }
-
-  async function createNewChat(event: React.FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    const name = newChatName.trim();
-    if (!name) return;
-    await onAction(async () => {
-      await window.codexVoice.createChat(name);
-      setNewChatName("");
-      setNewChatOpen(false);
-      setChatsOpen(true);
-    });
-  }
-
-  async function switchChat(chatId: string): Promise<void> {
-    await onAction(async () => {
-      await window.codexVoice.switchChat(chatId);
-      setSwitchChatOpen(false);
-      setChatsOpen(true);
-    });
-  }
-
-  function openProjectContextMenu(
-    event: React.MouseEvent<HTMLElement>,
-    project: VoiceProject,
-  ): void {
-    event.preventDefault();
-    setContextMenu({
-      kind: "project",
-      projectId: project.id,
-      label: project.displayName,
-      x: event.clientX,
-      y: event.clientY,
-    });
-  }
-
-  function openChatContextMenu(event: React.MouseEvent<HTMLElement>, chat: ChatSummary): void {
-    if (!activeProject) return;
-    event.preventDefault();
-    setContextMenu({
-      kind: "chat",
-      projectId: activeProject.id,
-      chatId: chat.id,
-      label: chat.title,
-      x: event.clientX,
-      y: event.clientY,
-    });
-  }
-
-  async function archiveContextTarget(): Promise<void> {
-    const target = contextMenu;
-    if (!target) return;
-    setContextMenu(null);
-    if (target.kind === "project") {
-      await onAction(() => window.codexVoice.archiveProject(target.projectId));
-      return;
-    }
-    await onAction(() => window.codexVoice.archiveChat(target.chatId, target.projectId));
-  }
-
-  async function restoreProject(projectId: string): Promise<void> {
-    await onAction(() => window.codexVoice.restoreProject(projectId));
-  }
-
-  async function restoreChat(projectId: string, chatId: string): Promise<void> {
-    await onAction(() => window.codexVoice.restoreChat(chatId, projectId));
   }
 
   async function saveApiKey(event: React.FormEvent<HTMLFormElement>): Promise<void> {
@@ -1020,11 +1130,64 @@ function VoiceHome({
     });
   }
 
+  async function saveExaApiKey(event?: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    await onAction(async () => {
+      await window.codexVoice.saveExaApiKey(exaApiKey);
+      setExaApiKey("");
+      await onRefresh();
+    });
+  }
+
+  async function clearExaApiKey(): Promise<void> {
+    await onAction(async () => {
+      await window.codexVoice.clearExaApiKey();
+      setExaApiKey("");
+      await onRefresh();
+    });
+  }
+
+  async function revealOpenAiApiKey(): Promise<string> {
+    const secret = await window.codexVoice.revealOpenAiApiKey();
+    return secret.value;
+  }
+
+  async function copyOpenAiApiKey(value?: string): Promise<void> {
+    const entered = value?.trim();
+    if (entered) {
+      await navigator.clipboard.writeText(entered);
+      return;
+    }
+    await window.codexVoice.copyOpenAiApiKey();
+  }
+
+  async function revealExaApiKey(): Promise<string> {
+    const secret = await window.codexVoice.revealExaApiKey();
+    return secret.value;
+  }
+
+  async function copyExaApiKey(value?: string): Promise<void> {
+    const entered = value?.trim();
+    if (entered) {
+      await navigator.clipboard.writeText(entered);
+      return;
+    }
+    await window.codexVoice.copyExaApiKey();
+  }
+
   async function saveOnboardingApiKey(): Promise<void> {
     await onAction(async () => {
       await window.codexVoice.saveOpenAiApiKey(apiKey);
       setApiKey("");
       onClearRealtimeIssue();
+      await onRefresh();
+    });
+  }
+
+  async function saveOnboardingExaApiKey(): Promise<void> {
+    await onAction(async () => {
+      await window.codexVoice.saveExaApiKey(exaApiKey);
+      setExaApiKey("");
       await onRefresh();
     });
   }
@@ -1076,6 +1239,18 @@ function VoiceHome({
     }, paneReplacementDelayMs);
   }
 
+  function openFuturePaneForIntent(): void {
+    setPermissionsOpen(false);
+    clearPaneReplacementTimeout();
+    lastOpenedPaneRef.current = "future";
+    if (canShowBothPanes || !settingsOpen) {
+      setFutureOpen(true);
+      return;
+    }
+    setSettingsOpen(false);
+    openPaneAfterReplacement("future");
+  }
+
   function toggleSettingsPane(): void {
     setPermissionsOpen(false);
     clearPaneReplacementTimeout();
@@ -1105,6 +1280,29 @@ function VoiceHome({
     }
 
     lastOpenedPaneRef.current = "future";
+    if (canShowBothPanes || !settingsOpen) {
+      setFutureOpen(true);
+      return;
+    }
+
+    setSettingsOpen(false);
+    openPaneAfterReplacement("future");
+  }
+
+  function openThreadInRightPanel(chat: ChatSummary): void {
+    setPermissionsOpen(false);
+    clearPaneReplacementTimeout();
+    lastOpenedPaneRef.current = "future";
+    setThreadOpenRequest({
+      requestId: Date.now(),
+      projectId: chat.projectId,
+      projectName: chat.projectTitle,
+      chatId: chat.id,
+      chatName: chat.title,
+      threadId: chat.threadId,
+      workspacePath: chat.workspacePath,
+    });
+
     if (canShowBothPanes || !settingsOpen) {
       setFutureOpen(true);
       return;
@@ -1220,6 +1418,7 @@ function VoiceHome({
     const startWidth = paneWidth(pane);
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
+    let latestRawWidth = startWidth;
 
     target.setPointerCapture(pointerId);
     document.body.style.cursor = "col-resize";
@@ -1229,6 +1428,7 @@ function VoiceHome({
     function onMove(moveEvent: PointerEvent): void {
       const delta = moveEvent.clientX - startX;
       const nextWidth = pane === "settings" ? startWidth + delta : startWidth - delta;
+      latestRawWidth = nextWidth;
       schedulePaneResize(pane, clampPaneWidthForResize(pane, nextWidth));
     }
 
@@ -1248,6 +1448,13 @@ function VoiceHome({
       document.body.style.userSelect = previousUserSelect;
       paneResizeCleanupRef.current = null;
       finishPaneResize(pane);
+      if (latestRawWidth <= paneDragCloseThreshold) {
+        if (pane === "settings") {
+          setSettingsOpen(false);
+        } else {
+          setFutureOpen(false);
+        }
+      }
     }
 
     paneResizeCleanupRef.current = cleanup;
@@ -1283,12 +1490,18 @@ function VoiceHome({
         aria-valuemin={minPaneWidth}
         aria-valuemax={maxWidth}
         aria-valuenow={currentWidth}
+        title={`Drag to resize ${label} pane. Pull past ${paneDragCloseThreshold}px to close.`}
         tabIndex={open ? 0 : -1}
         onPointerDown={(event) => startPaneResize(event, pane)}
         onKeyDown={(event) => resizePaneWithKeyboard(event, pane)}
       />
     );
   }
+
+  const effectiveLeftPaneWidth =
+    settingsOpen ? Math.min(leftPaneWidth, maxPaneWidthForResize("settings")) : leftPaneWidth;
+  const effectiveRightPaneWidth =
+    futureOpen ? Math.min(rightPanelWidth, maxPaneWidthForResize("future")) : rightPanelWidth;
 
   return (
     <main
@@ -1299,8 +1512,8 @@ function VoiceHome({
       }`}
       style={{
         ...voiceAccentStyle(orbCustomization),
-        "--settings-pane-resized-width": `${leftPaneWidth}px`,
-        "--right-pane-width": `${rightPanelWidth}px`,
+        "--settings-pane-resized-width": `${effectiveLeftPaneWidth}px`,
+        "--right-pane-width": `${effectiveRightPaneWidth}px`,
       } as React.CSSProperties}
     >
       <button
@@ -1331,7 +1544,7 @@ function VoiceHome({
           state={state}
           realtimeIssue={realtimeIssue}
           apiKey={apiKey}
-          archivedCount={archivedCount}
+          exaApiKey={exaApiKey}
           voiceConnected={voiceConnected}
           modelScope={modelScope}
           effectiveModel={effectiveModel}
@@ -1339,180 +1552,140 @@ function VoiceHome({
           effectiveServiceTier={effectiveServiceTier}
           effectivePermissionMode={effectivePermissionMode}
           modelOptions={modelOptions}
+          projects={projects}
           orbPresetId={orbPresetId}
           orbCustomization={orbCustomization}
           onOrbPresetChange={setOrbPresetId}
           onOrbCustomizationChange={setOrbCustomization}
+          onCreateProject={() => setNewOpen(true)}
+          onCreateProjectFromFolder={createProjectFromFolder}
+          onBrowseProjects={() => setBrowseOpen(true)}
+          onResumeProject={resumeProject}
+          onOpenThread={openThreadInRightPanel}
           onApiKeyChange={setApiKey}
           onSaveApiKey={saveApiKey}
           onClearApiKey={clearApiKey}
+          onRevealApiKey={revealOpenAiApiKey}
+          onCopyApiKey={copyOpenAiApiKey}
+          onExaApiKeyChange={setExaApiKey}
+          onSaveExaApiKey={saveExaApiKey}
+          onClearExaApiKey={clearExaApiKey}
+          onRevealExaApiKey={revealExaApiKey}
+          onCopyExaApiKey={copyExaApiKey}
           onSelectWorkspace={selectWorkspaceFolder}
           onAction={onAction}
           onRefresh={onRefresh}
           onShowDebug={onShowDebug}
-          onOpenArchived={() => setArchivedOpen(true)}
           onToggleVoice={onToggleVoice}
           onRestartVoice={onRestartVoice}
           resizer={paneResizer("settings", settingsOpen)}
         />
 
-        <div className="voice-home-content">
-        <header className="voice-home-header">
-          <h1>Codex Voice</h1>
-        </header>
+        <div className="voice-home-content" ref={voiceHomeContentRef}>
+          <header className="voice-home-header">
+            <h1>Codex Voice</h1>
+          </header>
 
-        <div className="voice-home-scroll">
-          <section className="voice-hero" aria-label="Voice status">
-            <button
-              className={`voice-orb ${voiceState.tone} ${orbPresetId}`}
-              aria-label={voiceOrbLabel}
-              onClick={handleVoiceOrbClick}
-            >
-              <VoiceOrbCanvas
-                tone={voiceState.tone}
-                outputLevel={voiceOutputLevel}
-                presetId={orbPresetId}
-                customization={orbCustomization}
-              />
-              <span className="voice-orb-shine" />
-            </button>
-            <div className={`voice-state-line ${voiceState.tone}`}>
-              <WaveformIcon />
-              <span>{voiceState.label}</span>
-            </div>
-          </section>
-
-          {error && <ErrorOverlay message={error} onDismiss={onDismissError} />}
-
-          {primaryPendingRequest && (
-            <VoicePendingRequestPanel
-              request={primaryPendingRequest}
-              requestCount={pendingRequests.length}
-              onAction={onAction}
-            />
-          )}
-
-          <section className="voice-project-region" aria-label="Projects">
-            <FeaturedProjectCard
-              activeProjectId={activeProjectId}
-              project={featuredProject}
-              chatsOpen={chatsOpen}
-              onCreate={() => setNewOpen(true)}
-              onResume={resumeProject}
-              onOpenMenu={openProjectContextMenu}
-              onToggleChats={() => {
-                const next = !chatsOpen;
-                setChatsOpen(next);
-                void onAction(() => window.codexVoice.showProjectChats(next));
-              }}
-            />
-
-            {chatsOpen && activeProject ? (
-              <ProjectChatsPanel
-                chats={projectChats}
-                onNewChat={() => setNewChatOpen(true)}
-                onSwitchChat={() => setSwitchChatOpen(true)}
-                onSelectChat={switchChat}
-                onOpenChatMenu={openChatContextMenu}
-              />
-            ) : (
-              <div className="voice-actions">
-                <button className="voice-action-button" onClick={() => setNewOpen(true)}>
-                  <PlusIcon />
-                  <span>New project</span>
-                </button>
-                <button className="voice-action-button" onClick={() => setBrowseOpen(true)}>
-                  <FolderIcon />
-                  <span>Browse projects</span>
-                </button>
+          <div className="voice-home-scroll">
+            <section className="voice-hero" aria-label="Voice status">
+              <button
+                className={`voice-orb ${voiceState.tone} ${orbPresetId}`}
+                aria-label={voiceOrbLabel}
+                onClick={handleVoiceOrbClick}
+              >
+                <VoiceOrbCanvas
+                  tone={voiceState.tone}
+                  outputLevel={voiceOutputLevel}
+                  presetId={orbPresetId}
+                  customization={orbCustomization}
+                />
+                <span className="voice-orb-shine" />
+              </button>
+              <div className={`voice-state-line ${voiceState.tone}`}>
+                <WaveformIcon />
+                <span>{voiceState.label}</span>
               </div>
+            </section>
+
+            {error && <ErrorOverlay message={error} onDismiss={onDismissError} />}
+
+            {primaryPendingRequest && (
+              <VoicePendingRequestPanel
+                request={primaryPendingRequest}
+                requestCount={pendingRequests.length}
+                onAction={onAction}
+              />
             )}
 
-            {(!chatsOpen || !activeProject) && (
-              <div className="recent-block">
-                <h2>Recent Projects</h2>
-                <div className="recent-list">
-                  {recentProjects.map((project) => (
+            <section className="voice-project-region active-thread-region" aria-label="Codex chats">
+              <ProjectChatsPanel chats={activeProject ? projectChats : []} onOpenThread={openThreadInRightPanel} />
+            </section>
+          </div>
+
+          <footer className="voice-footer">
+            <button
+              className="voice-footer-settings"
+              aria-label="Open settings"
+              aria-expanded={settingsOpen}
+              title={state.runtime.ready ? "Codex app-server connected" : "Codex app-server starting"}
+              onClick={toggleSettingsPane}
+            >
+              <ConfigIcon />
+              <span className="voice-footer-settings-label">Settings</span>
+            </button>
+            <div className="voice-permission-wrap footer-permissions">
+              <button
+                className={`voice-permission-trigger ${effectivePermissionMode}`}
+                aria-expanded={permissionsOpen}
+                onClick={() => setPermissionsOpen((current) => !current)}
+              >
+                <PermissionIcon mode={effectivePermissionMode} />
+                <span>{effectivePermission.displayName}</span>
+                <DownIcon />
+              </button>
+
+              {permissionsOpen && (
+                <div className="voice-permission-menu" role="menu">
+                  {CODEX_PERMISSION_PROFILES.map((profile) => (
                     <button
-                      key={project.id}
-                      className="recent-row"
-                      onClick={() => void resumeProject(project.id)}
-                      onContextMenu={(event) => openProjectContextMenu(event, project)}
+                      key={profile.mode}
+                      className={[profile.mode, profile.mode === effectivePermissionMode ? "selected" : ""]
+                        .filter(Boolean)
+                        .join(" ")}
+                      role="menuitemradio"
+                      aria-checked={profile.mode === effectivePermissionMode}
+                      onClick={() =>
+                        void onAction(() =>
+                          window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
+                        )
+                      }
                     >
-                      <span>
-                        <strong>{project.displayName}</strong>
-                        <small>{formatProjectTime(project.updatedAt)}</small>
-                      </span>
-                      <ChevronIcon />
+                      <PermissionIcon mode={profile.mode} />
+                      <span>{profile.displayName}</span>
+                      {profile.mode === effectivePermissionMode && <CheckIcon />}
                     </button>
                   ))}
-                  {recentProjects.length === 0 && (
-                    <div className="recent-empty">Recent projects will appear here.</div>
-                  )}
                 </div>
-              </div>
-            )}
-          </section>
-        </div>
-
-        <footer className="voice-footer">
-          <button
-            className="voice-footer-settings"
-            aria-label="Open settings"
-            aria-expanded={settingsOpen}
-            title={state.runtime.ready ? "Codex app-server connected" : "Codex app-server starting"}
-            onClick={toggleSettingsPane}
-          >
-            <ConfigIcon />
-            <span className="voice-footer-settings-label">Settings</span>
-          </button>
-          <div className="voice-permission-wrap footer-permissions">
-            <button
-              className={`voice-permission-trigger ${effectivePermissionMode}`}
-              aria-expanded={permissionsOpen}
-              onClick={() => setPermissionsOpen((current) => !current)}
-            >
-              <PermissionIcon mode={effectivePermissionMode} />
-              <span>{effectivePermission.displayName}</span>
-              <DownIcon />
-            </button>
-
-            {permissionsOpen && (
-              <div className="voice-permission-menu" role="menu">
-                {CODEX_PERMISSION_PROFILES.map((profile) => (
-                  <button
-                    key={profile.mode}
-                    className={[profile.mode, profile.mode === effectivePermissionMode ? "selected" : ""]
-                      .filter(Boolean)
-                      .join(" ")}
-                    role="menuitemradio"
-                    aria-checked={profile.mode === effectivePermissionMode}
-                    onClick={() =>
-                      void onAction(() =>
-                        window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
-                      )
-                    }
-                  >
-                    <PermissionIcon mode={profile.mode} />
-                    <span>{profile.displayName}</span>
-                    {profile.mode === effectivePermissionMode && <CheckIcon />}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </footer>
+              )}
+            </div>
+          </footer>
         </div>
 
         <RightPanel
           open={futureOpen}
           state={state}
           events={events}
-          width={rightPanelWidth}
           activateTranscriptRequest={transcriptActivationRequest}
-          onWidthChange={setRightPanelWidth}
+          openThreadRequest={threadOpenRequest}
+          openIntent={rightPanelOpenIntent}
+          realtimeConnected={voiceConnected}
+          realtimeConnecting={voiceConnecting}
+          realtimePaused={voicePaused}
+          realtimeAvailable={state.realtime.available}
           onClose={() => setFutureOpen(false)}
           onAction={onAction}
+          onSendRealtimeInput={onSendRealtimeInput}
+          resizer={paneResizer("future", futureOpen)}
         />
       </div>
 
@@ -1570,11 +1743,10 @@ function VoiceHome({
                   key={project.id}
                   className="browse-row"
                   onClick={() => void resumeProject(project.id)}
-                  onContextMenu={(event) => openProjectContextMenu(event, project)}
                 >
                   <FolderIcon />
                   <span>
-                    <strong>{project.displayName}</strong>
+                    <strong>{projectDisplayName(project)}</strong>
                     <small>{formatProjectTime(project.updatedAt)}</small>
                   </span>
                   <ChevronIcon />
@@ -1586,81 +1758,27 @@ function VoiceHome({
         </div>
       )}
 
-      {newChatOpen && (
-        <div className="voice-modal-backdrop" role="presentation">
-          <form className="voice-dialog" onSubmit={(event) => void createNewChat(event)}>
-            <div className="voice-dialog-header">
-              <h2>New chat</h2>
-              <button type="button" aria-label="Close" onClick={() => setNewChatOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <label className="voice-field">
-              Chat name
-              <input
-                autoFocus
-                value={newChatName}
-                onChange={(event) => setNewChatName(event.target.value)}
-                placeholder="Research thread"
-              />
-            </label>
-            <div className="voice-dialog-actions">
-              <button type="button" onClick={() => setNewChatOpen(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="voice-primary" disabled={!newChatName.trim()}>
-                Create
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {switchChatOpen && (
-        <div className="voice-modal-backdrop" role="presentation">
-          <section className="voice-dialog browse-dialog" aria-label="Switch chat">
-            <div className="voice-dialog-header">
-              <h2>Switch chat</h2>
-              <button type="button" aria-label="Close" onClick={() => setSwitchChatOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <div className="browse-list">
-              {projectChats.map((chat) => (
-                <button
-                  key={chat.id}
-                  className={`browse-row ${chat.active ? "selected-chat" : ""}`}
-                  onClick={() => void switchChat(chat.id)}
-                >
-                  <span className={`chat-status-dot ${chat.tone}`} />
-                  <span>
-                    <strong>{chat.title}</strong>
-                    <small>{chat.detail}</small>
-                  </span>
-                  <span className="browse-row-trailing">
-                    {chat.active && <span className="active-chat-pill">Active</span>}
-                    <ChevronIcon />
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
-        </div>
-      )}
-
       {onboardingOpen && (
         <OnboardingFlow
           state={state}
           realtimeIssue={realtimeIssue}
           apiKey={apiKey}
+          exaApiKey={exaApiKey}
           orbPresetId={orbPresetId}
           orbCustomization={orbCustomization}
           onApiKeyChange={setApiKey}
+          onExaApiKeyChange={setExaApiKey}
           onSaveApiKey={saveOnboardingApiKey}
+          onSaveExaApiKey={saveOnboardingExaApiKey}
+          onRevealApiKey={revealOpenAiApiKey}
+          onCopyApiKey={copyOpenAiApiKey}
+          onRevealExaApiKey={revealExaApiKey}
+          onCopyExaApiKey={copyExaApiKey}
           onVoiceChange={changeRealtimeVoice}
           onOrbPresetChange={setOrbPresetId}
           onOrbCustomizationChange={setOrbCustomization}
           onStartProject={(mode) => void startOnboardingProject(mode)}
+          onAction={onAction}
           onClose={completeOnboarding}
         />
       )}
@@ -1677,22 +1795,6 @@ function VoiceHome({
         />
       )}
 
-      {archivedOpen && (
-        <ArchivedDialog
-          projects={archivedProjects}
-          chats={archivedChats}
-          onClose={() => setArchivedOpen(false)}
-          onRestoreProject={restoreProject}
-          onRestoreChat={restoreChat}
-        />
-      )}
-
-      {contextMenu && (
-        <ArchiveContextMenu
-          target={contextMenu}
-          onArchive={() => void archiveContextTarget()}
-        />
-      )}
     </main>
   );
 }
@@ -1702,7 +1804,7 @@ function VoiceSettingsPane({
   state,
   realtimeIssue,
   apiKey,
-  archivedCount,
+  exaApiKey,
   voiceConnected,
   modelScope,
   effectiveModel,
@@ -1710,18 +1812,30 @@ function VoiceSettingsPane({
   effectiveServiceTier,
   effectivePermissionMode,
   modelOptions,
+  projects,
   orbPresetId,
   orbCustomization,
   onOrbPresetChange,
   onOrbCustomizationChange,
+  onCreateProject,
+  onCreateProjectFromFolder,
+  onBrowseProjects,
+  onResumeProject,
+  onOpenThread,
   onApiKeyChange,
   onSaveApiKey,
   onClearApiKey,
+  onRevealApiKey,
+  onCopyApiKey,
+  onExaApiKeyChange,
+  onSaveExaApiKey,
+  onClearExaApiKey,
+  onRevealExaApiKey,
+  onCopyExaApiKey,
   onSelectWorkspace,
   onAction,
   onRefresh,
   onShowDebug,
-  onOpenArchived,
   onToggleVoice,
   onRestartVoice,
   resizer,
@@ -1730,7 +1844,7 @@ function VoiceSettingsPane({
   state: AppState;
   realtimeIssue: string | null;
   apiKey: string;
-  archivedCount: number;
+  exaApiKey: string;
   voiceConnected: boolean;
   modelScope: "chat" | "nextTurn";
   effectiveModel: string;
@@ -1738,41 +1852,163 @@ function VoiceSettingsPane({
   effectiveServiceTier: CodexServiceTier | null;
   effectivePermissionMode: CodexPermissionMode;
   modelOptions: CodexModelSummary[];
+  projects: VoiceProject[];
   orbPresetId: VoiceOrbPresetId;
   orbCustomization: VoiceOrbCustomization;
   onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
   onOrbCustomizationChange: (customization: VoiceOrbCustomization) => void;
+  onCreateProject: () => void;
+  onCreateProjectFromFolder: () => Promise<void>;
+  onBrowseProjects: () => void;
+  onResumeProject: (projectId: string) => Promise<void>;
+  onOpenThread: (chat: ChatSummary) => void;
   onApiKeyChange: (value: string) => void;
   onSaveApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
   onClearApiKey: () => Promise<void>;
+  onRevealApiKey: () => Promise<string>;
+  onCopyApiKey: (value?: string) => Promise<void>;
+  onExaApiKeyChange: (value: string) => void;
+  onSaveExaApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+  onClearExaApiKey: () => Promise<void>;
+  onRevealExaApiKey: () => Promise<string>;
+  onCopyExaApiKey: (value?: string) => Promise<void>;
   onSelectWorkspace: () => Promise<void>;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
   onRefresh: () => Promise<void>;
   onShowDebug: () => Promise<void>;
-  onOpenArchived: () => void;
   onToggleVoice: () => Promise<void>;
   onRestartVoice: () => Promise<void>;
   resizer?: React.ReactNode;
 }): React.ReactElement {
-  const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("appearance");
+  const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("projects");
+  const [projectCreateMenuOpen, setProjectCreateMenuOpen] = useState(false);
+  const [projectCreateMenuAnchor, setProjectCreateMenuAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [projectsCollapsed, setProjectsCollapsed] = useState(false);
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(() => new Set());
+  const [renameTarget, setRenameTarget] = useState<ProjectTreeRenameTarget | null>(null);
+  const [treeMenuTarget, setTreeMenuTarget] = useState<ProjectTreeMenuTarget | null>(null);
+  const [openAiKeyVisible, setOpenAiKeyVisible] = useState(false);
+  const [openAiRevealedKey, setOpenAiRevealedKey] = useState<string | null>(null);
+  const [openAiSecretMessage, setOpenAiSecretMessage] = useState<string | null>(null);
+  const [exaKeyVisible, setExaKeyVisible] = useState(false);
+  const [exaRevealedKey, setExaRevealedKey] = useState<string | null>(null);
+  const [exaSecretMessage, setExaSecretMessage] = useState<string | null>(null);
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const activeProject = state.activeProject;
   const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
   const hasApiKey = Boolean(apiKey.trim());
+  const hasExaApiKey = Boolean(exaApiKey.trim());
   const apiKeySource = state.realtime.apiKeySource;
   const apiKeyManagedByEnvironment = apiKeySource === "environment";
   const canClearSavedApiKey = apiKeySource === "saved";
+  const exaApiKeySource = state.webSearch.apiKeySource;
+  const exaApiKeyManagedByEnvironment = exaApiKeySource === "environment";
+  const canClearSavedExaApiKey = exaApiKeySource === "saved";
+  const openAiStorageTitle = apiKeyStorageTitle(state.realtime);
+  const openAiStorageDetail = apiKeyStorageDetail(state.realtime);
+  const webSearchStorageTitleText = webSearchStorageTitle(state.webSearch);
+  const webSearchStorageDetailText = webSearchStorageDetail(state.webSearch);
   const realtimeSupportsReasoning = state.realtime.model === "gpt-realtime-2";
   const selectedRealtimeReasoningEffort =
     state.realtime.reasoningEffort ?? DEFAULT_REALTIME_REASONING_EFFORT;
   const selectedCodexModel = modelOptions.find((model) => model.model === effectiveModel) ?? null;
   const modelSupportsFast = supportsFastMode(selectedCodexModel);
   const fastModeOn = isFastServiceTier(effectiveServiceTier);
+  const canViewOpenAiKey = hasApiKey || state.realtime.available;
+  const canViewExaKey = hasExaApiKey || state.webSearch.available;
+  const openAiInputValue = openAiRevealedKey && openAiKeyVisible ? openAiRevealedKey : apiKey;
+  const exaInputValue = exaRevealedKey && exaKeyVisible ? exaRevealedKey : exaApiKey;
+
+  useEffect(() => {
+    setOpenAiKeyVisible(false);
+    setOpenAiRevealedKey(null);
+    setOpenAiSecretMessage(null);
+  }, [apiKeySource]);
+
+  useEffect(() => {
+    setExaKeyVisible(false);
+    setExaRevealedKey(null);
+    setExaSecretMessage(null);
+  }, [exaApiKeySource]);
+
+  useEffect(() => {
+    if (!openAiKeyVisible || !openAiRevealedKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setOpenAiKeyVisible(false);
+      setOpenAiRevealedKey(null);
+      setOpenAiSecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [openAiKeyVisible, openAiRevealedKey]);
+
+  useEffect(() => {
+    if (!exaKeyVisible || !exaRevealedKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setExaKeyVisible(false);
+      setExaRevealedKey(null);
+      setExaSecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [exaKeyVisible, exaRevealedKey]);
+
+  async function toggleOpenAiKeyVisible(): Promise<void> {
+    if (openAiKeyVisible) {
+      setOpenAiKeyVisible(false);
+      setOpenAiRevealedKey(null);
+      setOpenAiSecretMessage(null);
+      return;
+    }
+    if (hasApiKey) {
+      setOpenAiKeyVisible(true);
+      setOpenAiSecretMessage("Showing entered key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealApiKey();
+      setOpenAiRevealedKey(value);
+      setOpenAiKeyVisible(true);
+      setOpenAiSecretMessage("Showing active key.");
+    });
+  }
+
+  async function copyOpenAiKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyApiKey(hasApiKey ? apiKey : undefined);
+      setOpenAiSecretMessage(hasApiKey ? "Copied entered key." : "Copied active key.");
+    });
+  }
+
+  async function toggleExaKeyVisible(): Promise<void> {
+    if (exaKeyVisible) {
+      setExaKeyVisible(false);
+      setExaRevealedKey(null);
+      setExaSecretMessage(null);
+      return;
+    }
+    if (hasExaApiKey) {
+      setExaKeyVisible(true);
+      setExaSecretMessage("Showing entered Exa key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealExaApiKey();
+      setExaRevealedKey(value);
+      setExaKeyVisible(true);
+      setExaSecretMessage("Showing active Exa key.");
+    });
+  }
+
+  async function copyExaKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyExaApiKey(hasExaApiKey ? exaApiKey : undefined);
+      setExaSecretMessage(hasExaApiKey ? "Copied entered Exa key." : "Copied active Exa key.");
+    });
+  }
   const tabs: Array<{ id: VoiceSettingsTab; label: string; icon: React.ReactElement }> = [
+    { id: "projects", label: "Projects", icon: <FolderIcon /> },
     { id: "general", label: "General", icon: <ConfigIcon /> },
     { id: "appearance", label: "Appearance", icon: <AppearanceIcon /> },
     { id: "configuration", label: "Configuration", icon: <PermissionIcon mode={effectivePermissionMode} /> },
-    { id: "archive", label: archivedCount > 0 ? `Archive (${archivedCount})` : "Archive", icon: <ArchiveIcon /> },
   ];
 
   async function changeRealtimeModel(model: RealtimeModelId): Promise<void> {
@@ -1801,7 +2037,7 @@ function VoiceSettingsPane({
     if (updated && voiceConnected) await onRestartVoice();
   }
 
-  async function changeRealtimeReasoningEffort(reasoningEffort: RealtimeReasoningEffort): Promise<void> {
+	  async function changeRealtimeReasoningEffort(reasoningEffort: RealtimeReasoningEffort): Promise<void> {
     let updated = false;
     await onAction(async () => {
       try {
@@ -1811,17 +2047,172 @@ function VoiceSettingsPane({
         throw friendlyRealtimeSettingsError(caught);
       }
     });
-    if (updated && voiceConnected) await onRestartVoice();
+	    if (updated && voiceConnected) await onRestartVoice();
+	  }
+
+  useEffect(() => {
+    if (!treeMenuTarget) return undefined;
+    const close = () => setTreeMenuTarget(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [treeMenuTarget]);
+
+  useEffect(() => {
+    if (!projectCreateMenuOpen) return undefined;
+    const close = () => {
+      setProjectCreateMenuOpen(false);
+      setProjectCreateMenuAnchor(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectCreateMenuOpen]);
+
+  function closeProjectCreateMenu(): void {
+    setProjectCreateMenuOpen(false);
+    setProjectCreateMenuAnchor(null);
+  }
+
+  function toggleProjectCreateMenu(event: React.MouseEvent<HTMLButtonElement>): void {
+    event.stopPropagation();
+    setTreeMenuTarget(null);
+    setRenameTarget(null);
+    if (projectCreateMenuOpen) {
+      closeProjectCreateMenu();
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 310;
+    const menuHeight = 116;
+    const gap = 10;
+    const rightSideLeft = bounds.right + gap;
+    const left =
+      rightSideLeft + menuWidth <= window.innerWidth - 8
+        ? rightSideLeft
+        : Math.max(8, bounds.left - menuWidth - gap);
+    const top = Math.max(8, Math.min(bounds.top - 8, window.innerHeight - menuHeight - 8));
+    setProjectCreateMenuAnchor({ left, top });
+    setProjectCreateMenuOpen(true);
+  }
+
+  function toggleProjectCollapsed(projectId: string): void {
+    setCollapsedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) {
+        next.delete(projectId);
+      } else {
+        next.add(projectId);
+      }
+      return next;
+    });
+  }
+
+	  function beginProjectRename(project: VoiceProject): void {
+	    closeProjectCreateMenu();
+    setTreeMenuTarget(null);
+	    setRenameTarget({
+      kind: "project",
+      projectId: project.id,
+      original: projectDisplayName(project),
+      value: projectDisplayName(project),
+    });
+  }
+
+	  function beginChatRename(projectId: string, chat: ChatSummary): void {
+	    closeProjectCreateMenu();
+    setTreeMenuTarget(null);
+	    setRenameTarget({
+      kind: "chat",
+      projectId,
+      chatId: chat.id,
+      original: chat.title,
+      value: chat.title,
+    });
+  }
+
+  function updateRenameValue(value: string): void {
+    setRenameTarget((current) => (current ? { ...current, value } : current));
+  }
+
+  async function submitRename(): Promise<void> {
+    const target = renameTarget;
+    if (!target) return;
+    const nextName = target.value.trim();
+    setRenameTarget(null);
+    if (!nextName || nextName === target.original) return;
+    await onAction(async () => {
+      if (target.kind === "project") {
+        await window.codexVoice.renameProject(target.projectId, nextName);
+        return;
+      }
+      await window.codexVoice.renameChat(target.chatId, nextName, target.projectId);
+    });
+  }
+
+  function openProjectTreeMenu(event: React.MouseEvent<HTMLButtonElement>, project: VoiceProject, label: string): void {
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    closeProjectCreateMenu();
+    setRenameTarget(null);
+    setTreeMenuTarget({
+      kind: "project",
+      projectId: project.id,
+      label,
+      x: bounds.right + 8,
+      y: bounds.top - 7,
+    });
+  }
+
+  function openChatTreeMenu(event: React.MouseEvent<HTMLButtonElement>, projectId: string, chat: ChatSummary): void {
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    closeProjectCreateMenu();
+    setRenameTarget(null);
+    setTreeMenuTarget({
+      kind: "chat",
+      projectId,
+      chatId: chat.id,
+      label: chat.title,
+      x: bounds.right + 8,
+      y: bounds.top - 7,
+    });
+  }
+
+  async function removeTreeMenuTarget(): Promise<void> {
+    const target = treeMenuTarget;
+    if (!target) return;
+    setTreeMenuTarget(null);
+    setRenameTarget(null);
+    await onAction(async () => {
+      if (target.kind === "project") {
+        await window.codexVoice.removeProject(target.projectId);
+        return;
+      }
+      await window.codexVoice.removeChat(target.chatId, target.projectId);
+    });
   }
 
   return (
     <aside className="voice-settings-pane" aria-hidden={!open} inert={!open} aria-label="Settings">
       {resizer}
-      <div className="voice-settings-inner">
-        <header className="voice-settings-header">
-          <h2>Controls</h2>
-        </header>
-
+      <div className="voice-settings-inner no-title">
         <nav className="voice-settings-nav" aria-label="Control sections" role="tablist">
           {tabs.map((tab) => (
             <button
@@ -1839,6 +2230,199 @@ function VoiceSettingsPane({
         </nav>
 
         <div className="voice-settings-scroll" role="tabpanel">
+          {activeTab === "projects" && (
+            <>
+              <section className="voice-project-tree" aria-label="Projects">
+                <div className="voice-project-tree-header">
+                  <button
+                    type="button"
+                    className="voice-project-title-button"
+                    aria-expanded={!projectsCollapsed}
+                    onClick={() => {
+                      closeProjectCreateMenu();
+                      setProjectsCollapsed((current) => !current);
+                    }}
+                  >
+	                    <span>Projects</span>
+	                    <ChevronIcon className={!projectsCollapsed ? "open" : ""} />
+	                  </button>
+                  <div className="voice-project-tree-actions">
+                    <button
+                      type="button"
+                      aria-label="Browse projects"
+                      title="Browse projects"
+                      onClick={() => {
+                        closeProjectCreateMenu();
+                        onBrowseProjects();
+                      }}
+                    >
+                      <FilterIcon />
+                    </button>
+                    <div className="voice-project-create-wrap">
+                      <button
+                        type="button"
+                        aria-label="New project"
+                        title="New project"
+                        aria-expanded={projectCreateMenuOpen}
+                        onClick={toggleProjectCreateMenu}
+                      >
+                        <FolderPlusIcon />
+                      </button>
+                      {projectCreateMenuOpen && projectCreateMenuAnchor && (
+                        <div
+                          className="voice-project-create-menu"
+                          role="menu"
+                          style={{ left: projectCreateMenuAnchor.left, top: projectCreateMenuAnchor.top }}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              closeProjectCreateMenu();
+                              onCreateProject();
+                            }}
+                          >
+                            <FolderPlusIcon />
+                            <span>Start from scratch</span>
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              closeProjectCreateMenu();
+                              void onCreateProjectFromFolder();
+                            }}
+                          >
+                            <FolderIcon />
+                            <span>Use an existing folder</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className={`voice-project-tree-list ${projectsCollapsed ? "collapsed" : ""}`}>
+                    {projects.map((project) => {
+                      const chats = chatSummariesForProject(project, state);
+                      const projectLabel = projectDisplayName(project);
+	                      const projectCollapsed = collapsedProjectIds.has(project.id);
+	                      const projectRename =
+	                        renameTarget?.kind === "project" && renameTarget.projectId === project.id ? renameTarget : null;
+                      return (
+                        <div key={project.id} className="voice-project-tree-group">
+                          <div className="voice-project-tree-project-row">
+                            {projectRename ? (
+                              <ProjectTreeRenameForm
+                                ariaLabel="Rename project"
+	                                value={projectRename.value}
+	                                onChange={updateRenameValue}
+	                                onCancel={() => setRenameTarget(null)}
+	                                onSubmit={submitRename}
+	                              />
+	                            ) : (
+	                              <button
+                                type="button"
+                                className="voice-project-tree-project"
+                                title={project.workspacePath || project.folderPath}
+                                aria-expanded={!projectCollapsed}
+                                onClick={() => toggleProjectCollapsed(project.id)}
+                              >
+                                <FolderIcon />
+                                <span>{projectLabel}</span>
+	                              </button>
+	                            )}
+	                            {!projectRename && (
+	                              <button
+	                                type="button"
+	                                className="voice-tree-icon-button"
+	                                aria-label={`Open ${projectLabel} actions`}
+	                                aria-expanded={treeMenuTarget?.kind === "project" && treeMenuTarget.projectId === project.id}
+	                                title="Project actions"
+	                                onClick={(event) => openProjectTreeMenu(event, project, projectLabel)}
+	                              >
+	                                <EllipsisIcon />
+	                              </button>
+	                            )}
+	                          </div>
+                          <div className={`voice-project-tree-chats ${projectCollapsed ? "collapsed" : ""}`}>
+                              {chats.map((chat) => {
+                                const chatRename =
+                                  renameTarget?.kind === "chat" && renameTarget.chatId === chat.id ? renameTarget : null;
+	                                return (
+	                                  <div
+	                                    key={chat.id}
+	                                    className={`voice-project-tree-chat ${chat.working ? "working" : ""}`}
+	                                    title={chat.title}
+	                                  >
+	                                    {chatRename ? (
+	                                      <ProjectTreeRenameForm
+	                                        ariaLabel="Rename thread"
+	                                        value={chatRename.value}
+	                                        onChange={updateRenameValue}
+	                                        onCancel={() => setRenameTarget(null)}
+	                                        onSubmit={submitRename}
+	                                      />
+	                                    ) : (
+	                                      <button
+	                                        type="button"
+	                                        className="voice-project-tree-chat-button"
+	                                        onClick={() => onOpenThread(chat)}
+	                                      >
+	                                        <span>{chat.title}</span>
+	                                      </button>
+	                                    )}
+	                                    <span className="voice-tree-row-tools">
+	                                      {chat.working && (
+	                                        <span className="codex-thread-spinner" aria-label="Codex is working" />
+	                                      )}
+	                                      {!chatRename && (
+	                                        <button
+	                                          type="button"
+	                                          className="voice-tree-icon-button"
+	                                          aria-label={`Open ${chat.title} actions`}
+	                                          aria-expanded={treeMenuTarget?.kind === "chat" && treeMenuTarget.chatId === chat.id}
+	                                          title="Thread actions"
+	                                          onClick={(event) => openChatTreeMenu(event, project.id, chat)}
+	                                        >
+	                                          <EllipsisIcon />
+	                                        </button>
+	                                      )}
+	                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                        </div>
+                      );
+                    })}
+	                    {projects.length === 0 && (
+                      <div className="voice-left-empty">Projects will appear here.</div>
+                    )}
+                  </div>
+	                {treeMenuTarget && (
+	                  <ProjectTreeActionMenu
+	                    target={treeMenuTarget}
+	                    onRename={() => {
+	                      if (treeMenuTarget.kind === "project") {
+	                        const project = projects.find((candidate) => candidate.id === treeMenuTarget.projectId);
+	                        if (project) beginProjectRename(project);
+	                        return;
+	                      }
+	                      const project = projects.find((candidate) => candidate.id === treeMenuTarget.projectId) ?? null;
+	                      const chat = chatSummariesForProject(project, state).find(
+	                        (candidate) => candidate.id === treeMenuTarget.chatId,
+	                      );
+	                      if (chat) beginChatRename(treeMenuTarget.projectId, chat);
+	                    }}
+	                    onRemove={removeTreeMenuTarget}
+	                  />
+	                )}
+              </section>
+            </>
+          )}
+
           {activeTab === "general" && (
             <>
               <section className="voice-settings-section">
@@ -1877,28 +2461,107 @@ function VoiceSettingsPane({
               <section className="voice-settings-section">
                 <h3>OpenAI API key</h3>
                 <form className="voice-settings-card voice-settings-api-key" onSubmit={(event) => void onSaveApiKey(event)}>
-                  <div className="voice-settings-secret-status">
-                    <strong>{apiKeyStorageTitle(state.realtime)}</strong>
-                    <small>{apiKeyStorageDetail(state.realtime)}</small>
-                  </div>
+                  {(openAiStorageTitle || openAiStorageDetail) && (
+                    <div className="voice-settings-secret-status">
+                      {openAiStorageTitle && <strong>{openAiStorageTitle}</strong>}
+                      {openAiStorageDetail && <small>{openAiStorageDetail}</small>}
+                    </div>
+                  )}
                   <label className="voice-settings-field">
                     {apiKeySource === "saved" ? "Replacement key" : "API key"}
                     <input
-                      type="password"
-                      value={apiKey}
-                      onChange={(event) => onApiKeyChange(event.target.value)}
+                      type={openAiKeyVisible ? "text" : "password"}
+                      value={openAiInputValue}
+                      onChange={(event) => {
+                        setOpenAiRevealedKey(null);
+                        setOpenAiSecretMessage(null);
+                        onApiKeyChange(event.target.value);
+                      }}
                       placeholder={apiKeyInputPlaceholder(state.realtime)}
                       disabled={apiKeyManagedByEnvironment}
+                      readOnly={Boolean(openAiRevealedKey)}
                       autoComplete="off"
                       spellCheck={false}
                     />
                   </label>
+                  {openAiSecretMessage && (
+                    <div className="voice-settings-secret-note" role="status">
+                      {openAiSecretMessage}
+                    </div>
+                  )}
                   <div className="voice-settings-actions inline">
+                    <button type="button" onClick={() => void toggleOpenAiKeyVisible()} disabled={!canViewOpenAiKey}>
+                      {openAiKeyVisible ? "Hide" : "View"}
+                    </button>
+                    <button type="button" onClick={() => void copyOpenAiKey()} disabled={!canViewOpenAiKey}>
+                      Copy
+                    </button>
                     <button type="button" onClick={() => void onClearApiKey()} disabled={!canClearSavedApiKey}>
                       Clear
                     </button>
                     <button type="submit" className="primary" disabled={!hasApiKey || apiKeyManagedByEnvironment}>
                       {apiKeySource === "saved" ? "Replace" : "Save"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Web search</h3>
+                <form className="voice-settings-card voice-settings-api-key" onSubmit={(event) => void onSaveExaApiKey(event)}>
+                  {(webSearchStorageTitleText || webSearchStorageDetailText) && (
+                    <div className="voice-settings-secret-heading">
+                      <div className="voice-settings-secret-status">
+                        {webSearchStorageTitleText && <strong>{webSearchStorageTitleText}</strong>}
+                        {webSearchStorageDetailText && <small>{webSearchStorageDetailText}</small>}
+                      </div>
+                      <button
+                        type="button"
+                        className="api-key-info-button"
+                        aria-label="Web search details"
+                        title="Web search details"
+                      >
+                        <InfoIcon />
+                        <span className="api-key-info-popover" role="status">
+                          Exa is used by main for voice web search. The key stays out of app state unless you choose View.
+                        </span>
+                      </button>
+                    </div>
+                  )}
+                  <label className="voice-settings-field">
+                    {exaApiKeySource === "saved" ? "Replacement Exa key" : "Exa API key"}
+                    <input
+                      type={exaKeyVisible ? "text" : "password"}
+                      value={exaInputValue}
+                      onChange={(event) => {
+                        setExaRevealedKey(null);
+                        setExaSecretMessage(null);
+                        onExaApiKeyChange(event.target.value);
+                      }}
+                      placeholder={exaApiKeyInputPlaceholder(state.webSearch)}
+                      disabled={exaApiKeyManagedByEnvironment}
+                      readOnly={Boolean(exaRevealedKey)}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </label>
+                  {exaSecretMessage && (
+                    <div className="voice-settings-secret-note" role="status">
+                      {exaSecretMessage}
+                    </div>
+                  )}
+                  <div className="voice-settings-actions inline">
+                    <button type="button" onClick={() => void toggleExaKeyVisible()} disabled={!canViewExaKey}>
+                      {exaKeyVisible ? "Hide" : "View"}
+                    </button>
+                    <button type="button" onClick={() => void copyExaKey()} disabled={!canViewExaKey}>
+                      Copy
+                    </button>
+                    <button type="button" onClick={() => void onClearExaApiKey()} disabled={!canClearSavedExaApiKey}>
+                      Clear
+                    </button>
+                    <button type="submit" className="primary" disabled={!hasExaApiKey || exaApiKeyManagedByEnvironment}>
+                      {exaApiKeySource === "saved" ? "Replace" : "Save"}
                     </button>
                   </div>
                 </form>
@@ -1978,9 +2641,6 @@ function VoiceSettingsPane({
                             ? formatEffort(selectedRealtimeReasoningEffort)
                             : "Off on Realtime 1.5"}
                         </small>
-                      </span>
-                      <span className="realtime-reasoning-badge">
-                        {realtimeSupportsReasoning ? "2.0" : "1.5"}
                       </span>
                     </div>
                     <div className="voice-settings-segmented realtime-reasoning" aria-label="Realtime reasoning effort">
@@ -2143,20 +2803,6 @@ function VoiceSettingsPane({
             </>
           )}
 
-          {activeTab === "archive" && (
-            <section className="voice-settings-section">
-              <h3>Archive</h3>
-              <div className="voice-settings-card action-settings-card">
-                <button type="button" className="voice-settings-action" onClick={onOpenArchived}>
-                  <ArchiveIcon />
-                  <span>
-                    <strong>Archived items</strong>
-                    <small>{archivedCount > 0 ? `${archivedCount} archived items` : "No archived items"}</small>
-                  </span>
-                </button>
-              </div>
-            </section>
-          )}
         </div>
       </div>
     </aside>
@@ -2333,41 +2979,108 @@ function OnboardingFlow({
   state,
   realtimeIssue,
   apiKey,
+  exaApiKey,
   orbPresetId,
   orbCustomization,
   onApiKeyChange,
+  onExaApiKeyChange,
   onSaveApiKey,
+  onSaveExaApiKey,
+  onRevealApiKey,
+  onCopyApiKey,
+  onRevealExaApiKey,
+  onCopyExaApiKey,
   onVoiceChange,
   onOrbPresetChange,
   onOrbCustomizationChange,
   onStartProject,
+  onAction,
   onClose,
 }: {
   state: AppState;
   realtimeIssue: string | null;
   apiKey: string;
+  exaApiKey: string;
   orbPresetId: VoiceOrbPresetId;
   orbCustomization: VoiceOrbCustomization;
   onApiKeyChange: (value: string) => void;
+  onExaApiKeyChange: (value: string) => void;
   onSaveApiKey: () => Promise<void>;
+  onSaveExaApiKey: () => Promise<void>;
+  onRevealApiKey: () => Promise<string>;
+  onCopyApiKey: (value?: string) => Promise<void>;
+  onRevealExaApiKey: () => Promise<string>;
+  onCopyExaApiKey: (value?: string) => Promise<void>;
   onVoiceChange: (voice: RealtimeVoiceId) => Promise<void>;
   onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
   onOrbCustomizationChange: (customization: VoiceOrbCustomization) => void;
   onStartProject: (mode: "scratch" | "folder") => void;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
   onClose: () => void;
 }): React.ReactElement {
-  const initialStep = state.realtime.available ? "voice" : "key";
+  const initialStep = state.realtime.available && state.webSearch.available ? "voice" : "key";
   const [step, setStep] = useState<OnboardingStep>(initialStep);
   const [revealed, setRevealed] = useState(false);
+  const [revealedApiKey, setRevealedApiKey] = useState<string | null>(null);
+  const [exaRevealed, setExaRevealed] = useState(false);
+  const [revealedExaApiKey, setRevealedExaApiKey] = useState<string | null>(null);
+  const [apiKeySecretMessage, setApiKeySecretMessage] = useState<string | null>(null);
+  const [exaSecretMessage, setExaSecretMessage] = useState<string | null>(null);
+  const [webSearchRequested, setWebSearchRequested] = useState(state.webSearch.available);
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const hasApiKey = Boolean(apiKey.trim());
+  const hasExaApiKey = Boolean(exaApiKey.trim());
   const apiKeyManagedByEnvironment = state.realtime.apiKeySource === "environment";
+  const exaApiKeyManagedByEnvironment = state.webSearch.apiKeySource === "environment";
   const selectedVoice = realtimeVoiceOption(state.realtime.voice);
   const selectedOrb = voiceOrbPresetById(orbPresetId);
   const hasProject = state.projects.length > 0;
   const stepIndex = onboardingStepOrder.indexOf(step);
   const canGoBack = stepIndex > 0;
   const isLastStep = step === "project";
+  const webSearchNeedsKey = webSearchRequested && !state.webSearch.available && !hasExaApiKey;
+  const canViewApiKey = hasApiKey || state.realtime.available;
+  const canViewExaApiKey = hasExaApiKey || state.webSearch.available;
+  const apiKeyInputValue = revealed && revealedApiKey ? revealedApiKey : apiKey;
+  const exaApiKeyInputValue = exaRevealed && revealedExaApiKey ? revealedExaApiKey : exaApiKey;
+
+  useEffect(() => {
+    if (state.webSearch.available) {
+      setWebSearchRequested(true);
+    }
+  }, [state.webSearch.available]);
+
+  useEffect(() => {
+    setRevealed(false);
+    setRevealedApiKey(null);
+    setApiKeySecretMessage(null);
+  }, [state.realtime.apiKeySource]);
+
+  useEffect(() => {
+    setExaRevealed(false);
+    setRevealedExaApiKey(null);
+    setExaSecretMessage(null);
+  }, [state.webSearch.apiKeySource]);
+
+  useEffect(() => {
+    if (!revealed || !revealedApiKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setRevealed(false);
+      setRevealedApiKey(null);
+      setApiKeySecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [revealed, revealedApiKey]);
+
+  useEffect(() => {
+    if (!exaRevealed || !revealedExaApiKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setExaRevealed(false);
+      setRevealedExaApiKey(null);
+      setExaSecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [exaRevealed, revealedExaApiKey]);
 
   const stepMeta: Array<{
     id: OnboardingStep;
@@ -2383,12 +3096,17 @@ function OnboardingFlow({
   async function saveKeyAndContinue(): Promise<void> {
     if (hasApiKey) {
       await onSaveApiKey();
-      setStep("voice");
-      return;
     }
+    if (webSearchRequested && hasExaApiKey) {
+      await onSaveExaApiKey();
+    }
+    if (webSearchNeedsKey) return;
     if (state.realtime.available) {
       setStep("voice");
       return;
+    }
+    if (hasApiKey) {
+      setStep("voice");
     }
   }
 
@@ -2411,6 +3129,60 @@ function OnboardingFlow({
 
   function startProject(mode: "scratch" | "folder"): void {
     onStartProject(mode);
+  }
+
+  async function toggleApiKeyReveal(): Promise<void> {
+    if (revealed) {
+      setRevealed(false);
+      setRevealedApiKey(null);
+      setApiKeySecretMessage(null);
+      return;
+    }
+    if (hasApiKey) {
+      setRevealed(true);
+      setApiKeySecretMessage("Showing entered key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealApiKey();
+      setRevealedApiKey(value);
+      setRevealed(true);
+      setApiKeySecretMessage("Showing active key.");
+    });
+  }
+
+  async function copyApiKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyApiKey(hasApiKey ? apiKey : undefined);
+      setApiKeySecretMessage(hasApiKey ? "Copied entered key." : "Copied active key.");
+    });
+  }
+
+  async function toggleExaApiKeyReveal(): Promise<void> {
+    if (exaRevealed) {
+      setExaRevealed(false);
+      setRevealedExaApiKey(null);
+      setExaSecretMessage(null);
+      return;
+    }
+    if (hasExaApiKey) {
+      setExaRevealed(true);
+      setExaSecretMessage("Showing entered Exa key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealExaApiKey();
+      setRevealedExaApiKey(value);
+      setExaRevealed(true);
+      setExaSecretMessage("Showing active Exa key.");
+    });
+  }
+
+  async function copyExaApiKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyExaApiKey(hasExaApiKey ? exaApiKey : undefined);
+      setExaSecretMessage(hasExaApiKey ? "Copied entered Exa key." : "Copied active Exa key.");
+    });
   }
 
   return (
@@ -2466,7 +3238,7 @@ function OnboardingFlow({
                 >
                   <InfoIcon />
                   <span className="api-key-info-popover" role="status">
-                    Main creates Realtime client secrets. Saved keys are not sent back to this window.
+                    Main stores keys outside app state and only reveals them after you choose View.
                   </span>
                 </button>
               </div>
@@ -2478,10 +3250,15 @@ function OnboardingFlow({
                     aria-label="OpenAI API key"
                     autoFocus
                     type={revealed ? "text" : "password"}
-                    value={apiKey}
-                    onChange={(event) => onApiKeyChange(event.target.value)}
+                    value={apiKeyInputValue}
+                    onChange={(event) => {
+                      setRevealedApiKey(null);
+                      setApiKeySecretMessage(null);
+                      onApiKeyChange(event.target.value);
+                    }}
                     placeholder={apiKeyInputPlaceholder(state.realtime)}
                     disabled={apiKeyManagedByEnvironment}
+                    readOnly={Boolean(revealedApiKey)}
                     autoComplete="off"
                     spellCheck={false}
                   />
@@ -2490,14 +3267,107 @@ function OnboardingFlow({
                       type="button"
                       aria-label={revealed ? "Hide API key" : "Reveal API key"}
                       title={revealed ? "Hide key" : "Reveal key"}
-                      disabled={!hasApiKey}
-                      onClick={() => setRevealed((current) => !current)}
+                      disabled={!canViewApiKey}
+                      onClick={() => void toggleApiKeyReveal()}
                     >
                       {revealed ? <EyeOffIcon /> : <EyeIcon />}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Copy OpenAI API key"
+                      title="Copy key"
+                      disabled={!canViewApiKey}
+                      onClick={() => void copyApiKey()}
+                    >
+                      Copy
                     </button>
                   </div>
                 </div>
               </div>
+              {apiKeySecretMessage && (
+                <div className="voice-settings-secret-note onboarding-secret-note" role="status">
+                  {apiKeySecretMessage}
+                </div>
+              )}
+
+              <label className="onboarding-web-search-toggle">
+                <input
+                  type="checkbox"
+                  checked={webSearchRequested}
+                  onChange={(event) => setWebSearchRequested(event.target.checked)}
+                />
+                <span>
+                  <strong>Enable web search</strong>
+                  <small>{state.webSearch.available ? "Exa is ready." : "Add Exa so voice can search the live web."}</small>
+                </span>
+              </label>
+
+              {webSearchRequested && (
+                <div className="onboarding-web-search-panel">
+                  <div className="onboarding-web-search-heading">
+                    <span>
+                      <strong>Exa API key</strong>
+                      <small>Used only for the voice web search tool.</small>
+                    </span>
+                    <button
+                      type="button"
+                      className="api-key-info-button"
+                      aria-label="Why Exa is needed"
+                      title="Why Exa is needed"
+                    >
+                      <InfoIcon />
+                      <span className="api-key-info-popover" role="status">
+                        Exa is used by main for voice web search. The key stays out of app state unless you choose View.
+                      </span>
+                    </button>
+                  </div>
+                  <div className="voice-field api-key-field">
+                    <div className="api-key-input-wrap">
+                      <input
+                        id="exa-api-key-onboarding-input"
+                        aria-label="Exa API key"
+                        type={exaRevealed ? "text" : "password"}
+                        value={exaApiKeyInputValue}
+                        onChange={(event) => {
+                          setRevealedExaApiKey(null);
+                          setExaSecretMessage(null);
+                          onExaApiKeyChange(event.target.value);
+                        }}
+                        placeholder={exaApiKeyInputPlaceholder(state.webSearch)}
+                        disabled={exaApiKeyManagedByEnvironment}
+                        readOnly={Boolean(revealedExaApiKey)}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <div className="api-key-input-actions">
+                        <button
+                          type="button"
+                          aria-label={exaRevealed ? "Hide Exa API key" : "Reveal Exa API key"}
+                          title={exaRevealed ? "Hide key" : "Reveal key"}
+                          disabled={!canViewExaApiKey}
+                          onClick={() => void toggleExaApiKeyReveal()}
+                        >
+                          {exaRevealed ? <EyeOffIcon /> : <EyeIcon />}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Copy Exa API key"
+                          title="Copy Exa key"
+                          disabled={!canViewExaApiKey}
+                          onClick={() => void copyExaApiKey()}
+                        >
+                          Copy
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  {exaSecretMessage && (
+                    <div className="voice-settings-secret-note onboarding-secret-note" role="status">
+                      {exaSecretMessage}
+                    </div>
+                  )}
+                </div>
+              )}
 
             </article>
 
@@ -2577,7 +3447,7 @@ function OnboardingFlow({
             <button
               type="button"
               className="voice-primary"
-              disabled={step === "key" && !state.realtime.available && !hasApiKey}
+              disabled={step === "key" && ((!state.realtime.available && !hasApiKey) || webSearchNeedsKey)}
               onClick={() => void goNext()}
             >
               {isLastStep ? "Done" : "Next"}
@@ -3457,7 +4327,7 @@ function ApiKeyDialog({
           </button>
           {infoOpen && (
             <div className="api-key-info-popover" role="status">
-              Main creates Realtime client secrets. Saved keys are not sent back to this window.
+              Main stores keys outside app state and only reveals them after you choose View.
             </div>
           )}
         </div>
@@ -3503,239 +4373,166 @@ function ApiKeyDialog({
   );
 }
 
-function FeaturedProjectCard({
-  activeProjectId,
-  chatsOpen,
-  project,
-  onCreate,
-  onResume,
-  onOpenMenu,
-  onToggleChats,
-}: {
-  activeProjectId: string | null;
-  chatsOpen: boolean;
-  project: VoiceProject | null;
-  onCreate: () => void;
-  onResume: (projectId: string) => Promise<void>;
-  onOpenMenu: (event: React.MouseEvent<HTMLElement>, project: VoiceProject) => void;
-  onToggleChats: () => void;
-}): React.ReactElement {
-  if (!project) {
-    return (
-      <button className="featured-project-card empty-feature" onClick={onCreate}>
-        <span className="voice-folder-tile">
-          <FolderIcon />
-        </span>
-        <span className="featured-copy">
-          <strong>No active project</strong>
-          <small>Create a project to begin</small>
-        </span>
-        <ChevronIcon />
-      </button>
-    );
-  }
+type ChatSummary = {
+  id: string;
+  projectId: string;
+  projectTitle: string;
+  workspacePath: string | null;
+  threadId: string | null;
+  title: string;
+  tone: "active" | "waiting" | "idle";
+  working: boolean;
+};
 
-  const active = project.id === activeProjectId;
+type ProjectTreeRenameTarget =
+  | {
+      kind: "project";
+      projectId: string;
+      original: string;
+      value: string;
+    }
+  | {
+      kind: "chat";
+      projectId: string;
+      chatId: string;
+      original: string;
+      value: string;
+    };
+
+type ProjectTreeMenuTarget =
+  | {
+      kind: "project";
+      projectId: string;
+      label: string;
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "chat";
+      projectId: string;
+      chatId: string;
+      label: string;
+      x: number;
+      y: number;
+    };
+
+function ProjectTreeActionMenu({
+  target,
+  onRename,
+  onRemove,
+}: {
+  target: ProjectTreeMenuTarget;
+  onRename: () => void;
+  onRemove: () => Promise<void>;
+}): React.ReactElement {
+  const width = 234;
+  const height = 104;
+  const left = Math.max(8, Math.min(target.x, window.innerWidth - width - 8));
+  const top = Math.max(8, Math.min(target.y, window.innerHeight - height - 8));
+
   return (
-    <button
-      className={`featured-project-card ${chatsOpen && active ? "expanded" : ""}`}
-      aria-expanded={active ? chatsOpen : undefined}
-      onContextMenu={(event) => onOpenMenu(event, project)}
-      onClick={() => {
-        if (active) {
-          onToggleChats();
-          return;
-        }
-        void onResume(project.id);
-      }}
+    <div
+      className="voice-tree-action-menu"
+      role="menu"
+      style={{ left, top, width }}
+      onClick={(event) => event.stopPropagation()}
     >
-      <span className="voice-folder-tile">
-        <FolderIcon />
-      </span>
-      <span className="featured-copy">
-        <strong>{project.displayName}</strong>
-        <small>
-          {formatProjectTime(project.updatedAt)}
-          {active && (
-            <>
-              <span className="voice-meta-dot">.</span>
-              <span className="active-project-text">Active project</span>
-            </>
-          )}
-        </small>
-      </span>
-      <ChevronIcon className={chatsOpen && active ? "chevron-open" : ""} />
-    </button>
+      <button type="button" role="menuitem" onClick={onRename}>
+        <EditIcon />
+        <span>{target.kind === "project" ? "Rename project" : "Rename thread"}</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        className="danger"
+        onClick={() => {
+          void onRemove();
+        }}
+      >
+        <RemoveIcon />
+        <span>Remove</span>
+      </button>
+    </div>
   );
 }
 
-type ChatSummary = {
-  id: string;
-  title: string;
-  detail: string;
-  tone: "active" | "waiting" | "idle";
-  active: boolean;
-};
+function ProjectTreeRenameForm({
+  ariaLabel,
+  value,
+  onChange,
+  onCancel,
+  onSubmit,
+}: {
+  ariaLabel: string;
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onSubmit: () => Promise<void>;
+}): React.ReactElement {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  return (
+    <form
+      className="voice-tree-rename-form"
+      onClick={(event) => event.stopPropagation()}
+      onSubmit={(event) => {
+        event.preventDefault();
+        void onSubmit();
+      }}
+    >
+      <input
+        ref={inputRef}
+        aria-label={ariaLabel}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") onCancel();
+        }}
+      />
+      <button type="submit" aria-label="Save name" title="Save">
+        <CheckIcon />
+      </button>
+      <button type="button" aria-label="Cancel rename" title="Cancel" onClick={onCancel}>
+        <CloseIcon />
+      </button>
+    </form>
+  );
+}
 
 function ProjectChatsPanel({
   chats,
-  onNewChat,
-  onSwitchChat,
-  onSelectChat,
-  onOpenChatMenu,
+  onOpenThread,
 }: {
   chats: ChatSummary[];
-  onNewChat: () => void;
-  onSwitchChat: () => void;
-  onSelectChat: (chatId: string) => Promise<void>;
-  onOpenChatMenu: (event: React.MouseEvent<HTMLElement>, chat: ChatSummary) => void;
+  onOpenThread: (chat: ChatSummary) => void;
 }): React.ReactElement {
-  const activeChat = chats.find((chat) => chat.active) ?? null;
   return (
-    <div className="project-chats-panel">
-      <div className="project-chats-header">
-        <div>
-          <h2>Chats in this project</h2>
-          {activeChat && (
-            <p>
-              Active chat: <strong>{activeChat.title}</strong>
-            </p>
-          )}
-        </div>
-        <span>{chats.length}</span>
-      </div>
+    <div className="project-chats-panel active-thread-stack">
       <div className="project-chat-list">
         {chats.map((chat) => (
           <button
+            type="button"
             key={chat.id}
-            className={`project-chat-row ${chat.active ? "active" : ""}`}
-            onClick={() => void onSelectChat(chat.id)}
-            onContextMenu={(event) => onOpenChatMenu(event, chat)}
+            className={`project-chat-row ${chat.working ? "working" : ""}`}
+            onClick={() => onOpenThread(chat)}
           >
             <span className={`chat-status-dot ${chat.tone}`} />
             <span className="project-chat-copy">
               <strong>{chat.title}</strong>
-              <small>{chat.detail}</small>
             </span>
-            {chat.active && (
+            {chat.working && (
               <span className="project-chat-trailing">
-                <span className="active-chat-pill">Active</span>
+                <span className="codex-thread-spinner" aria-label="Codex is working" />
               </span>
             )}
           </button>
         ))}
       </div>
-      <div className="voice-actions chat-actions">
-        <button className="voice-action-button" type="button" onClick={onNewChat}>
-          <PlusIcon />
-          <span>New chat</span>
-        </button>
-        <button className="voice-action-button" type="button" onClick={onSwitchChat}>
-          <SwitchIcon />
-          <span>Switch chat</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function ArchiveContextMenu({
-  target,
-  onArchive,
-}: {
-  target: ContextMenuTarget;
-  onArchive: () => void;
-}): React.ReactElement {
-  const left = Math.max(8, Math.min(target.x, window.innerWidth - 188));
-  const top = Math.max(8, Math.min(target.y, window.innerHeight - 54));
-  return (
-    <div
-      className="voice-context-menu"
-      role="menu"
-      style={{ left, top }}
-      onClick={(event) => event.stopPropagation()}
-    >
-      <button role="menuitem" onClick={onArchive}>
-        {target.kind === "project" ? "Archive project" : "Archive chat"}
-      </button>
-    </div>
-  );
-}
-
-function ArchivedDialog({
-  projects,
-  chats,
-  onClose,
-  onRestoreProject,
-  onRestoreChat,
-}: {
-  projects: VoiceProject[];
-  chats: ArchivedChat[];
-  onClose: () => void;
-  onRestoreProject: (projectId: string) => Promise<void>;
-  onRestoreChat: (projectId: string, chatId: string) => Promise<void>;
-}): React.ReactElement {
-  const empty = projects.length === 0 && chats.length === 0;
-  return (
-    <div className="voice-modal-backdrop" role="presentation">
-      <section className="voice-dialog archived-dialog" aria-label="Archived">
-        <div className="voice-dialog-header">
-          <h2>Archived</h2>
-          <button type="button" aria-label="Close" onClick={onClose}>
-            <CloseIcon />
-          </button>
-        </div>
-
-        {empty ? (
-          <p className="browse-empty">Archived chats and projects will appear here.</p>
-        ) : (
-          <div className="archived-sections">
-            {projects.length > 0 && (
-              <section className="archived-section">
-                <h3>Projects</h3>
-                <div className="archived-list">
-                  {projects.map((project) => (
-                    <article key={project.id} className="archived-row">
-                      <FolderIcon />
-                      <span>
-                        <strong>{project.displayName}</strong>
-                        <small>{project.archivedAt ? formatProjectTime(project.archivedAt) : "Archived"}</small>
-                      </span>
-                      <button type="button" onClick={() => void onRestoreProject(project.id)}>
-                        Restore
-                      </button>
-                    </article>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {chats.length > 0 && (
-              <section className="archived-section">
-                <h3>Chats</h3>
-                <div className="archived-list">
-                  {chats.map(({ projectId, projectName, chat }) => (
-                    <article key={chat.id} className="archived-row">
-                      <span className="chat-status-dot idle" />
-                      <span>
-                        <strong>{chat.displayName}</strong>
-                        <small>
-                          {projectName}
-                          <span className="voice-meta-dot">.</span>
-                          {chat.archivedAt ? formatProjectTime(chat.archivedAt) : "Archived"}
-                        </small>
-                      </span>
-                      <button type="button" onClick={() => void onRestoreChat(projectId, chat.id)}>
-                        Restore
-                      </button>
-                    </article>
-                  ))}
-                </div>
-              </section>
-            )}
-          </div>
-        )}
-      </section>
     </div>
   );
 }
@@ -3864,7 +4661,7 @@ function DebugDashboard({
                 className={`project-card ${project.id === activeProjectId ? "active" : ""}`}
                 onClick={() => void onAction(() => window.codexVoice.resumeProject(project.id))}
               >
-                <strong>{project.displayName}</strong>
+                <strong>{projectDisplayName(project)}</strong>
                 <span>{new Date(project.updatedAt).toLocaleString()}</span>
                 <small>{project.lastStatus ?? "No status yet."}</small>
               </button>
@@ -4053,30 +4850,44 @@ function voiceOrbAriaLabel(
 
 function chatSummariesForProject(project: VoiceProject | null, state: AppState): ChatSummary[] {
   if (!project) return [];
+  const projectTitle = projectDisplayName(project);
   return (project.chats ?? []).filter((chat) => !chat.archivedAt).map((chat) => {
     const runtime = (state.runtime.chats ?? []).find((candidate) => candidate.chatId === chat.id);
     const waiting = Boolean(runtime?.pendingRequests.length);
     const working = Boolean(runtime?.activeTurnId);
     return {
       id: chat.id,
+      projectId: project.id,
+      projectTitle,
+      workspacePath: project.workspacePath ?? project.folderPath ?? null,
+      threadId: chat.codexThreadId,
       title: chat.displayName,
-      detail: runtime?.status ?? chat.lastStatus ?? "Idle",
       tone: waiting ? "waiting" : working ? "active" : "idle",
-      active: chat.id === state.runtime.activeChatId,
+      working,
     };
   });
 }
 
-function archivedChatsForProjects(projects: VoiceProject[]): ArchivedChat[] {
-  return projects.flatMap((project) =>
-    (project.chats ?? [])
-      .filter((chat) => chat.archivedAt)
-      .map((chat) => ({
-        projectId: project.id,
-        projectName: project.displayName,
-        chat,
-      })),
-  );
+function projectDisplayName(project: VoiceProject): string {
+  if (project.displayNameSource === "custom") return project.displayName || "Project";
+  const workspacePath = project.workspacePath?.trim();
+  if (workspacePath && !samePathText(workspacePath, project.folderPath)) {
+    return basenameFromPathText(workspacePath) || project.displayName || "Project";
+  }
+  return project.displayName || basenameFromPathText(project.folderPath) || "Project";
+}
+
+function basenameFromPathText(value: string | null | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return "";
+  const withoutTrailingSlash = trimmed.replace(/[\\/]+$/, "");
+  const parts = withoutTrailingSlash.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? withoutTrailingSlash;
+}
+
+function samePathText(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalize = (value: string | null | undefined) => value?.trim().replace(/[\\/]+$/, "") ?? "";
+  return normalize(left) === normalize(right);
 }
 
 function realtimeHealth(
@@ -4104,24 +4915,50 @@ function apiKeyInputPlaceholder(realtime: AppState["realtime"]): string {
   return "sk-...";
 }
 
-function apiKeyStorageTitle(realtime: AppState["realtime"]): string {
-  if (realtime.apiKeySource === "environment") return "Environment key active";
+function apiKeyStorageTitle(realtime: AppState["realtime"]): string | null {
+  if (realtime.apiKeySource === "environment") return null;
   if (realtime.apiKeySource === "saved") {
     return realtime.apiKeyEncrypted ? "Saved key encrypted" : "Saved key active";
   }
   return "No key configured";
 }
 
-function apiKeyStorageDetail(realtime: AppState["realtime"]): string {
+function apiKeyStorageDetail(realtime: AppState["realtime"]): string | null {
   if (realtime.apiKeySource === "environment") {
-    return "Loaded by main from OPENAI_API_KEY. Remove it from the environment to use a saved key.";
+    return null;
   }
   if (realtime.apiKeySource === "saved") {
     return realtime.apiKeyEncrypted
-      ? "Stored with Electron safeStorage. Paste a new key here to replace it."
-      : "Stored locally without safeStorage encryption on this machine.";
+      ? "Stored with Electron safeStorage. Use View or Copy when you need it."
+      : "Legacy local save without OS encryption. Replace it to re-encrypt when safeStorage is available.";
   }
-  return "Paste a key once. After saving, this window cannot read it back.";
+  return "Paste a key once. Main stores it outside app state and only reveals it on request.";
+}
+
+function exaApiKeyInputPlaceholder(webSearch: AppState["webSearch"]): string {
+  if (webSearch.apiKeySource === "environment") return "EXA_API_KEY is set";
+  if (webSearch.apiKeySource === "saved") return "Paste a replacement Exa key";
+  return "Exa API key";
+}
+
+function webSearchStorageTitle(webSearch: AppState["webSearch"]): string | null {
+  if (webSearch.apiKeySource === "environment") return null;
+  if (webSearch.apiKeySource === "saved") {
+    return webSearch.apiKeyEncrypted ? "Saved Exa key encrypted" : "Saved Exa key active";
+  }
+  return null;
+}
+
+function webSearchStorageDetail(webSearch: AppState["webSearch"]): string | null {
+  if (webSearch.apiKeySource === "environment") {
+    return null;
+  }
+  if (webSearch.apiKeySource === "saved") {
+    return webSearch.apiKeyEncrypted
+      ? "Stored with Electron safeStorage. Use View or Copy when you need it."
+      : "Legacy local save without OS encryption. Replace it to re-encrypt when safeStorage is available.";
+  }
+  return null;
 }
 
 function friendlyRealtimeIssue(issue: string): string {
@@ -4156,6 +4993,16 @@ function friendlyRealtimeSettingsError(error: unknown): Error {
   if (message.includes("No handler registered") && message.includes("realtime:setSettings")) {
     return new Error(
       "Codex Voice main process is still running an older build. Restart Codex Voice, then choose the Realtime settings again.",
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
+function friendlyActionError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("No handler registered") && message.includes("settings:")) {
+    return new Error(
+      "Codex Voice main process is still running an older build. Restart Codex Voice, then try the API key action again.",
     );
   }
   return error instanceof Error ? error : new Error(message);
@@ -4269,6 +5116,26 @@ function FolderIcon(): React.ReactElement {
   );
 }
 
+function FolderPlusIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="folder-plus-icon">
+      <path d="M3.75 7.1a2 2 0 0 1 2-2h4.05a2 2 0 0 1 1.48.65l1.17 1.28h5.8a2 2 0 0 1 2 2v8.05a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V7.1Z" />
+      <path d="M12 10.75v5.5" />
+      <path d="M9.25 13.5h5.5" />
+    </svg>
+  );
+}
+
+function FilterIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 7h14" />
+      <path d="M7.75 12h8.5" />
+      <path d="M10.25 17h3.5" />
+    </svg>
+  );
+}
+
 function PlusIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -4289,6 +5156,34 @@ function CheckIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m5.5 12.5 4.25 4.25L18.5 7.25" />
+    </svg>
+  );
+}
+
+function EditIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m5 16.85-.35 2.5 2.5-.35 10.2-10.2-2.15-2.15L5 16.85Z" />
+      <path d="m14.35 7.5 2.15 2.15" />
+    </svg>
+  );
+}
+
+function EllipsisIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="ellipsis-icon">
+      <path d="M6.5 12h.01" />
+      <path d="M12 12h.01" />
+      <path d="M17.5 12h.01" />
+    </svg>
+  );
+}
+
+function RemoveIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M6.25 6.25 17.75 17.75" />
+      <path d="M17.75 6.25 6.25 17.75" />
     </svg>
   );
 }
@@ -4318,17 +5213,6 @@ function RefreshIcon(): React.ReactElement {
       <path d="M4 18v-5h5" />
       <path d="M18.4 9A6.6 6.6 0 0 0 6.7 7.1L4 10" />
       <path d="M5.6 15A6.6 6.6 0 0 0 17.3 16.9L20 14" />
-    </svg>
-  );
-}
-
-function ArchiveIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4.5 6.5h15" />
-      <path d="M6.25 6.5v11.25a2 2 0 0 0 2 2h7.5a2 2 0 0 0 2-2V6.5" />
-      <path d="M8.5 3.75h7a2 2 0 0 1 2 2v.75h-11v-.75a2 2 0 0 1 2-2Z" />
-      <path d="M9.5 11.5h5" />
     </svg>
   );
 }

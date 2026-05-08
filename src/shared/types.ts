@@ -341,6 +341,7 @@ export type VoiceChat = {
 export type VoiceProject = {
   id: string;
   displayName: string;
+  displayNameSource?: "workspace" | "custom";
   folderPath: string;
   workspacePath: string;
   activeChatId: string | null;
@@ -365,6 +366,8 @@ export type SelectedWorkspaceFolder = {
 
 export type CodexChatRuntime = {
   chatId: string;
+  handle: string;
+  projectHandle: string;
   threadId: string | null;
   displayName: string;
   activeTurnId: string | null;
@@ -377,6 +380,50 @@ export type CodexChatRuntime = {
   activeTurnServiceTier: CodexServiceTier | null;
 };
 
+export type CodexProjectTarget = {
+  projectId?: string | null;
+  projectHandle?: string | null;
+  projectName?: string | null;
+  workspacePath?: string | null;
+  createIfMissing?: boolean | null;
+};
+
+export type CodexThreadTarget = {
+  chatId?: string | null;
+  threadHandle?: string | null;
+  chatName?: string | null;
+  newChatName?: string | null;
+  createIfMissing?: boolean | null;
+  forceNew?: boolean | null;
+};
+
+export type DispatchCodexTaskArgs = {
+  request: string;
+  context?: string | null;
+  project?: CodexProjectTarget | null;
+  thread?: CodexThreadTarget | null;
+};
+
+export type CreateCodexThreadArgs = {
+  name: string;
+  project?: CodexProjectTarget | null;
+  context?: string | null;
+  forceNew?: boolean | null;
+};
+
+export type ListCodexThreadsArgs = {
+  project?: CodexProjectTarget | null;
+};
+
+export type CodexProjectThreadRuntime = {
+  projectId: string;
+  projectHandle: string;
+  projectName: string;
+  workspacePath: string;
+  activeChatId: string | null;
+  chats: CodexChatRuntime[];
+};
+
 export type CodexRuntimeState = {
   ready: boolean;
   activeProjectId: string | null;
@@ -387,6 +434,7 @@ export type CodexRuntimeState = {
   tokenUsage: CodexThreadTokenUsage | null;
   pendingRequests: PendingCodexRequest[];
   chats: CodexChatRuntime[];
+  projectThreads: CodexProjectThreadRuntime[];
   showProjectChats: boolean;
 };
 
@@ -436,8 +484,10 @@ export type PendingCodexRequest = {
   requestId: number | string;
   method: string;
   projectId?: string;
+  projectHandle?: string;
   projectName?: string;
   chatId?: string;
+  threadHandle?: string;
   chatName?: string;
   threadId?: string;
   turnId?: string;
@@ -467,12 +517,21 @@ export type AppState = {
     apiKeySource: "environment" | "saved" | null;
     apiKeyEncrypted: boolean;
   };
+  webSearch: {
+    available: boolean;
+    provider: "exa";
+    reason: string | null;
+    apiKeySource: "environment" | "saved" | null;
+    apiKeyEncrypted: boolean;
+  };
 };
 
 export type CodexActionResult = {
   kind: "turn" | "command";
   message: string;
   turnId: string | null;
+  projectHandle?: string | null;
+  threadHandle?: string | null;
   project: VoiceProject | null;
   chat: VoiceChat | null;
 };
@@ -503,6 +562,23 @@ export type VoiceTranscriptMessage = {
   responseId?: string;
   itemId?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type RealtimeUserAttachment = {
+  id: string;
+  kind: "image";
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  dataUrl: string;
+  localPath?: string | null;
+};
+
+export type RealtimeUserAttachmentMetadata = Omit<RealtimeUserAttachment, "dataUrl">;
+
+export type RealtimeUserInput = {
+  text: string;
+  attachments: RealtimeUserAttachment[];
 };
 
 export type WindowChromeState = {
@@ -550,6 +626,10 @@ export type VoiceWebSearchArgs = {
 export type VoiceWebSearchSource = {
   title: string | null;
   url: string;
+  author?: string | null;
+  publishedDate?: string | null;
+  highlights?: string[];
+  score?: number | null;
 };
 
 export type VoiceWebSearchAction = {
@@ -564,6 +644,9 @@ export type VoiceWebSearchResult = {
   sources: VoiceWebSearchSource[];
   actions: VoiceWebSearchAction[];
   model: string;
+  provider?: "exa";
+  searchType?: string;
+  requestId?: string | null;
 };
 
 export type VoiceExecCommandResult = {
@@ -573,6 +656,17 @@ export type VoiceExecCommandResult = {
   session_id?: number;
   original_token_count?: number;
   output: string;
+};
+
+export type ApiKeySecretView = {
+  value: string;
+  source: "environment" | "saved";
+  encrypted: boolean;
+};
+
+export type ApiKeySecretCopyResult = {
+  source: "environment" | "saved";
+  encrypted: boolean;
 };
 
 export type CodexVoiceApi = {
@@ -587,18 +681,27 @@ export type CodexVoiceApi = {
   setWorkspaceFolder(workspacePath: string, name?: string | null): Promise<VoiceProject>;
   createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject>;
   resumeProject(projectId: string): Promise<VoiceProject>;
+  renameProject(projectId: string, name: string): Promise<VoiceProject>;
+  removeProject(projectId: string): Promise<VoiceProject>;
   archiveProject(projectId: string): Promise<VoiceProject>;
   restoreProject(projectId: string): Promise<VoiceProject>;
   createChat(name: string, projectId?: string): Promise<VoiceProject>;
   switchChat(chatId: string, projectId?: string): Promise<VoiceProject>;
+  renameChat(chatId: string, name: string, projectId?: string): Promise<VoiceProject>;
+  removeChat(chatId: string, projectId?: string): Promise<VoiceProject>;
   archiveChat(chatId: string, projectId?: string): Promise<VoiceProject>;
   restoreChat(chatId: string, projectId?: string): Promise<VoiceProject>;
   listChats(projectId?: string): Promise<VoiceChat[]>;
   showProjectChats(open?: boolean): Promise<void>;
   summarizeProject(projectId?: string, chatId?: string): Promise<string>;
+  createThread(args: CreateCodexThreadArgs): Promise<VoiceProject>;
+  listProjectThreads(args?: ListCodexThreadsArgs): Promise<CodexProjectThreadRuntime[]>;
+  getAllThreadStatus(args?: ListCodexThreadsArgs): Promise<CodexProjectThreadRuntime[]>;
+  dispatchCodexTask(args: DispatchCodexTaskArgs): Promise<CodexActionResult>;
   sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult>;
   steerCodex(text: string, chatId?: string): Promise<{ turnId: string }>;
   interruptCodex(chatId?: string): Promise<void>;
+  openCodexThreadInApp(threadId: string): Promise<void>;
   getChatStatus(chatId?: string): Promise<CodexChatRuntime[]>;
   setCodexSettings(
     settings: {
@@ -624,6 +727,12 @@ export type CodexVoiceApi = {
   cancelWebSearch(requestId: string): Promise<void>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
+  revealOpenAiApiKey(): Promise<ApiKeySecretView>;
+  copyOpenAiApiKey(): Promise<ApiKeySecretCopyResult>;
+  saveExaApiKey(apiKey: string): Promise<void>;
+  clearExaApiKey(): Promise<void>;
+  revealExaApiKey(): Promise<ApiKeySecretView>;
+  copyExaApiKey(): Promise<ApiKeySecretCopyResult>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;
   setRealtimeSettings(settings: {
     model?: RealtimeModelId | null;

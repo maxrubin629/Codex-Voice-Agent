@@ -75,6 +75,9 @@ function realtimeTranscriptRole(event: AppEvent, phase: "delta" | "completed"): 
   if (event.kind === "userTranscript" || rawType === "conversation.item.input_audio_transcription.completed") {
     return "user";
   }
+  if (event.kind === "userTranscriptFailed" || rawType === "conversation.item.input_audio_transcription.failed") {
+    return "user";
+  }
   if (event.kind === "assistantTranscript" || rawType === "response.output_audio_transcript.done") {
     return "assistant";
   }

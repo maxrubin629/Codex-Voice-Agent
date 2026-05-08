@@ -1,11 +1,19 @@
-import { app, BrowserWindow, dialog, ipcMain, type OpenDialogOptions } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, type IpcMainInvokeEvent, type OpenDialogOptions } from "electron";
 import path from "node:path";
-import { clearOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
+import {
+  clearExaApiKey,
+  clearOpenAiApiKey,
+  revealExaApiKey,
+  revealOpenAiApiKey,
+  saveExaApiKey,
+  saveOpenAiApiKey,
+} from "./apiKeyStore";
 import appIcon from "./assets/app-icon.png?asset";
 import { CodexBridge } from "./codexBridge";
 import { VoiceCodexOrchestrator } from "./orchestrator";
 import { ProjectStore } from "./projectStore";
 import {
+  openCodexThreadInApp,
   openRightPanelTarget,
   previewRightPanelTarget,
   readGitChangeSummary,
@@ -17,6 +25,9 @@ import type {
   AppEvent,
   CodexPermissionMode,
   CodexSettingsScope,
+  CreateCodexThreadArgs,
+  DispatchCodexTaskArgs,
+  ListCodexThreadsArgs,
   RealtimeModelId,
   RealtimeReasoningEffort,
   RealtimeVoiceId,
@@ -201,6 +212,13 @@ function registerIpcHandler(
   ipcMain.handle(channel, listener);
 }
 
+function requireVoiceWindowSecretRequest(event: IpcMainInvokeEvent): void {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!senderWindow || senderWindow !== voiceWindow) {
+    throw new Error("API keys can only be viewed or copied from the voice window.");
+  }
+}
+
 app.setName(appName);
 
 app.whenReady().then(() => {
@@ -272,6 +290,15 @@ function registerIpc(): void {
     (_event, payload: { projectId: string }) => requireOrchestrator().resumeProject(payload.projectId),
   );
   registerIpcHandler(
+    "projects:rename",
+    (_event, payload: { projectId: string; name: string }) =>
+      requireOrchestrator().renameProject(payload.projectId, payload.name),
+  );
+  registerIpcHandler(
+    "projects:remove",
+    (_event, payload: { projectId: string }) => requireOrchestrator().removeProject(payload.projectId),
+  );
+  registerIpcHandler(
     "projects:archive",
     (_event, payload: { projectId: string }) => requireOrchestrator().archiveProject(payload.projectId),
   );
@@ -288,6 +315,16 @@ function registerIpc(): void {
     "projects:switchChat",
     (_event, payload: { chatId: string; projectId?: string }) =>
       requireOrchestrator().switchChat(payload.chatId, payload.projectId),
+  );
+  registerIpcHandler(
+    "projects:renameChat",
+    (_event, payload: { chatId: string; name: string; projectId?: string }) =>
+      requireOrchestrator().renameChat(payload.chatId, payload.name, payload.projectId),
+  );
+  registerIpcHandler(
+    "projects:removeChat",
+    (_event, payload: { chatId: string; projectId?: string }) =>
+      requireOrchestrator().removeChat(payload.chatId, payload.projectId),
   );
   registerIpcHandler(
     "projects:archiveChat",
@@ -315,6 +352,18 @@ function registerIpc(): void {
     (_event, payload: { projectId?: string; chatId?: string }) =>
       requireOrchestrator().summarizeProject(payload.projectId, payload.chatId),
   );
+  registerIpcHandler("projects:createThread", (_event, payload: CreateCodexThreadArgs) =>
+    requireOrchestrator().createThread(payload),
+  );
+  registerIpcHandler("projects:listThreads", (_event, payload?: ListCodexThreadsArgs) =>
+    requireOrchestrator().listProjectThreads(payload ?? {}),
+  );
+  registerIpcHandler("projects:allThreadStatus", (_event, payload?: ListCodexThreadsArgs) =>
+    requireOrchestrator().getAllThreadStatus(payload ?? {}),
+  );
+  registerIpcHandler("codex:dispatchTask", (_event, payload: DispatchCodexTaskArgs) =>
+    requireOrchestrator().dispatchCodexTask(payload),
+  );
   registerIpcHandler(
     "codex:send",
     (_event, payload: { text: string; chatId?: string; workspacePath?: string | null }) =>
@@ -325,6 +374,9 @@ function registerIpc(): void {
   );
   registerIpcHandler("codex:interrupt", (_event, payload?: { chatId?: string }) =>
     requireOrchestrator().interruptCodex(payload?.chatId),
+  );
+  registerIpcHandler("codex:openThreadInApp", (_event, payload: { threadId?: string }) =>
+    openCodexThreadInApp(payload.threadId),
   );
   registerIpcHandler(
     "codex:setSettings",
@@ -394,6 +446,32 @@ function registerIpc(): void {
   });
   registerIpcHandler("settings:clearOpenAiApiKey", () => {
     clearOpenAiApiKey();
+  });
+  registerIpcHandler("settings:revealOpenAiApiKey", (event) => {
+    requireVoiceWindowSecretRequest(event);
+    return revealOpenAiApiKey();
+  });
+  registerIpcHandler("settings:copyOpenAiApiKey", (event) => {
+    requireVoiceWindowSecretRequest(event);
+    const secret = revealOpenAiApiKey();
+    clipboard.writeText(secret.value);
+    return { source: secret.source, encrypted: secret.encrypted };
+  });
+  registerIpcHandler("settings:saveExaApiKey", (_event, payload: { apiKey: string }) => {
+    saveExaApiKey(payload.apiKey);
+  });
+  registerIpcHandler("settings:clearExaApiKey", () => {
+    clearExaApiKey();
+  });
+  registerIpcHandler("settings:revealExaApiKey", (event) => {
+    requireVoiceWindowSecretRequest(event);
+    return revealExaApiKey();
+  });
+  registerIpcHandler("settings:copyExaApiKey", (event) => {
+    requireVoiceWindowSecretRequest(event);
+    const secret = revealExaApiKey();
+    clipboard.writeText(secret.value);
+    return { source: secret.source, encrypted: secret.encrypted };
   });
   registerIpcHandler("realtime:createClientSecret", () =>
     requireOrchestrator().createRealtimeClientSecret(),

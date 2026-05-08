@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   ActiveThreadSummary,
   AppEvent,
@@ -6,6 +6,7 @@ import type {
   GitChangeSummary,
   PendingCodexRequest,
   PendingRequestQuestion,
+  RealtimeUserInput,
   RightPanelPreviewResult,
   ThreadArtifactCandidate,
   ThreadSourceCandidate,
@@ -13,21 +14,29 @@ import type {
   VoiceChat,
   VoiceTranscriptMessage,
 } from "../../shared/types";
+import type { BuiltInTabId, RightPanelOpenIntent, RightPanelOpenIntentReason } from "./rightPanelOpenIntents";
+import {
+  dataTransferHasImage,
+  filesFromClipboard,
+  filesFromDataTransfer,
+  filesToRealtimeAttachments,
+  formatBytes as formatAttachmentBytes,
+} from "./realtimeInputAttachments";
 import { VoiceTranscriptContent } from "./voiceTranscript";
-
-type BuiltInTabId =
-  | "overview"
-  | "transcript"
-  | "summary"
-  | "activity"
-  | "approvals"
-  | "last-output"
-  | "chats"
-  | "changes"
-  | "runtime";
 
 type RightPanelTab =
   | { id: BuiltInTabId; kind: "builtIn"; title: string; closeable: boolean }
+  | {
+      id: string;
+      kind: "thread";
+      title: string;
+      subtitle: string | null;
+      projectId: string;
+      chatId: string;
+      threadId: string | null;
+      workspacePath: string | null;
+      closeable: true;
+    }
   | {
       id: string;
       kind: "file" | "url" | "source" | "artifact";
@@ -38,10 +47,23 @@ type RightPanelTab =
       workspacePath?: string | null;
       mimeType?: string | null;
       raw?: unknown;
+      openedBy?: string | null;
+      openedReason?: RightPanelOpenIntentReason | null;
       closeable: true;
     };
 
 type PreviewRightPanelTab = Extract<RightPanelTab, { kind: "file" | "url" | "source" | "artifact" }>;
+type ThreadRightPanelTab = Extract<RightPanelTab, { kind: "thread" }>;
+
+export type RightPanelThreadOpenRequest = {
+  requestId: number;
+  projectId: string;
+  projectName: string;
+  chatId: string;
+  chatName: string;
+  threadId: string | null;
+  workspacePath: string | null;
+};
 
 type RemoteState<T> =
   | { status: "idle" | "loading"; data: T | null; error: string | null }
@@ -50,7 +72,7 @@ type RemoteState<T> =
 
 const builtInTabs: Array<RightPanelTab & { id: BuiltInTabId; kind: "builtIn" }> = [
   { id: "overview", kind: "builtIn", title: "Overview", closeable: true },
-  { id: "transcript", kind: "builtIn", title: "Transcript", closeable: true },
+  { id: "transcript", kind: "builtIn", title: "Voice", closeable: true },
   { id: "summary", kind: "builtIn", title: "Summary", closeable: true },
   { id: "activity", kind: "builtIn", title: "Activity", closeable: true },
   { id: "approvals", kind: "builtIn", title: "Approvals", closeable: true },
@@ -65,27 +87,37 @@ const tabsStorageKey = "codexVoice.rightPanel.tabs";
 const tabsStorageVersionKey = "codexVoice.rightPanel.tabsVersion";
 const tabsStorageVersion = "4";
 const activeTabStorageKey = "codexVoice.rightPanel.activeTab";
-const minPanelWidth = 320;
-const maxPanelWidth = 720;
 
 export function RightPanel({
   open,
   state,
   events,
-  width,
   activateTranscriptRequest,
-  onWidthChange,
+  openThreadRequest,
+  openIntent,
+  realtimeConnected,
+  realtimeConnecting,
+  realtimePaused,
+  realtimeAvailable,
   onClose,
   onAction,
+  onSendRealtimeInput,
+  resizer,
 }: {
   open: boolean;
   state: AppState;
   events: AppEvent[];
-  width: number;
   activateTranscriptRequest: number;
-  onWidthChange: (width: number) => void;
+  openThreadRequest: RightPanelThreadOpenRequest | null;
+  openIntent: RightPanelOpenIntent | null;
+  realtimeConnected: boolean;
+  realtimeConnecting: boolean;
+  realtimePaused: boolean;
+  realtimeAvailable: boolean;
   onClose: () => void;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
+  onSendRealtimeInput: (input: RealtimeUserInput) => Promise<void>;
+  resizer?: React.ReactNode;
 }): React.ReactElement {
   const [tabs, setTabs] = useState<RightPanelTab[]>(() => loadTabs());
   const [activeTabId, setActiveTabId] = useState<string>(() => loadActiveTabId());
@@ -106,7 +138,11 @@ export function RightPanel({
     data: null,
     error: null,
   });
+  const tabsViewportRef = useRef<HTMLDivElement | null>(null);
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const tabWheelFrameRef = useRef<number | null>(null);
+  const pendingTabWheelDeltaRef = useRef(0);
+  const handledIntentIdRef = useRef<string | null>(null);
   const activeProject = state.activeProject;
   const activeChat = useMemo(() => activeChatForState(state), [state]);
   const workspacePath = activeProject?.workspacePath ?? activeProject?.folderPath ?? null;
@@ -137,6 +173,24 @@ export function RightPanel({
   }, [activeTabId]);
 
   useEffect(() => {
+    return () => {
+      if (tabWheelFrameRef.current !== null) {
+        window.cancelAnimationFrame(tabWheelFrameRef.current);
+      }
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const activeTabNode = tabRefs.current.get(activeTabId);
+    (activeTabNode?.parentElement ?? activeTabNode)?.scrollIntoView({
+      block: "nearest",
+      inline: "center",
+      behavior: "smooth",
+    });
+  }, [activeTabId, open, tabs.length]);
+
+  useEffect(() => {
     if (!open || activateTranscriptRequest === 0) return;
     const transcriptTab = builtInTabs.find((tab) => tab.id === "transcript");
     if (!transcriptTab) return;
@@ -145,6 +199,17 @@ export function RightPanel({
     );
     setActiveTabId("transcript");
   }, [activateTranscriptRequest, open]);
+
+  useEffect(() => {
+    if (!openThreadRequest) return;
+    openThreadTab(openThreadRequest);
+  }, [openThreadRequest]);
+
+  useEffect(() => {
+    if (!openIntent || handledIntentIdRef.current === openIntent.id) return;
+    handledIntentIdRef.current = openIntent.id;
+    applyOpenIntent(openIntent);
+  }, [openIntent]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -221,22 +286,28 @@ export function RightPanel({
     }
   }
 
-  function openTab(tab: RightPanelTab): void {
+  function openTab(tab: RightPanelTab, options: { activate?: boolean } = {}): void {
+    const activate = options.activate ?? true;
     setTabs((current) => {
       const existing = current.find((candidate) => candidate.id === tab.id);
-      if (existing) return current;
+      if (existing) {
+        return current.map((candidate) => (candidate.id === tab.id ? mergeTab(candidate, tab) : candidate));
+      }
       return [...current, tab];
     });
-    setActiveTabId(tab.id);
+    if (activate) setActiveTabId(tab.id);
     setTabMenuOpen(false);
   }
 
-  function openBuiltInTab(id: BuiltInTabId): void {
+  function openBuiltInTab(id: BuiltInTabId, options: { activate?: boolean } = {}): void {
     const tab = builtInTabs.find((candidate) => candidate.id === id);
-    if (tab) openTab(tab);
+    if (tab) openTab(tab, options);
   }
 
-  function openArtifactTab(artifact: ThreadArtifactCandidate): void {
+  function openArtifactTab(
+    artifact: ThreadArtifactCandidate,
+    options: { activate?: boolean; openedBy?: string | null; openedReason?: RightPanelOpenIntentReason | null } = {},
+  ): void {
     openTab({
       id: artifactTabId(artifact, workspacePath),
       kind: artifact.kind === "url" ? "url" : "artifact",
@@ -247,11 +318,16 @@ export function RightPanel({
       workspacePath,
       mimeType: artifact.mimeType,
       raw: artifact.raw,
+      openedBy: options.openedBy ?? null,
+      openedReason: options.openedReason ?? null,
       closeable: true,
-    });
+    }, { activate: options.activate });
   }
 
-  function openSourceTab(source: ThreadSourceCandidate): void {
+  function openSourceTab(
+    source: ThreadSourceCandidate,
+    options: { activate?: boolean; openedBy?: string | null; openedReason?: RightPanelOpenIntentReason | null } = {},
+  ): void {
     openTab({
       id: sourceTabId(source, workspacePath),
       kind: source.url ? "url" : source.path ? "file" : "source",
@@ -261,7 +337,104 @@ export function RightPanel({
       url: source.url,
       workspacePath,
       raw: source.raw,
+      openedBy: options.openedBy ?? null,
+      openedReason: options.openedReason ?? null,
       closeable: true,
+    }, { activate: options.activate });
+  }
+
+  function openThreadTab(request: RightPanelThreadOpenRequest): void {
+    openTab(threadTabFromRequest(request));
+  }
+
+  function applyOpenIntent(intent: RightPanelOpenIntent): void {
+    const activate = intent.priority === "foreground";
+    if (intent.target.kind === "builtIn") {
+      openBuiltInTab(intent.target.tabId, { activate });
+      return;
+    }
+    if (intent.target.kind === "artifact") {
+      openArtifactTab(intent.target.artifact, {
+        activate,
+        openedBy: intent.label,
+        openedReason: intent.reason,
+      });
+      return;
+    }
+    if (intent.target.kind === "source") {
+      openSourceTab(intent.target.source, {
+        activate,
+        openedBy: intent.label,
+        openedReason: intent.reason,
+      });
+      return;
+    }
+    if (intent.target.kind === "url") {
+      openTab({
+        id: urlTabId(intent.target.url),
+        kind: "url",
+        title: intent.target.title ?? titleFromTarget(intent.target.url),
+        subtitle: intent.target.subtitle ?? intent.label,
+        url: intent.target.url,
+        workspacePath,
+        mimeType: intent.target.mimeType,
+        openedBy: intent.label,
+        openedReason: intent.reason,
+        closeable: true,
+      }, { activate });
+      return;
+    }
+    openTab({
+      id: fileTabId(intent.target.path, intent.target.workspacePath ?? workspacePath),
+      kind: "file",
+      title: intent.target.title ?? titleFromTarget(intent.target.path),
+      subtitle: intent.target.subtitle ?? intent.label,
+      path: intent.target.path,
+      workspacePath: intent.target.workspacePath ?? workspacePath,
+      mimeType: intent.target.mimeType,
+      openedBy: intent.label,
+      openedReason: intent.reason,
+      closeable: true,
+    }, { activate });
+  }
+
+  function navigatePreviewTab(tabId: string, target: { kind: "url"; url: string } | { kind: "file"; path: string }): void {
+    const existingTab = tabs.find((tab) => tab.id === tabId && isPreviewTab(tab)) as PreviewRightPanelTab | undefined;
+    const nextActiveId =
+      target.kind === "url"
+        ? urlTabId(target.url)
+        : fileTabId(target.path, existingTab?.workspacePath ?? workspacePath);
+    setTabs((current) =>
+      current.map((tab) => {
+        if (tab.id !== tabId || !isPreviewTab(tab)) return tab;
+        if (target.kind === "url") {
+          return {
+            ...tab,
+            id: nextActiveId,
+            kind: "url",
+            title: titleFromTarget(target.url),
+            subtitle: "URL preview",
+            url: target.url,
+            path: undefined,
+            openedBy: null,
+            openedReason: null,
+          };
+        }
+        return {
+          ...tab,
+          id: nextActiveId,
+          kind: "file",
+          title: titleFromTarget(target.path),
+          subtitle: "File preview",
+          path: target.path,
+          url: undefined,
+          openedBy: null,
+          openedReason: null,
+        };
+      }),
+    );
+    window.requestAnimationFrame(() => {
+      setActiveTabId(nextActiveId);
     });
   }
 
@@ -320,31 +493,22 @@ export function RightPanel({
     }
   }
 
-  function startResize(event: React.PointerEvent<HTMLDivElement>): void {
+  function handleTabsWheel(event: React.WheelEvent<HTMLDivElement>): void {
+    const node = event.currentTarget;
+    const maxScrollLeft = node.scrollWidth - node.clientWidth;
+    if (maxScrollLeft <= 0) return;
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    if (delta === 0) return;
+    const nextScrollLeft = node.scrollLeft + delta;
+    if ((delta < 0 && node.scrollLeft <= 0) || (delta > 0 && node.scrollLeft >= maxScrollLeft)) return;
     event.preventDefault();
-    const startX = event.clientX;
-    const startWidth = width;
-    const pointerId = event.pointerId;
-    event.currentTarget.setPointerCapture(pointerId);
-    const onMove = (moveEvent: PointerEvent) => {
-      onWidthChange(clamp(startWidth + startX - moveEvent.clientX, minPanelWidth, maxPanelWidth));
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }
-
-  function resizeWithKeyboard(event: React.KeyboardEvent<HTMLDivElement>): void {
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      onWidthChange(clamp(width + 24, minPanelWidth, maxPanelWidth));
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      onWidthChange(clamp(width - 24, minPanelWidth, maxPanelWidth));
-    }
+    pendingTabWheelDeltaRef.current += delta;
+    if (tabWheelFrameRef.current !== null) return;
+    tabWheelFrameRef.current = window.requestAnimationFrame(() => {
+      node.scrollLeft += pendingTabWheelDeltaRef.current;
+      pendingTabWheelDeltaRef.current = 0;
+      tabWheelFrameRef.current = null;
+    });
   }
 
   return (
@@ -354,26 +518,17 @@ export function RightPanel({
       inert={!open}
       aria-label="Codex right panel"
     >
-      <div
-        className="voice-right-resizer"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize right panel"
-        aria-valuemin={minPanelWidth}
-        aria-valuemax={maxPanelWidth}
-        aria-valuenow={Math.round(width)}
-        tabIndex={open ? 0 : -1}
-        onPointerDown={startResize}
-        onKeyDown={resizeWithKeyboard}
-      />
+      {resizer}
 
       <div className="voice-right-inner">
         <div className="voice-right-tabbar">
           <div
+            ref={tabsViewportRef}
             className="voice-right-tabs"
             role="tablist"
             aria-label="Right panel tabs"
             onKeyDown={handleTabListKeyDown}
+            onWheel={handleTabsWheel}
           >
             {tabs.map((tab) => (
               <div
@@ -397,7 +552,7 @@ export function RightPanel({
                   title="Drag to reorder"
                   onClick={() => setActiveTabId(tab.id)}
                 >
-                  <TabIcon kind={tab.kind} />
+                  <TabIcon tab={tab} />
                   <span>{tab.title}</span>
                 </button>
                 {tab.closeable && (
@@ -443,7 +598,7 @@ export function RightPanel({
         </div>
 
         <section
-          className={`voice-right-body ${activeTab?.id === "transcript" ? "transcript-active" : ""}`}
+          className={`voice-right-body ${isTranscriptTab(activeTab) ? "transcript-active" : ""}`}
           role="tabpanel"
           id={activeTab ? `voice-right-panel-${activeTab.id}` : undefined}
           aria-labelledby={activeTab ? `voice-right-tab-${activeTab.id}` : undefined}
@@ -465,10 +620,20 @@ export function RightPanel({
               transcriptMessages={transcriptState.data ?? []}
               gitState={gitState}
               workspacePath={workspacePath}
+              realtimeConnected={realtimeConnected}
+              realtimeConnecting={realtimeConnecting}
+              realtimePaused={realtimePaused}
+              realtimeAvailable={realtimeAvailable}
               onAction={onAction}
+              onSendRealtimeInput={async (input) => {
+                await onSendRealtimeInput(input);
+                await refreshTranscriptMessages();
+              }}
               onOpenArtifact={openArtifactTab}
               onOpenSource={openSourceTab}
+              onOpenThread={openThreadTab}
               onOpenBuiltIn={openBuiltInTab}
+              onNavigatePreview={navigatePreviewTab}
               onRefreshSummary={refreshSummary}
               onRefreshGit={refreshGit}
             />
@@ -488,10 +653,17 @@ function RightPanelTabContent({
   transcriptMessages,
   gitState,
   workspacePath,
+  realtimeConnected,
+  realtimeConnecting,
+  realtimePaused,
+  realtimeAvailable,
   onAction,
+  onSendRealtimeInput,
   onOpenArtifact,
   onOpenSource,
+  onOpenThread,
   onOpenBuiltIn,
+  onNavigatePreview,
   onRefreshSummary,
   onRefreshGit,
 }: {
@@ -503,15 +675,33 @@ function RightPanelTabContent({
   transcriptMessages: VoiceTranscriptMessage[];
   gitState: RemoteState<GitChangeSummary>;
   workspacePath: string | null;
+  realtimeConnected: boolean;
+  realtimeConnecting: boolean;
+  realtimePaused: boolean;
+  realtimeAvailable: boolean;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
+  onSendRealtimeInput: (input: RealtimeUserInput) => Promise<void>;
   onOpenArtifact: (artifact: ThreadArtifactCandidate) => void;
   onOpenSource: (source: ThreadSourceCandidate) => void;
+  onOpenThread: (request: RightPanelThreadOpenRequest) => void;
   onOpenBuiltIn: (tab: BuiltInTabId) => void;
+  onNavigatePreview: (tabId: string, target: { kind: "url"; url: string } | { kind: "file"; path: string }) => void;
   onRefreshSummary: () => Promise<void>;
   onRefreshGit: () => Promise<void>;
 }): React.ReactElement {
   if (tab.kind === "file" || tab.kind === "url" || tab.kind === "artifact" || tab.kind === "source") {
-    return <PreviewTab tab={tab} workspacePath={workspacePath} />;
+    return <PreviewTab tab={tab} workspacePath={workspacePath} onNavigate={onNavigatePreview} />;
+  }
+
+  if (tab.kind === "thread") {
+    return (
+      <ThreadTranscriptTab
+        tab={tab}
+        state={state}
+        events={events}
+        onAction={onAction}
+      />
+    );
   }
 
   if (tab.id === "overview") {
@@ -527,15 +717,20 @@ function RightPanelTabContent({
   }
   if (tab.id === "transcript") {
     return (
-      <div className="voice-right-transcript-tab">
-        <VoiceTranscriptContent
-          open
-          state={state}
-          events={events}
-          summary={summaryState.data}
-          messages={transcriptMessages}
-        />
-      </div>
+      <VoiceTranscriptTab
+        title="Voice transcript"
+        threadId={activeChat?.codexThreadId ?? null}
+        state={state}
+        events={events}
+        summary={summaryState.data}
+        messages={transcriptMessages}
+        realtimeConnected={realtimeConnected}
+        realtimeConnecting={realtimeConnecting}
+        realtimePaused={realtimePaused}
+        realtimeAvailable={realtimeAvailable}
+        onSendRealtimeInput={onSendRealtimeInput}
+        onAction={onAction}
+      />
     );
   }
   if (tab.id === "summary") {
@@ -554,7 +749,7 @@ function RightPanelTabContent({
   if (tab.id === "activity") return <ActivityTab events={events} state={state} />;
   if (tab.id === "approvals") return <ApprovalsTab requests={state.runtime.pendingRequests} onAction={onAction} />;
   if (tab.id === "last-output") return <LastOutputTab activeChat={activeChat} />;
-  if (tab.id === "chats") return <ChatsTab state={state} />;
+  if (tab.id === "chats") return <ChatsTab state={state} onOpenThread={onOpenThread} />;
   if (tab.id === "changes") return <ChangesTab gitState={gitState} onRefreshGit={onRefreshGit} />;
   return <RuntimeTab state={state} summaryState={summaryState} gitState={gitState} />;
 }
@@ -1006,7 +1201,314 @@ function LastOutputTab({ activeChat }: { activeChat: VoiceChat | null }): React.
   );
 }
 
-function ChatsTab({ state }: { state: AppState }): React.ReactElement {
+function VoiceTranscriptTab({
+  title,
+  threadId,
+  state,
+  events,
+  summary,
+  messages,
+  realtimeConnected = false,
+  realtimeConnecting = false,
+  realtimePaused = false,
+  realtimeAvailable = true,
+  context,
+  onSendRealtimeInput,
+  onAction,
+}: {
+  title: string;
+  threadId: string | null;
+  state: AppState;
+  events: AppEvent[];
+  summary: ActiveThreadSummary | null;
+  messages: VoiceTranscriptMessage[];
+  realtimeConnected?: boolean;
+  realtimeConnecting?: boolean;
+  realtimePaused?: boolean;
+  realtimeAvailable?: boolean;
+  context?: { chat: VoiceChat | null; chatId: string | null; threadId: string | null };
+  onSendRealtimeInput?: (input: RealtimeUserInput) => Promise<void>;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
+}): React.ReactElement {
+  return (
+    <div className="voice-right-transcript-tab">
+      <header className="voice-thread-tab-header">
+        <span>
+          <strong>{title}</strong>
+        </span>
+        <button
+          type="button"
+          className="voice-thread-open-codex"
+          aria-label="Open thread in Codex"
+          title={threadId ? "Open thread in Codex" : "No Codex thread id yet"}
+          disabled={!threadId}
+          onClick={() => {
+            if (!threadId) return;
+            void onAction(() => window.codexVoice.openCodexThreadInApp(threadId));
+          }}
+        >
+          <CodexAppMiniIcon />
+        </button>
+      </header>
+      <VoiceTranscriptContent
+        open
+        state={state}
+        events={events}
+        summary={summary}
+        messages={messages}
+        context={context}
+      />
+      {onSendRealtimeInput && (
+        <RealtimeComposer
+          connected={realtimeConnected}
+          connecting={realtimeConnecting}
+          paused={realtimePaused}
+          available={realtimeAvailable}
+          onSend={onSendRealtimeInput}
+        />
+      )}
+    </div>
+  );
+}
+
+function RealtimeComposer({
+  connected,
+  connecting,
+  paused,
+  available,
+  onSend,
+}: {
+  connected: boolean;
+  connecting: boolean;
+  paused: boolean;
+  available: boolean;
+  onSend: (input: RealtimeUserInput) => Promise<void>;
+}): React.ReactElement {
+  const [text, setText] = useState("");
+  const [attachments, setAttachments] = useState<RealtimeUserInput["attachments"]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [draggingImage, setDraggingImage] = useState(false);
+  const [sending, setSending] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const canSend = available && !sending && (text.trim().length > 0 || attachments.length > 0);
+  const composerLabel = !available
+    ? "Set up Realtime before sending. Drop images on this area to attach them."
+    : connected
+      ? "Message Realtime. Drop images on this area to attach them."
+      : "Message Realtime. Sending will start Realtime. Drop images on this area to attach them.";
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 124)}px`;
+  }, [text]);
+
+  async function addFiles(files: File[]): Promise<void> {
+    if (files.length === 0) return;
+    setError(null);
+    const result = await filesToRealtimeAttachments(files);
+    if (result.attachments.length > 0) {
+      setAttachments((current) => [...current, ...result.attachments].slice(0, 6));
+    }
+    if (result.rejected.length > 0) {
+      setError(result.rejected.map((item) => `${item.name}: ${item.reason}`).join(" "));
+    }
+  }
+
+  async function submit(event?: React.FormEvent): Promise<void> {
+    event?.preventDefault();
+    if (!available) {
+      setError("Set up Realtime before sending.");
+      return;
+    }
+    if (!text.trim() && attachments.length === 0) return;
+    setSending(true);
+    setError(null);
+    try {
+      await onSend({ text, attachments });
+      setText("");
+      setAttachments([]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <form
+      className={`voice-right-composer ${draggingImage ? "dragging" : ""}`}
+      aria-label={composerLabel}
+      onSubmit={(event) => void submit(event)}
+      onDragEnter={(event) => {
+        if (!dataTransferHasImage(event.dataTransfer)) return;
+        event.preventDefault();
+        setDraggingImage(true);
+      }}
+      onDragOver={(event) => {
+        if (!dataTransferHasImage(event.dataTransfer)) return;
+        event.preventDefault();
+        setDraggingImage(true);
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDraggingImage(false);
+      }}
+      onDrop={(event) => {
+        if (!dataTransferHasImage(event.dataTransfer)) return;
+        event.preventDefault();
+        setDraggingImage(false);
+        void addFiles(filesFromDataTransfer(event.dataTransfer));
+      }}
+    >
+      {attachments.length > 0 && (
+        <div className="voice-right-attachments" aria-label="Attached images">
+          {attachments.map((attachment) => (
+            <div key={attachment.id} className="voice-right-attachment">
+              <img src={attachment.dataUrl} alt="" />
+              <span>
+                <strong>{attachment.name}</strong>
+                <small>{formatAttachmentBytes(attachment.sizeBytes)}</small>
+              </span>
+              <button
+                type="button"
+                aria-label={`Remove ${attachment.name}`}
+                onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}
+              >
+                <CloseSmallIcon />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="voice-right-composer-row">
+        <textarea
+          ref={textareaRef}
+          value={text}
+          rows={1}
+          disabled={!available || sending}
+          placeholder={available ? "Message Realtime" : "Set up Realtime"}
+          onChange={(event) => setText(event.target.value)}
+          onPaste={(event) => {
+            const files = filesFromClipboard(event.clipboardData);
+            if (files.some((file) => file.type.startsWith("image/"))) {
+              void addFiles(files);
+            }
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              void submit();
+            }
+          }}
+        />
+        <button type="submit" className="voice-right-send-button" disabled={!canSend} aria-label="Send to Realtime">
+          <SendMiniIcon />
+        </button>
+      </div>
+      {(error || paused || (connecting && !sending)) && (
+        <div className="voice-right-composer-status" aria-live="polite">
+          {error ? <span className="error">{error}</span> : <span>{connecting ? "Connecting Realtime" : "Voice paused"}</span>}
+        </div>
+      )}
+    </form>
+  );
+}
+
+function ThreadTranscriptTab({
+  tab,
+  state,
+  events,
+  onAction,
+}: {
+  tab: ThreadRightPanelTab;
+  state: AppState;
+  events: AppEvent[];
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
+}): React.ReactElement {
+  const [summaryState, setSummaryState] = useState<RemoteState<ActiveThreadSummary>>({
+    status: "idle",
+    data: null,
+    error: null,
+  });
+  const [messagesState, setMessagesState] = useState<RemoteState<VoiceTranscriptMessage[]>>({
+    status: "idle",
+    data: null,
+    error: null,
+  });
+  const chat = findChatForThreadTab(state, tab);
+  const liveEvents = isActiveThreadTab(state, tab) ? events : [];
+  const context = useMemo(
+    () => ({ chat, chatId: tab.chatId, threadId: tab.threadId }),
+    [chat, tab.chatId, tab.threadId],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setSummaryState((current) => ({ status: "loading", data: current.data, error: null }));
+    void window.codexVoice
+      .getActiveThreadSummary(tab.chatId)
+      .then((data) => {
+        if (!cancelled) setSummaryState({ status: "ready", data, error: null });
+      })
+      .catch((caught) => {
+        if (!cancelled) setSummaryState({ status: "error", data: null, error: errorMessage(caught) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab.chatId, tab.threadId, chat?.lastTurnOutput?.turnId, chat?.updatedAt, state.runtime.status]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMessagesState((current) => ({ status: "loading", data: current.data, error: null }));
+    void window.codexVoice
+      .getTranscriptMessages(tab.chatId)
+      .then((data) => {
+        if (!cancelled) setMessagesState({ status: "ready", data, error: null });
+      })
+      .catch((caught) => {
+        if (!cancelled) setMessagesState({ status: "error", data: null, error: errorMessage(caught) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab.chatId, chat?.updatedAt, state.runtime.status]);
+
+  if (summaryState.status === "loading" && messagesState.status === "loading" && !summaryState.data && !messagesState.data) {
+    return <RightPanelLoading title={`Opening ${tab.title}`} />;
+  }
+
+  if (summaryState.status === "error" && messagesState.status === "error") {
+    return (
+      <RightPanelEmpty
+        title="Thread unavailable"
+        detail={summaryState.error ?? messagesState.error ?? "Could not load this thread."}
+      />
+    );
+  }
+
+  return (
+    <VoiceTranscriptTab
+      title={tab.title}
+      threadId={tab.threadId}
+      state={state}
+      events={liveEvents}
+      summary={summaryState.data}
+      messages={messagesState.data ?? []}
+      context={context}
+      onAction={onAction}
+    />
+  );
+}
+
+function ChatsTab({
+  state,
+  onOpenThread,
+}: {
+  state: AppState;
+  onOpenThread: (request: RightPanelThreadOpenRequest) => void;
+}): React.ReactElement {
   const project = state.activeProject;
   if (!project) {
     return <RightPanelEmpty title="No chats yet" detail="Create or resume a project and its chats will appear here." />;
@@ -1025,7 +1527,7 @@ function ChatsTab({ state }: { state: AppState }): React.ReactElement {
                 key={chat.id}
                 type="button"
                 className={`voice-right-row ${active ? "selected" : ""}`}
-                onClick={() => void window.codexVoice.switchChat(chat.id, project.id)}
+                onClick={() => onOpenThread(threadOpenRequestFromChat(project, chat))}
               >
                 <StatusDot status={runtime?.activeTurnId ? "in_progress" : runtime?.pendingRequests.length ? "pending" : "unknown"} />
                 <span>
@@ -1163,13 +1665,27 @@ function RuntimeTab({
   );
 }
 
-function PreviewTab({ tab, workspacePath }: { tab: PreviewRightPanelTab; workspacePath: string | null }): React.ReactElement {
+function PreviewTab({
+  tab,
+  workspacePath,
+  onNavigate,
+}: {
+  tab: PreviewRightPanelTab;
+  workspacePath: string | null;
+  onNavigate: (tabId: string, target: { kind: "url"; url: string } | { kind: "file"; path: string }) => void;
+}): React.ReactElement {
   const [preview, setPreview] = useState<RemoteState<RightPanelPreviewResult>>({
     status: "idle",
     data: null,
     error: null,
   });
+  const [address, setAddress] = useState(tab.url ?? tab.path ?? "");
+  const [reloadKey, setReloadKey] = useState(0);
   const previewWorkspacePath = tab.workspacePath ?? workspacePath;
+
+  useEffect(() => {
+    setAddress(tab.url ?? tab.path ?? "");
+  }, [tab.path, tab.url]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1189,7 +1705,7 @@ function PreviewTab({ tab, workspacePath }: { tab: PreviewRightPanelTab; workspa
     return () => {
       cancelled = true;
     };
-  }, [tab.id, tab.path, tab.url, previewWorkspacePath]);
+  }, [tab.id, tab.path, tab.url, previewWorkspacePath, reloadKey]);
 
   if (preview.status === "loading" && !preview.data) return <RightPanelLoading title={`Loading ${tab.title}`} />;
   if (preview.status === "error") {
@@ -1205,10 +1721,31 @@ function PreviewTab({ tab, workspacePath }: { tab: PreviewRightPanelTab; workspa
     if (tab.path) return window.codexVoice.openRightPanelTarget({ kind: "file", path: tab.path, workspacePath: previewWorkspacePath });
     return Promise.resolve();
   };
+  const navigate = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const target = normalizePreviewAddress(address);
+    if (!target) return;
+    onNavigate(tab.id, target);
+  };
 
   return (
     <div className="voice-right-stack">
       <section className="voice-right-section preview-section">
+        <form className="voice-right-browser-bar" onSubmit={navigate}>
+          <button type="button" aria-label="Reload preview" title="Reload preview" onClick={() => setReloadKey((value) => value + 1)}>
+            <ReloadMiniIcon />
+          </button>
+          <input
+            value={address}
+            onChange={(event) => setAddress(event.target.value)}
+            aria-label="Preview address"
+            placeholder="Path or local URL"
+          />
+          <button type="submit" aria-label="Open address" title="Open address">
+            <ChevronMini />
+          </button>
+        </form>
+        {tab.openedBy && <div className="voice-right-attention-line">{tab.openedBy}</div>}
         <SectionHeader
           title={data.title}
           detail={data.subtitle ?? data.mimeType ?? null}
@@ -1228,6 +1765,7 @@ function PreviewTab({ tab, workspacePath }: { tab: PreviewRightPanelTab; workspa
           </div>
         ) : data.kind === "iframe" && data.url ? (
           <iframe
+            key={`${data.url}:${reloadKey}`}
             className="voice-right-url-preview"
             title={data.title}
             src={data.url}
@@ -1358,7 +1896,7 @@ function loadTabs(): RightPanelTab[] {
     if (window.localStorage.getItem(tabsStorageVersionKey) !== tabsStorageVersion) {
       return defaultTabs;
     }
-    const parsed = JSON.parse(window.localStorage.getItem(tabsStorageKey) ?? "null") as RightPanelTab[] | null;
+    const parsed = JSON.parse(window.localStorage.getItem(tabsStorageKey) ?? "null") as unknown;
     if (Array.isArray(parsed) && parsed.length > 0) {
       const normalized = parsed
         .map(normalizeStoredTab)
@@ -1371,15 +1909,49 @@ function loadTabs(): RightPanelTab[] {
   return defaultTabs;
 }
 
-function normalizeStoredTab(tab: RightPanelTab): RightPanelTab | null {
+function normalizeStoredTab(tab: unknown): RightPanelTab | null {
   if (!tab || typeof tab !== "object") return null;
-  if (tab.kind === "builtIn") {
-    return builtInTabs.find((candidate) => candidate.id === tab.id) ?? null;
+  const record = tab as Record<string, unknown>;
+  if (record.kind === "builtIn") {
+    return builtInTabs.find((candidate) => candidate.id === record.id) ?? null;
+  }
+  if (record.kind === "thread") {
+    const projectId = typeof record.projectId === "string" ? record.projectId : "";
+    const chatId = typeof record.chatId === "string" ? record.chatId : "";
+    if (!projectId || !chatId) return null;
+    return {
+      id: typeof record.id === "string" ? record.id : threadTabId(chatId),
+      kind: "thread",
+      title: typeof record.title === "string" && record.title ? record.title : "Voice thread",
+      subtitle: typeof record.subtitle === "string" ? record.subtitle : null,
+      projectId,
+      chatId,
+      threadId: typeof record.threadId === "string" ? record.threadId : null,
+      workspacePath: typeof record.workspacePath === "string" ? record.workspacePath : null,
+      closeable: true,
+    };
+  }
+  if (
+    record.kind !== "file" &&
+    record.kind !== "url" &&
+    record.kind !== "source" &&
+    record.kind !== "artifact"
+  ) {
+    return null;
   }
   return {
-    ...tab,
+    ...(record as unknown as PreviewRightPanelTab),
     closeable: true,
   };
+}
+
+function mergeTab(existing: RightPanelTab, incoming: RightPanelTab): RightPanelTab {
+  if (existing.kind === "builtIn" || incoming.kind === "builtIn") return existing;
+  return {
+    ...existing,
+    ...incoming,
+    closeable: true,
+  } as RightPanelTab;
 }
 
 function persistTabs(tabs: RightPanelTab[]): void {
@@ -1433,6 +2005,59 @@ function activeChatForState(state: AppState): VoiceChat | null {
   );
 }
 
+function threadOpenRequestFromChat(project: NonNullable<AppState["activeProject"]>, chat: VoiceChat): RightPanelThreadOpenRequest {
+  return {
+    requestId: Date.now(),
+    projectId: project.id,
+    projectName: project.displayName,
+    chatId: chat.id,
+    chatName: chat.displayName,
+    threadId: chat.codexThreadId,
+    workspacePath: project.workspacePath ?? project.folderPath ?? null,
+  };
+}
+
+function threadTabFromRequest(request: RightPanelThreadOpenRequest): ThreadRightPanelTab {
+  return {
+    id: threadTabId(request.chatId),
+    kind: "thread",
+    title: request.chatName || "Voice thread",
+    subtitle: request.projectName,
+    projectId: request.projectId,
+    chatId: request.chatId,
+    threadId: request.threadId,
+    workspacePath: request.workspacePath,
+    closeable: true,
+  };
+}
+
+function threadTabId(chatId: string): string {
+  return `thread:${chatId}`;
+}
+
+function findChatForThreadTab(state: AppState, tab: ThreadRightPanelTab): VoiceChat | null {
+  const project =
+    state.projects.find((candidate) => candidate.id === tab.projectId) ??
+    state.activeProject ??
+    null;
+  return project?.chats.find((chat) => chat.id === tab.chatId && !chat.archivedAt) ?? null;
+}
+
+function isActiveThreadTab(state: AppState, tab: ThreadRightPanelTab): boolean {
+  const activeChat = activeChatForState(state);
+  if (state.runtime.activeChatId && state.runtime.activeChatId === tab.chatId) return true;
+  if (activeChat?.id === tab.chatId) return true;
+  return Boolean(tab.threadId && activeChat?.codexThreadId === tab.threadId);
+}
+
+function isTranscriptTab(tab: RightPanelTab | null): boolean {
+  return tab?.id === "transcript" || tab?.kind === "thread";
+}
+
+function isPreviewTab(tab: RightPanelTab): tab is PreviewRightPanelTab {
+  return tab.kind === "file" || tab.kind === "url" || tab.kind === "artifact" || tab.kind === "source";
+}
+
 function fallbackQuestions(request: PendingCodexRequest): PendingRequestQuestion[] {
   const raw = request.raw as { params?: { questions?: unknown }; raw?: { params?: { questions?: unknown } } };
   const value = raw.params?.questions ?? raw.raw?.params?.questions;
@@ -1471,6 +2096,14 @@ function sourceTabId(source: ThreadSourceCandidate, workspacePath: string | null
   return `source:${previewTabScopeKey(source.path, source.url, source.id, workspacePath)}`;
 }
 
+function fileTabId(filePath: string, workspacePath: string | null): string {
+  return `file:${previewTabScopeKey(filePath, undefined, filePath, workspacePath)}`;
+}
+
+function urlTabId(url: string): string {
+  return `url:${url}`;
+}
+
 function previewTabScopeKey(
   targetPath: string | undefined,
   targetUrl: string | undefined,
@@ -1503,6 +2136,25 @@ function firstLine(text: string): string {
   return text.trim().split(/\r?\n/).find(Boolean)?.slice(0, 180) ?? "";
 }
 
+function titleFromTarget(value: string): string {
+  try {
+    const url = new URL(value);
+    return url.pathname.split("/").filter(Boolean).pop() || url.hostname || value;
+  } catch {
+    return value.split(/[\\/]/).filter(Boolean).pop() ?? value;
+  }
+}
+
+function normalizePreviewAddress(value: string): { kind: "url"; url: string } | { kind: "file"; path: string } | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed) || /^file:\/\//i.test(trimmed)) return { kind: "url", url: trimmed };
+  if (/^[\w.-]+(:\d+)?(\/.*)?$/i.test(trimmed) && (trimmed.includes("localhost") || trimmed.startsWith("127.0.0.1"))) {
+    return { kind: "url", url: `http://${trimmed}` };
+  }
+  return { kind: "file", path: trimmed };
+}
+
 function stripCodeFenceLanguage(value: string): string {
   return value.replace(/^[A-Za-z0-9_-]+\n/, "").trim();
 }
@@ -1519,17 +2171,14 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function TabIcon({ kind }: { kind: RightPanelTab["kind"] }): React.ReactElement {
-  if (kind === "file" || kind === "artifact") return <FileMiniIcon />;
-  if (kind === "url" || kind === "source") return <LinkMiniIcon />;
+function TabIcon({ tab }: { tab: RightPanelTab }): React.ReactElement {
+  if (tab.kind === "thread" || (tab.kind === "builtIn" && tab.id === "transcript")) return <VoiceMiniIcon />;
+  if (tab.kind === "file" || tab.kind === "artifact") return <FileMiniIcon />;
+  if (tab.kind === "url" || tab.kind === "source") return <LinkMiniIcon />;
   return <PanelIcon />;
 }
 
@@ -1578,6 +2227,23 @@ function ChevronMini(): React.ReactElement {
   );
 }
 
+function SendMiniIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4.5 19.5 20 12 4.5 4.5l2 6.5L13 12l-6.5 1z" />
+    </svg>
+  );
+}
+
+function ReloadMiniIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M18.5 8.5A7 7 0 1 0 19 15" />
+      <path d="M18.5 4.5v4h-4" />
+    </svg>
+  );
+}
+
 function FileMiniIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1611,6 +2277,27 @@ function ToolMiniIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M14.5 5.5a4.5 4.5 0 0 0 4 6.9l-6.1 6.1a2.4 2.4 0 0 1-3.4-3.4l6.1-6.1a4.5 4.5 0 0 0-.6-3.5Z" />
+    </svg>
+  );
+}
+
+function VoiceMiniIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M6.5 10.5v3" />
+      <path d="M10.15 7.5v9" />
+      <path d="M13.85 5.5v13" />
+      <path d="M17.5 9.25v5.5" />
+    </svg>
+  );
+}
+
+function CodexAppMiniIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="5" y="5" width="14" height="14" rx="3" />
+      <path d="M9 15 15 9" />
+      <path d="M9 9h6v6" />
     </svg>
   );
 }

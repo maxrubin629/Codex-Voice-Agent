@@ -45,6 +45,19 @@ export OPENAI_REALTIME_VOICE=marin
 export OPENAI_REALTIME_REASONING_EFFORT=low
 ```
 
+Optional web search settings:
+
+```sh
+export EXA_API_KEY=your-exa-api-key
+export EXA_WEB_SEARCH_TYPE=instant
+export EXA_WEB_SEARCH_NUM_RESULTS=5
+```
+
+Voice web search uses Exa retrieval and returns titles, URLs, and extractive
+highlights to the Realtime model. It does not call a second OpenAI model to
+write a separate search answer. You can also save the Exa key from onboarding
+or Settings > General > Web search.
+
 The app also exposes a Realtime model selector in Settings, with
 `gpt-realtime-2` and `gpt-realtime-1.5` available. GPT Realtime 2 is the default
 and supports minimal, low, medium, high, or xhigh reasoning effort for voice

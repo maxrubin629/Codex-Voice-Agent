@@ -12,6 +12,9 @@ import type {
   CodexChatRuntime,
   CodexModelSummary,
   CodexPermissionMode,
+  CodexProjectTarget,
+  CodexProjectThreadRuntime,
+  CodexThreadTarget,
   VoiceChat,
   CodexSettings,
   CodexSettingsScope,
@@ -20,6 +23,9 @@ import type {
   CodexThreadTokenUsage,
   CodexTurnOutput,
   CodexRuntimeState,
+  CreateCodexThreadArgs,
+  DispatchCodexTaskArgs,
+  ListCodexThreadsArgs,
   PendingRequestDetail,
   PendingRequestQuestion,
   PendingRequestQuestionOption,
@@ -48,7 +54,7 @@ import {
 } from "../shared/types";
 import { transcriptMessageFromEvent } from "../shared/transcriptMessages";
 import { CodexBridge, type CodexJsonMessage } from "./codexBridge";
-import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
+import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings, webSearchConfig } from "./realtime";
 import { ProjectStore } from "./projectStore";
 
 type TurnWaiter = {
@@ -132,6 +138,11 @@ type VoiceToolContext = {
   permissionProfile: unknown | null;
 };
 
+type ProjectResolutionOptions = {
+  createIfMissing: boolean;
+  defaultToActive: boolean;
+};
+
 export class VoiceCodexOrchestrator extends EventEmitter {
   private activeProjectId: string | null = null;
   private showProjectChatsFlag = false;
@@ -207,6 +218,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       runtime: this.runtimeState(activeProject, projects),
       codexSettings: this.codexSettings(activeProject),
       realtime: realtimeConfig(),
+      webSearch: webSearchConfig(),
     };
   }
 
@@ -242,6 +254,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     }
 
     const updated = await this.store.updateProject(activeProject.id, {
+      displayName: path.basename(resolvedWorkspacePath) || activeProject.displayName,
+      displayNameSource: "workspace",
       workspacePath: resolvedWorkspacePath,
       lastStatus: `Workspace: ${resolvedWorkspacePath}`,
     });
@@ -279,6 +293,32 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       ? `Recovered project chat: ${resumed.chat.displayName}`
       : `Resumed project: ${updated.displayName}`;
     this.emitEvent("app", "projectResumed", `Resumed project "${updated.displayName}".`, updated);
+    this.emitState();
+    return updated;
+  }
+
+  async renameProject(projectId: string, name: string): Promise<VoiceProject> {
+    const displayName = name.trim();
+    if (!displayName) throw new Error("Project name is required.");
+    const updated = await this.store.updateProject(projectId, {
+      displayName,
+      displayNameSource: "custom",
+      lastStatus: `Renamed project: ${displayName}`,
+    });
+    this.status = `Renamed project: ${displayName}`;
+    this.emitEvent("app", "projectRenamed", this.status, updated);
+    this.emitState();
+    return updated;
+  }
+
+  async removeProject(projectId: string): Promise<VoiceProject> {
+    const updated = await this.store.archiveProject(projectId);
+    if (this.activeProjectId === projectId) {
+      this.activeProjectId = null;
+      this.showProjectChatsFlag = false;
+    }
+    this.status = `Removed project from app: ${updated.displayName}`;
+    this.emitEvent("app", "projectRemoved", this.status, updated);
     this.emitState();
     return updated;
   }
@@ -335,6 +375,36 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return updated;
   }
 
+  async renameChat(chatId: string, name: string, projectId?: string): Promise<VoiceProject> {
+    const displayName = name.trim();
+    if (!displayName) throw new Error("Chat name is required.");
+    const project = projectId ? await this.requireProject(projectId) : await this.requireProjectForChat(chatId);
+    const chat = project.chats.find((candidate) => candidate.id === chatId);
+    if (!chat) throw new Error(`Unknown chat: ${chatId}`);
+
+    const updated = await this.store.updateChat(project.id, chat.id, { displayName });
+    this.status = `Renamed chat: ${displayName}`;
+    this.emitEvent("app", "chatRenamed", this.status, { projectId: project.id, chatId: chat.id });
+    this.emitState();
+    return updated;
+  }
+
+  async removeChat(chatId: string, projectId?: string): Promise<VoiceProject> {
+    const project = projectId ? await this.requireProject(projectId) : await this.requireProjectForChat(chatId);
+    const chat = project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt);
+    if (!chat) throw new Error(`Unknown chat: ${chatId}`);
+
+    const updated = await this.store.archiveChat(project.id, chat.id);
+    if (this.activeProjectId === project.id) {
+      this.activeProjectId = updated.id;
+      this.showProjectChatsFlag = Boolean(updated.activeChatId);
+    }
+    this.status = `Removed thread from app: ${chat.displayName}`;
+    this.emitEvent("app", "chatRemoved", this.status, { projectId: project.id, chatId: chat.id });
+    this.emitState();
+    return updated;
+  }
+
   async archiveChat(chatId: string, projectId?: string): Promise<VoiceProject> {
     const project = projectId ? await this.requireProject(projectId) : await this.requireProjectForChat(chatId);
     const chat = project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt);
@@ -378,6 +448,66 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
+  async createThread(args: CreateCodexThreadArgs): Promise<VoiceProject> {
+    const displayName = args.name.trim();
+    if (!displayName) throw new Error("Thread name is required.");
+    const project = await this.resolveProjectTarget(args.project, displayName, {
+      createIfMissing: Boolean(args.project?.createIfMissing || args.project?.workspacePath),
+      defaultToActive: true,
+    });
+    if (!args.forceNew) {
+      const existing = this.findChatByName(project, displayName);
+      if (existing) {
+        const switched = await this.switchChat(existing.id, project.id);
+        this.status = `Using existing thread: ${existing.displayName}`;
+        this.emitState();
+        return switched;
+      }
+    }
+    const updated = await this.startChatThread(project, displayName);
+    this.activeProjectId = updated.id;
+    this.showProjectChatsFlag = true;
+    this.status = `Created thread: ${displayName}`;
+    this.emitEvent("app", "chatCreated", `Created thread "${displayName}".`, activeChatForProject(updated));
+    this.emitState();
+    return updated;
+  }
+
+  async listProjectThreads(args: ListCodexThreadsArgs = {}): Promise<CodexProjectThreadRuntime[]> {
+    const projects = args.project
+      ? [await this.resolveProjectTarget(args.project, "Project", { createIfMissing: false, defaultToActive: true })]
+      : await this.store.listProjects();
+    return projects.map((project) => this.projectThreadRuntime(project));
+  }
+
+  async getAllThreadStatus(args: ListCodexThreadsArgs = {}): Promise<CodexProjectThreadRuntime[]> {
+    return this.listProjectThreads(args);
+  }
+
+  async dispatchCodexTask(args: DispatchCodexTaskArgs): Promise<CodexActionResult> {
+    const request = args.request.trim();
+    if (!request) throw new Error("Cannot dispatch an empty request to Codex.");
+
+    const threadTarget = args.thread ?? null;
+    const targetProjectFromThread =
+      !args.project && threadTarget ? await this.findProjectForThreadTarget(threadTarget) : null;
+    const project =
+      targetProjectFromThread ??
+      (await this.resolveProjectTarget(args.project, titleFromText(request), {
+        createIfMissing: args.project?.createIfMissing !== false,
+        defaultToActive: true,
+      }));
+    const threadName =
+      threadTarget?.newChatName?.trim() ||
+      threadTarget?.chatName?.trim() ||
+      titleFromText(request);
+    const context = await this.resolveThreadTarget(project, threadTarget, threadName);
+    const text = args.context?.trim()
+      ? `${request}\n\nVoice conversation context:\n${args.context.trim()}`
+      : request;
+    return this.startCodexTurn(context, text);
+  }
+
   async sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult> {
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Cannot send an empty request to Codex.");
@@ -402,6 +532,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     } else {
       context = await this.requireChatContextForPrompt(trimmed, chatId);
     }
+    return this.startCodexTurn(context, trimmed);
+  }
+
+  private async startCodexTurn(context: ChatContext, trimmed: string): Promise<CodexActionResult> {
     const { project, chat } = await this.resumeChatThread(context.project, context.chat);
     if (!chat.codexThreadId) throw new Error("Active chat is missing a Codex thread id.");
 
@@ -443,6 +577,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     });
     this.emitEvent("app", "turnStarted", `Sent request to "${chat.displayName}".`, { turnId, chatId: chat.id, text: trimmed });
     this.emitState();
+    const updatedChat = updated.chats.find((candidate) => candidate.id === chat.id) ?? null;
     return {
       kind: "turn",
       message: `Codex started with ${this.describeModelEffort(
@@ -451,8 +586,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         turnSettings.serviceTier,
       )}.`,
       turnId,
+      projectHandle: projectHandle(updated),
+      threadHandle: updatedChat ? threadHandle(updated, updatedChat) : null,
       project: updated,
-      chat: updated.chats.find((candidate) => candidate.id === chat.id) ?? null,
+      chat: updatedChat,
     };
   }
 
@@ -1061,6 +1198,196 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     );
   }
 
+  private async findProjectForChatName(name: string): Promise<VoiceProject> {
+    const matches: Array<{ project: VoiceProject; chat: VoiceChat }> = [];
+    for (const project of await this.store.listProjects()) {
+      const chat = this.findChatByName(project, name);
+      if (chat) matches.push({ project, chat });
+    }
+    if (matches.length === 1) {
+      this.activeProjectId = matches[0].project.id;
+      return matches[0].project;
+    }
+    if (matches.length > 1) throw new Error(`More than one thread matched "${name}" across projects.`);
+    throw new Error(`No thread matched "${name}".`);
+  }
+
+  private async findProjectForThreadTarget(target: CodexThreadTarget): Promise<VoiceProject | null> {
+    if (target.chatId?.trim()) return this.requireProjectForChat(target.chatId.trim());
+    const threadHandle = target.threadHandle?.trim();
+    if (threadHandle) {
+      const matches: Array<{ project: VoiceProject; chat: VoiceChat }> = [];
+      for (const project of await this.store.listProjects()) {
+        const chat = this.findChatByHandle(project, threadHandle);
+        if (chat) matches.push({ project, chat });
+      }
+      if (matches.length === 1) {
+        this.activeProjectId = matches[0].project.id;
+        return matches[0].project;
+      }
+      if (matches.length > 1) throw new Error(`More than one thread matched handle "${threadHandle}" across projects.`);
+      return null;
+    }
+    if (target.chatName?.trim()) return this.findProjectForChatName(target.chatName.trim());
+    return null;
+  }
+
+  private async resolveProjectTarget(
+    target: CodexProjectTarget | null | undefined,
+    fallbackName: string,
+    options: ProjectResolutionOptions,
+  ): Promise<VoiceProject> {
+    const projectId = target?.projectId?.trim();
+    if (projectId) {
+      const project = await this.store.getProject(projectId);
+      if (!project) throw new Error(`Unknown project: ${projectId}`);
+      this.activeProjectId = project.id;
+      return project;
+    }
+
+    const workspacePath = await resolveWorkspacePathInput(target?.workspacePath);
+    if (workspacePath) {
+      const existing = (await this.store.listProjects()).find((project) =>
+        samePath(projectWorkspacePath(project), workspacePath),
+      );
+      if (existing) {
+        this.activeProjectId = existing.id;
+        return existing;
+      }
+      if (options.createIfMissing || target?.createIfMissing) {
+        return this.createProject(target?.projectName?.trim() || path.basename(workspacePath), workspacePath);
+      }
+      throw new Error(`No project is bound to workspace path: ${workspacePath}`);
+    }
+
+    const projectHandleTarget = target?.projectHandle?.trim();
+    if (projectHandleTarget) {
+      const match = this.findProjectByHandle(await this.store.listProjects(), projectHandleTarget);
+      if (match) {
+        this.activeProjectId = match.id;
+        return match;
+      }
+      if (options.createIfMissing || target?.createIfMissing) {
+        return this.createProject(titleFromHandle(projectHandleTarget));
+      }
+      throw new Error(`No project matched handle "${projectHandleTarget}".`);
+    }
+
+    const projectName = target?.projectName?.trim();
+    if (projectName) {
+      const match = this.findProjectByName(await this.store.listProjects(), projectName);
+      if (match) {
+        this.activeProjectId = match.id;
+        return match;
+      }
+      if (options.createIfMissing || target?.createIfMissing) {
+        return this.createProject(projectName);
+      }
+      throw new Error(`No project matched "${projectName}".`);
+    }
+
+    if (options.defaultToActive && this.activeProjectId) {
+      return this.requireProject();
+    }
+    if (options.createIfMissing) {
+      return this.createProject(fallbackName);
+    }
+    throw new Error("No project target was supplied.");
+  }
+
+  private async resolveThreadTarget(
+    project: VoiceProject,
+    target: CodexThreadTarget | null | undefined,
+    fallbackName: string,
+  ): Promise<ChatContext> {
+    const chatId = target?.chatId?.trim();
+    if (chatId) {
+      const chat = project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt);
+      if (!chat) throw new Error(`Project "${project.displayName}" does not contain thread: ${chatId}`);
+      return { project, chat };
+    }
+
+    const threadHandle = target?.threadHandle?.trim();
+    if (!target?.forceNew && threadHandle) {
+      const existing = this.findChatByHandle(project, threadHandle);
+      if (existing) return { project, chat: existing };
+      if (target?.createIfMissing === false) {
+        throw new Error(`No thread matched handle "${threadHandle}" in project "${project.displayName}".`);
+      }
+    }
+
+    const requestedName =
+      target?.chatName?.trim() ||
+      target?.newChatName?.trim() ||
+      (threadHandle ? titleFromHandle(threadHandle) : "");
+    if (!target?.forceNew && requestedName) {
+      const existing = this.findChatByName(project, requestedName);
+      if (existing) return { project, chat: existing };
+      if (target?.createIfMissing !== false) {
+        const updated = await this.startChatThread(project, requestedName);
+        return this.requireActiveChatContextFromProject(updated);
+      }
+      throw new Error(`No thread matched "${requestedName}" in project "${project.displayName}".`);
+    }
+
+    if (target?.forceNew || target?.createIfMissing) {
+      const updated = await this.startChatThread(project, requestedName || fallbackName);
+      return this.requireActiveChatContextFromProject(updated);
+    }
+
+    const existing = activeChatForProject(project);
+    if (existing) return { project, chat: existing };
+
+    const updated = await this.startChatThread(project, fallbackName);
+    return this.requireActiveChatContextFromProject(updated);
+  }
+
+  private findProjectByHandle(projects: VoiceProject[], handle: string): VoiceProject | null {
+    const normalized = normalizeHandlePath(handle);
+    const exact = projects.filter((project) => projectHandle(project) === normalized);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) throw new Error(`More than one project matched handle "${handle}".`);
+    return null;
+  }
+
+  private findProjectByName(projects: VoiceProject[], name: string): VoiceProject | null {
+    const needle = normalizeLookupText(name);
+    const exact = projects.filter((project) => projectLookupNames(project).some((candidate) => candidate === needle));
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) throw new Error(`More than one project matched "${name}".`);
+    const partial = projects.filter((project) => projectLookupNames(project).some((candidate) => candidate.includes(needle)));
+    if (partial.length === 1) return partial[0];
+    if (partial.length > 1) throw new Error(`More than one project matched "${name}".`);
+    return null;
+  }
+
+  private findChatByHandle(project: VoiceProject, handle: string): VoiceChat | null {
+    const normalized = normalizeHandlePath(handle);
+    const projectPrefix = `${projectHandle(project)}/`;
+    const threadOnly = normalized.startsWith(projectPrefix) ? normalized.slice(projectPrefix.length) : normalized;
+    const chats = project.chats.filter((chat) => !chat.archivedAt);
+    const exact = chats.filter((chat) => {
+      const fullHandle = threadHandle(project, chat);
+      const chatHandle = threadHandleSegment(chat);
+      return fullHandle === normalized || chatHandle === threadOnly || chat.id === handle || chat.codexThreadId === handle;
+    });
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) throw new Error(`More than one thread matched handle "${handle}" in project "${project.displayName}".`);
+    return null;
+  }
+
+  private findChatByName(project: VoiceProject, name: string): VoiceChat | null {
+    const needle = normalizeLookupText(name);
+    const chats = project.chats.filter((chat) => !chat.archivedAt);
+    const exact = chats.filter((chat) => normalizeLookupText(chat.displayName) === needle || chat.id === name);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) throw new Error(`More than one thread matched "${name}".`);
+    const partial = chats.filter((chat) => normalizeLookupText(chat.displayName).includes(needle));
+    if (partial.length === 1) return partial[0];
+    if (partial.length > 1) throw new Error(`More than one thread matched "${name}".`);
+    return null;
+  }
+
   private async projectForWorkspace(displayName: string, workspacePath: string): Promise<VoiceProject> {
     const projects = await this.store.listProjects();
     const existing = projects.find((project) => samePath(projectWorkspacePath(project), workspacePath));
@@ -1440,7 +1767,19 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       tokenUsage: activeThreadId ? this.tokenUsageByThread.get(activeThreadId) ?? null : null,
       pendingRequests: this.runtimePendingRequests(activeProject, chatRuntimes, projects),
       chats: chatRuntimes,
+      projectThreads: projects.map((project) => this.projectThreadRuntime(project)),
       showProjectChats: this.showProjectChatsFlag,
+    };
+  }
+
+  private projectThreadRuntime(project: VoiceProject): CodexProjectThreadRuntime {
+    return {
+      projectId: project.id,
+      projectHandle: projectHandle(project),
+      projectName: project.displayName,
+      workspacePath: projectWorkspacePath(project),
+      activeChatId: project.activeChatId,
+      chats: this.chatRuntimeStates(project),
     };
   }
 
@@ -1461,6 +1800,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       const activeTurnId = threadId ? this.activeTurnByThread.get(threadId) ?? null : null;
       return {
         chatId: chat.id,
+        handle: threadHandle(project, chat),
+        projectHandle: projectHandle(project),
         threadId,
         displayName: chat.displayName,
         activeTurnId,
@@ -1503,7 +1844,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       return {
         ...request,
         projectId: stored?.project.id ?? activeProject?.id,
+        projectHandle: stored?.project ? projectHandle(stored.project) : runtime?.projectHandle,
         chatId: runtime?.chatId ?? stored?.chat.id,
+        threadHandle: stored ? threadHandle(stored.project, stored.chat) : runtime?.handle,
         projectName: stored?.project.displayName,
         chatName: runtime?.displayName ?? stored?.chat.displayName,
       };
@@ -1942,7 +2285,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.status = message.split("\n")[0] || "Native slash command handled.";
     this.emitEvent("app", "slashCommand", message);
     this.emitState();
-    return { kind: "command", message, turnId: null, project: project, chat: project ? activeChatForProject(project) : null };
+    const chat = project ? activeChatForProject(project) : null;
+    return {
+      kind: "command",
+      message,
+      turnId: null,
+      projectHandle: project ? projectHandle(project) : null,
+      threadHandle: project && chat ? threadHandle(project, chat) : null,
+      project,
+      chat,
+    };
   }
 
   private currentSettingsText(activeProject: VoiceProject | null): string {
@@ -3526,6 +3878,70 @@ function activeChatForProject(project: VoiceProject): VoiceChat | null {
 
 function titleFromText(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 48) || "Voice Project";
+}
+
+function titleFromHandle(handle: string): string {
+  const lastSegment = handle.split("/").filter(Boolean).pop() ?? handle;
+  return (
+    lastSegment
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/\b\w/g, (letter) => letter.toUpperCase()) || "Codex Thread"
+  );
+}
+
+function normalizeLookupText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeHandlePath(value: string): string {
+  return value
+    .split("/")
+    .map((segment) => handleSegment(segment))
+    .filter(Boolean)
+    .join("/");
+}
+
+function handleSegment(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_{2,}/g, "_");
+}
+
+function projectHandle(project: VoiceProject): string {
+  return (
+    handleSegment(path.basename(projectWorkspacePath(project))) ||
+    handleSegment(project.displayName) ||
+    handleSegment(project.id) ||
+    "project"
+  );
+}
+
+function threadHandleSegment(chat: VoiceChat): string {
+  return handleSegment(chat.displayName) || handleSegment(chat.id) || "thread";
+}
+
+function threadHandle(project: VoiceProject, chat: VoiceChat): string {
+  return `${projectHandle(project)}/${threadHandleSegment(chat)}`;
+}
+
+function projectLookupNames(project: VoiceProject): string[] {
+  return [
+    project.id,
+    project.displayName,
+    path.basename(projectWorkspacePath(project)),
+    path.basename(project.folderPath),
+    projectHandle(project),
+  ]
+    .map((candidate) => normalizeLookupText(candidate))
+    .filter(Boolean);
 }
 
 function parseSlashInput(text: string): { command: string; args: string[]; rest: string } {

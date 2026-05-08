@@ -6,6 +6,8 @@ type ApiKeyFile = {
   version: 1;
   openAiApiKey?: string | null;
   openAiApiKeyEncoding?: "safeStorage" | "plain";
+  exaApiKey?: string | null;
+  exaApiKeyEncoding?: "safeStorage" | "plain";
   updatedAt?: string;
 };
 
@@ -15,22 +17,18 @@ export type ApiKeyStatus = {
   encrypted: boolean;
 };
 
+export type ApiKeySecretView = {
+  value: string;
+  source: "environment" | "saved";
+  encrypted: boolean;
+};
+
 const FILE_NAME = "codex-voice-secrets.json";
 
 export function getOpenAiApiKey(): string | null {
   if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
   const saved = readFile();
-  if (!saved.openAiApiKey) return null;
-
-  if (saved.openAiApiKeyEncoding === "safeStorage") {
-    try {
-      return safeStorage.decryptString(Buffer.from(saved.openAiApiKey, "base64"));
-    } catch {
-      return null;
-    }
-  }
-
-  return saved.openAiApiKey;
+  return decodeSavedSecret(saved.openAiApiKey, saved.openAiApiKeyEncoding);
 }
 
 export function getOpenAiApiKeyStatus(): ApiKeyStatus {
@@ -38,18 +36,11 @@ export function getOpenAiApiKeyStatus(): ApiKeyStatus {
     return { configured: true, source: "environment", encrypted: false };
   }
   const saved = readFile();
-  if (saved.openAiApiKeyEncoding === "safeStorage" && saved.openAiApiKey) {
-    try {
-      safeStorage.decryptString(Buffer.from(saved.openAiApiKey, "base64"));
-    } catch {
-      return { configured: false, source: null, encrypted: true };
-    }
-  }
-  return {
-    configured: Boolean(saved.openAiApiKey),
-    source: saved.openAiApiKey ? "saved" : null,
-    encrypted: saved.openAiApiKeyEncoding === "safeStorage",
-  };
+  return savedSecretStatus(saved.openAiApiKey, saved.openAiApiKeyEncoding);
+}
+
+export function revealOpenAiApiKey(): ApiKeySecretView {
+  return revealSecret(getOpenAiApiKey(), getOpenAiApiKeyStatus(), "OpenAI API key");
 }
 
 export function saveOpenAiApiKey(apiKey: string): ApiKeyStatus {
@@ -59,13 +50,13 @@ export function saveOpenAiApiKey(apiKey: string): ApiKeyStatus {
     return getOpenAiApiKeyStatus();
   }
 
-  const encrypted = safeStorage.isEncryptionAvailable();
+  const current = readFile();
+  const secret = encodeSecret(trimmed);
   const file: ApiKeyFile = {
+    ...current,
     version: 1,
-    openAiApiKey: encrypted
-      ? safeStorage.encryptString(trimmed).toString("base64")
-      : trimmed,
-    openAiApiKeyEncoding: encrypted ? "safeStorage" : "plain",
+    openAiApiKey: secret.value,
+    openAiApiKeyEncoding: secret.encoding,
     updatedAt: new Date().toISOString(),
   };
   writeFile(file);
@@ -73,8 +64,52 @@ export function saveOpenAiApiKey(apiKey: string): ApiKeyStatus {
 }
 
 export function clearOpenAiApiKey(): ApiKeyStatus {
-  writeFile({ version: 1, openAiApiKey: null, openAiApiKeyEncoding: undefined });
+  const current = readFile();
+  writeFile({ ...current, version: 1, openAiApiKey: null, openAiApiKeyEncoding: undefined });
   return getOpenAiApiKeyStatus();
+}
+
+export function getExaApiKey(): string | null {
+  if (process.env.EXA_API_KEY) return process.env.EXA_API_KEY;
+  const saved = readFile();
+  return decodeSavedSecret(saved.exaApiKey, saved.exaApiKeyEncoding);
+}
+
+export function getExaApiKeyStatus(): ApiKeyStatus {
+  if (process.env.EXA_API_KEY) {
+    return { configured: true, source: "environment", encrypted: false };
+  }
+  const saved = readFile();
+  return savedSecretStatus(saved.exaApiKey, saved.exaApiKeyEncoding);
+}
+
+export function revealExaApiKey(): ApiKeySecretView {
+  return revealSecret(getExaApiKey(), getExaApiKeyStatus(), "Exa API key");
+}
+
+export function saveExaApiKey(apiKey: string): ApiKeyStatus {
+  const trimmed = apiKey.trim();
+  if (!trimmed) {
+    clearExaApiKey();
+    return getExaApiKeyStatus();
+  }
+
+  const current = readFile();
+  const secret = encodeSecret(trimmed);
+  writeFile({
+    ...current,
+    version: 1,
+    exaApiKey: secret.value,
+    exaApiKeyEncoding: secret.encoding,
+    updatedAt: new Date().toISOString(),
+  });
+  return getExaApiKeyStatus();
+}
+
+export function clearExaApiKey(): ApiKeyStatus {
+  const current = readFile();
+  writeFile({ ...current, version: 1, exaApiKey: null, exaApiKeyEncoding: undefined });
+  return getExaApiKeyStatus();
 }
 
 function secretsPath(): string {
@@ -95,4 +130,60 @@ function writeFile(file: ApiKeyFile): void {
   const filePath = secretsPath();
   mkdirSync(path.dirname(filePath), { recursive: true });
   writeFileSync(filePath, JSON.stringify(file, null, 2), { mode: 0o600 });
+}
+
+function encodeSecret(value: string): { value: string; encoding: "safeStorage" | "plain" } {
+  const encrypted = safeStorage.isEncryptionAvailable();
+  return {
+    value: encrypted ? safeStorage.encryptString(value).toString("base64") : value,
+    encoding: encrypted ? "safeStorage" : "plain",
+  };
+}
+
+function decodeSavedSecret(
+  value: string | null | undefined,
+  encoding: "safeStorage" | "plain" | undefined,
+): string | null {
+  if (!value) return null;
+  if (encoding === "safeStorage") {
+    try {
+      return safeStorage.decryptString(Buffer.from(value, "base64"));
+    } catch {
+      return null;
+    }
+  }
+  return value;
+}
+
+function savedSecretStatus(
+  value: string | null | undefined,
+  encoding: "safeStorage" | "plain" | undefined,
+): ApiKeyStatus {
+  if (encoding === "safeStorage" && value) {
+    try {
+      safeStorage.decryptString(Buffer.from(value, "base64"));
+    } catch {
+      return { configured: false, source: null, encrypted: true };
+    }
+  }
+  return {
+    configured: Boolean(value),
+    source: value ? "saved" : null,
+    encrypted: encoding === "safeStorage",
+  };
+}
+
+function revealSecret(
+  value: string | null,
+  status: ApiKeyStatus,
+  label: string,
+): ApiKeySecretView {
+  if (!value || !status.configured || !status.source) {
+    throw new Error(`${label} is not configured.`);
+  }
+  return {
+    value,
+    source: status.source,
+    encrypted: status.encrypted,
+  };
 }

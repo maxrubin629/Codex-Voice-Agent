@@ -3,9 +3,15 @@ import type {
   ApprovalDecision,
   AppState,
   CodexPermissionMode,
+  CodexProjectTarget,
   CodexSettingsScope,
+  CodexThreadTarget,
   CodexTurnOutput,
+  DispatchCodexTaskArgs,
   PendingCodexRequest,
+  RealtimeUserAttachment,
+  RealtimeUserAttachmentMetadata,
+  RealtimeUserInput,
   ToolQuestionAnswer,
   VoiceChat,
   VoiceTranscriptMessage,
@@ -58,8 +64,10 @@ export class RealtimeVoiceClient {
   private outputSamples: Uint8Array<ArrayBuffer> | null = null;
   private outputLevelFrame: number | null = null;
   private smoothedOutputLevel = 0;
+  private lastAudibleOutputAtMs = 0;
   private isPaused = false;
   private realtimeEpoch = 0;
+  private pendingResponseCreates = 0;
   private trackedResponses = new Map<string, TrackedRealtimeResponse>();
   private functionCallsByCallId = new Map<string, TrackedFunctionCall>();
   private functionCallsByItemId = new Map<string, TrackedFunctionCall>();
@@ -74,10 +82,22 @@ export class RealtimeVoiceClient {
     return this.isPaused;
   }
 
+  private isCurrentConnection(epoch: number, pc: RTCPeerConnection, dc?: RTCDataChannel): boolean {
+    return this.realtimeEpoch === epoch && this.pc === pc && (!dc || this.dc === dc);
+  }
+
+  private assertCurrentConnection(epoch: number, pc?: RTCPeerConnection): void {
+    if (this.realtimeEpoch !== epoch || (pc && this.pc !== pc)) {
+      throw new Error("Realtime connection was cancelled.");
+    }
+  }
+
   async connect(): Promise<void> {
     if (this.pc) return;
+    const epoch = this.realtimeEpoch;
     this.callbacks.onConnectionChange(false, "Creating Realtime session.");
     const secret = await window.codexVoice.createRealtimeClientSecret();
+    this.assertCurrentConnection(epoch);
 
     const pc = new RTCPeerConnection();
     const audioEl = document.createElement("audio");
@@ -85,6 +105,7 @@ export class RealtimeVoiceClient {
     this.audioEl = audioEl;
     audioEl.autoplay = true;
     pc.ontrack = (event) => {
+      if (this.pc !== pc || this.realtimeEpoch !== epoch) return;
       const [remoteStream] = event.streams;
       audioEl.srcObject = remoteStream;
       if (remoteStream) this.setupOutputAnalyser(remoteStream);
@@ -92,12 +113,17 @@ export class RealtimeVoiceClient {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!this.isCurrentConnection(epoch, pc)) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("Realtime connection was cancelled.");
+      }
       this.localStream = stream;
       pc.addTrack(stream.getAudioTracks()[0], stream);
 
       const dc = pc.createDataChannel("oai-events");
       this.dc = dc;
       dc.addEventListener("open", () => {
+        if (!this.isCurrentConnection(epoch, pc, dc)) return;
         this.setPaused(false);
         this.callbacks.onConnectionChange(
           true,
@@ -107,13 +133,16 @@ export class RealtimeVoiceClient {
         void this.injectTranscriptHistoryContext();
       });
       dc.addEventListener("close", () => {
+        if (!this.isCurrentConnection(epoch, pc, dc)) return;
         this.callbacks.onConnectionChange(false, "Realtime data channel closed.");
         this.log("connection", "Realtime data channel closed.");
       });
       dc.addEventListener("message", (event) => this.handleMessage(event));
 
       const offer = await pc.createOffer();
+      this.assertCurrentConnection(epoch, pc);
       await pc.setLocalDescription(offer);
+      this.assertCurrentConnection(epoch, pc);
 
       const response = await fetch("https://api.openai.com/v1/realtime/calls", {
         method: "POST",
@@ -129,17 +158,23 @@ export class RealtimeVoiceClient {
         throw new Error(`Realtime WebRTC connection failed: ${response.status} ${text}`);
       }
 
+      const answerSdp = await response.text();
+      this.assertCurrentConnection(epoch, pc);
       await pc.setRemoteDescription({
         type: "answer",
-        sdp: await response.text(),
+        sdp: answerSdp,
       });
+      this.assertCurrentConnection(epoch, pc);
     } catch (error) {
-      this.disconnect();
+      if (this.realtimeEpoch === epoch) {
+        this.disconnect();
+      }
       throw error;
     }
   }
 
   disconnect(): void {
+    const hadConnection = Boolean(this.pc || this.dc || this.localStream || this.audioEl);
     this.realtimeEpoch += 1;
     this.trackedResponses.clear();
     this.functionCallsByCallId.clear();
@@ -153,7 +188,9 @@ export class RealtimeVoiceClient {
     this.audioEl = null;
     this.teardownOutputAnalyser();
     this.isPaused = false;
-    this.callbacks.onConnectionChange(false, "Realtime disconnected.");
+    if (hadConnection) {
+      this.callbacks.onConnectionChange(false, "Realtime disconnected.");
+    }
   }
 
   setPaused(paused: boolean): void {
@@ -181,6 +218,54 @@ export class RealtimeVoiceClient {
         instructions: `Briefly tell the user this Codex status update in natural spoken English: ${JSON.stringify(
           message,
         )}`,
+      },
+    });
+  }
+
+  sendUserInput(input: RealtimeUserInput): void {
+    const text = input.text.trim();
+    const attachments = input.attachments ?? [];
+    if (!text && attachments.length === 0) {
+      throw new Error("Message or image is required.");
+    }
+
+    this.interruptActiveResponse(
+      "userInput",
+      "Interrupted active Realtime response for new user text input.",
+      { text, attachmentCount: attachments.length },
+    );
+    const content: Array<Record<string, unknown>> = [];
+    if (text) {
+      content.push({
+        type: "input_text",
+        text,
+      });
+    }
+    for (const attachment of attachments) {
+      content.push({
+        type: "input_image",
+        image_url: attachment.dataUrl,
+      });
+    }
+
+    this.send({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content,
+      },
+    });
+    this.log("userInput", userInputLogMessage(text, attachments), {
+      type: "conversation.item.create",
+      userInputId: `user-input-${Date.now()}`,
+      text,
+      attachments: attachments.map(sanitizeAttachmentForLog),
+    });
+    this.send({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
       },
     });
   }
@@ -302,6 +387,11 @@ export class RealtimeVoiceClient {
       return;
     }
 
+    if (payload.type === "input_audio_buffer.speech_stopped") {
+      this.log("userSpeechStopped", "User speech stopped.", payload);
+      return;
+    }
+
     if (payload.type === "response.output_audio_transcript.delta" && payload.delta) {
       this.log("voiceDelta", payload.delta, payload);
       return;
@@ -317,6 +407,11 @@ export class RealtimeVoiceClient {
       return;
     }
 
+    if (payload.type === "conversation.item.input_audio_transcription.failed") {
+      this.log("userTranscriptFailed", payload.error?.message ?? "User transcription failed.", payload);
+      return;
+    }
+
     if (payload.type === "response.output_audio_transcript.done" && payload.transcript) {
       this.log("assistantTranscript", payload.transcript, payload);
       return;
@@ -324,7 +419,23 @@ export class RealtimeVoiceClient {
 
     if (payload.type === "response.created") {
       const responseId = stringValue(payload.response?.id);
-      if (responseId) this.ensureTrackedResponse(responseId);
+      if (this.pendingResponseCreates > 0) this.pendingResponseCreates -= 1;
+      if (responseId) {
+        const record = this.ensureTrackedResponse(responseId);
+        record.status = stringValue(payload.response?.status) ?? record.status ?? "in_progress";
+      }
+    }
+
+    if (payload.type === "response.cancelled") {
+      if (this.pendingResponseCreates > 0) this.pendingResponseCreates -= 1;
+      const responseId = stringValue(payload.response_id) ?? stringValue(payload.response?.id);
+      const record = responseId ? this.trackedResponses.get(responseId) : null;
+      if (record) {
+        record.status = "cancelled";
+        this.skipFunctionCalls(record, "Realtime response was cancelled.");
+      }
+      this.log("response.cancelled", "Realtime response cancelled.", payload);
+      return;
     }
 
     if (payload.type === "response.output_item.added") {
@@ -400,6 +511,31 @@ export class RealtimeVoiceClient {
     };
     this.trackedResponses.set(responseId, record);
     return record;
+  }
+
+  private interruptActiveResponse(kind: string, message: string, raw?: unknown): void {
+    const shouldCancelResponse = this.hasInterruptibleResponse();
+    this.invalidatePendingToolCalls(kind, raw);
+    if (!shouldCancelResponse) return;
+
+    this.send({ type: "response.cancel" });
+    if (this.hasRecentOutputPlayback()) {
+      this.send({ type: "output_audio_buffer.clear" });
+    }
+    this.callbacks.onOutputLevel?.(0);
+    this.log("responseInterrupted", message, raw);
+  }
+
+  private hasInterruptibleResponse(): boolean {
+    if (this.pendingResponseCreates > 0) return true;
+    for (const record of this.trackedResponses.values()) {
+      if (!isTerminalRealtimeResponseStatus(record.status)) return true;
+    }
+    return false;
+  }
+
+  private hasRecentOutputPlayback(): boolean {
+    return Date.now() - this.lastAudibleOutputAtMs < 1_500;
   }
 
   private upsertFunctionCall(responseId: string | undefined, item: FunctionCallItem): TrackedFunctionCall | null {
@@ -629,6 +765,9 @@ export class RealtimeVoiceClient {
       throw new Error("Realtime data channel is not open.");
     }
     this.dc.send(JSON.stringify(payload));
+    if (outgoingEventType(payload) === "response.create") {
+      this.pendingResponseCreates += 1;
+    }
   }
 
   private setupOutputAnalyser(stream: MediaStream): void {
@@ -696,6 +835,9 @@ export class RealtimeVoiceClient {
       const rawLevel = Math.max(0, Math.min(1, (rms - 0.012) / 0.16));
       const smoothing = rawLevel > this.smoothedOutputLevel ? 0.36 : 0.12;
       this.smoothedOutputLevel += (rawLevel - this.smoothedOutputLevel) * smoothing;
+      if (rawLevel > 0.018 || this.smoothedOutputLevel > 0.03) {
+        this.lastAudibleOutputAtMs = Date.now();
+      }
       this.callbacks.onOutputLevel?.(this.isPaused ? 0 : this.smoothedOutputLevel);
       this.outputLevelFrame = window.requestAnimationFrame(tick);
     };
@@ -722,7 +864,7 @@ async function callVoiceTool(
   if (name === "submit_to_codex") {
     const request = stringArg(args.request);
     const context = optionalString(args.context);
-    const chatId = await resolveChatId(optionalString(args.chatId), optionalString(args.chatName));
+    const chatId = await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle));
     const result = await window.codexVoice.sendToCodex(
       context ? `${request}\n\nVoice conversation context:\n${context}` : request,
       chatId,
@@ -732,31 +874,69 @@ async function callVoiceTool(
       ok: true,
       message: result.message,
       turnId: result.turnId,
+      projectHandle: result.projectHandle,
+      threadHandle: result.threadHandle,
       project: result.project,
       chat: result.chat,
+      thread: result.chat,
+    };
+  }
+
+  if (name === "dispatch_codex_task") {
+    const request = stringArg(args.request);
+    const task: DispatchCodexTaskArgs = {
+      request,
+      context: optionalString(args.context),
+      project: projectTargetFromArgs(args),
+      thread: threadTargetFromArgs(args),
+    };
+    const result = await window.codexVoice.dispatchCodexTask(task);
+    return {
+      ok: true,
+      message: result.message,
+      turnId: result.turnId,
+      projectHandle: result.projectHandle,
+      threadHandle: result.threadHandle,
+      project: result.project,
+      chat: result.chat,
+      thread: result.chat,
     };
   }
 
   if (name === "steer_codex") {
+    const project = projectTargetFromArgs(args);
+    const chatId = project
+      ? (await resolveChatIdInProject(project, optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle), true)) ??
+        (await resolveActiveChatIdInProject(project))
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle));
     const result = await window.codexVoice.steerCodex(
       stringArg(args.message),
-      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
+      chatId,
     );
     return { ok: true, message: "Codex received the update.", ...result };
   }
 
   if (name === "interrupt_codex") {
-    await window.codexVoice.interruptCodex(await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)));
+    const project = projectTargetFromArgs(args);
+    const chatId = project
+      ? (await resolveChatIdInProject(project, optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle), true)) ??
+        (await resolveActiveChatIdInProject(project))
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle));
+    await window.codexVoice.interruptCodex(
+      chatId,
+    );
     return { ok: true, message: "Codex interruption was requested." };
   }
 
   if (name === "get_codex_status") {
     const state = await window.codexVoice.getState();
     const activeProject = state.activeProject;
+    const activeThread = activeProject ? activeChat(visibleChats(activeProject.chats), activeProject.activeChatId) : null;
     return {
       ok: true,
       activeProject,
-      activeChat: activeProject ? activeChat(visibleChats(activeProject.chats), activeProject.activeChatId) : null,
+      activeThread,
+      activeChat: activeThread,
       runtime: state.runtime,
       codexSettings: state.codexSettings,
     };
@@ -866,40 +1046,73 @@ async function callVoiceTool(
     return { ok: true, project };
   }
 
-  if (name === "create_new_codex_chat") {
-    const project = await window.codexVoice.createChat(stringArg(args.name));
-    return { ok: true, message: `Created chat ${stringArg(args.name)}.`, project, activeChat: activeChat(visibleChats(project.chats), project.activeChatId) };
+  if (name === "create_new_codex_thread" || name === "create_new_codex_chat") {
+    const project = await window.codexVoice.createThread({
+      name: stringArg(args.name),
+      context: optionalString(args.context),
+      project: projectTargetFromArgs(args, "createProjectIfMissing"),
+      forceNew: optionalBoolean(args.forceNew),
+    });
+    const activeThread = activeChat(visibleChats(project.chats), project.activeChatId);
+    return { ok: true, message: `Created thread ${stringArg(args.name)}.`, project, activeThread, activeChat: activeThread };
   }
 
-  if (name === "list_codex_chats") {
+  if (name === "list_codex_threads" || name === "list_codex_chats") {
+    if (optionalBoolean(args.allProjects) || projectTargetFromArgs(args)) {
+      const projects = await window.codexVoice.listProjectThreads({ project: projectTargetFromArgs(args) });
+      return { ok: true, projects };
+    }
     const state = await window.codexVoice.getState();
     const activeProject = state.activeProject;
     return {
       ok: true,
       activeChatId: state.runtime.activeChatId,
+      threads: visibleChats(activeProject?.chats ?? []),
       chats: visibleChats(activeProject?.chats ?? []),
       statuses: state.runtime.chats,
     };
   }
 
-  if (name === "switch_codex_chat") {
-    const chatId = await resolveChatId(optionalString(args.chatId), optionalString(args.name));
-    if (!chatId) throw new Error("No chat matched that request.");
-    const project = await window.codexVoice.switchChat(chatId);
-    return { ok: true, message: "Switched active chat.", project, activeChat: activeChat(visibleChats(project.chats), project.activeChatId) };
+  if (name === "get_all_codex_thread_status") {
+    const projects = await window.codexVoice.getAllThreadStatus({ project: projectTargetFromArgs(args) });
+    return { ok: true, projects };
   }
 
-  if (name === "get_codex_chat_status") {
-    const chatId = await resolveChatId(optionalString(args.chatId), optionalString(args.name), true);
+  if (name === "switch_codex_thread" || name === "switch_codex_chat") {
+    const targetProject = projectTargetFromArgs(args);
+    const chatId = targetProject
+      ? await resolveChatIdInProject(targetProject, optionalString(args.chatId), optionalString(args.name), optionalString(args.threadHandle))
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.name), optionalString(args.threadHandle));
+    if (!chatId) throw new Error("No thread matched that request.");
+    const project = await window.codexVoice.switchChat(chatId);
+    const activeThread = activeChat(visibleChats(project.chats), project.activeChatId);
+    return { ok: true, message: "Switched active thread.", project, activeThread, activeChat: activeThread };
+  }
+
+  if (name === "get_codex_thread_status" || name === "get_codex_chat_status") {
+    const project = projectTargetFromArgs(args);
+    if (project && !optionalString(args.chatId) && !optionalString(args.name) && !optionalString(args.threadHandle)) {
+      const projects = await window.codexVoice.getAllThreadStatus({ project });
+      return { ok: true, projects };
+    }
+    const chatId = project
+      ? await resolveChatIdInProject(project, optionalString(args.chatId), optionalString(args.name), optionalString(args.threadHandle), true)
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.name), optionalString(args.threadHandle), true);
     const statuses = await window.codexVoice.getChatStatus(chatId);
     return { ok: true, statuses };
   }
 
-  if (name === "show_open_codex_chats") {
+  if (name === "show_open_codex_threads" || name === "show_open_codex_chats") {
     await window.codexVoice.showProjectChats(true);
     const state = await window.codexVoice.getState();
     const activeProject = state.activeProject;
-    return { ok: true, message: "Showing open chats.", chats: visibleChats(activeProject?.chats ?? []), statuses: state.runtime.chats };
+    return {
+      ok: true,
+      message: "Showing open threads.",
+      threads: visibleChats(activeProject?.chats ?? []),
+      chats: visibleChats(activeProject?.chats ?? []),
+      statuses: state.runtime.chats,
+    };
   }
 
   if (name === "list_recent_codex_projects") {
@@ -915,22 +1128,62 @@ async function callVoiceTool(
         workspacePath: project.workspacePath,
         lastSummary: project.lastSummary,
         activeChatId: project.activeChatId,
+        projectHandle: state.runtime.projectThreads.find((runtime) => runtime.projectId === project.id)?.projectHandle,
         chats: visibleChats(project.chats),
+        threads: state.runtime.projectThreads.find((runtime) => runtime.projectId === project.id)?.chats ?? [],
       })),
     };
   }
 
   if (name === "continue_codex_project") {
     const state = await window.codexVoice.getState();
-    const projectId = optionalString(args.projectId) || state.projects[0]?.id;
+    const projectId = (await resolveProjectId(projectTargetFromArgs(args))) || state.projects[0]?.id;
     if (!projectId) throw new Error("No recent Codex voice projects exist yet.");
     const project = await window.codexVoice.resumeProject(projectId);
     return { ok: true, project };
   }
 
   if (name === "summarize_recent_project") {
-    const summary = await window.codexVoice.summarizeProject(optionalString(args.projectId), await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true));
+    const projectId = await resolveProjectId(projectTargetFromArgs(args));
+    const chatId = projectId
+      ? await resolveChatIdInProject({ projectId }, optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle), true)
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle), true);
+    const summary = await window.codexVoice.summarizeProject(projectId, chatId);
     return { ok: true, summary };
+  }
+
+  if (name === "rename_codex_project") {
+    const projectId = await resolveProjectId(projectTargetFromArgs(args));
+    if (!projectId) throw new Error("Project target is required.");
+    const project = await window.codexVoice.renameProject(projectId, stringArg(args.name));
+    return { ok: true, project };
+  }
+
+  if (name === "rename_codex_thread") {
+    const project = projectTargetFromArgs(args);
+    const chatId = project
+      ? await resolveChatIdInProject(project, optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle))
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle));
+    if (!chatId) throw new Error("Thread target is required.");
+    const updated = await window.codexVoice.renameChat(chatId, stringArg(args.name));
+    return { ok: true, project: updated };
+  }
+
+  if (name === "remove_codex_project") {
+    const projectId = await resolveProjectId(projectTargetFromArgs(args));
+    if (!projectId) throw new Error("Project target is required.");
+    const project = await window.codexVoice.removeProject(projectId);
+    return { ok: true, project };
+  }
+
+  if (name === "remove_codex_thread") {
+    const project = projectTargetFromArgs(args);
+    const chatId = project
+      ? await resolveChatIdInProject(project, optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle))
+      : await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), optionalString(args.threadHandle));
+    if (!chatId) throw new Error("Thread target is required.");
+    const updated = await window.codexVoice.removeChat(chatId);
+    return { ok: true, project: updated };
   }
 
   throw new Error(`Unknown Realtime tool: ${name}`);
@@ -948,7 +1201,7 @@ async function cancelStaleVoiceTool(name: string, output: unknown): Promise<void
     return;
   }
 
-  if (name === "submit_to_codex" && typeof result?.turnId === "string") {
+  if ((name === "submit_to_codex" || name === "dispatch_codex_task") && typeof result?.turnId === "string") {
     const chatId = typeof result.chat?.id === "string" ? result.chat.id : undefined;
     await window.codexVoice.interruptCodex(chatId);
   }
@@ -965,6 +1218,21 @@ function safeJson(raw: string | undefined): Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function outgoingEventType(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  return stringValue((payload as { type?: unknown }).type);
+}
+
+function isTerminalRealtimeResponseStatus(status: string | undefined): boolean {
+  return (
+    status === "completed" ||
+    status === "cancelled" ||
+    status === "canceled" ||
+    status === "failed" ||
+    status === "incomplete"
+  );
 }
 
 function stringArg(value: unknown): string {
@@ -993,16 +1261,121 @@ function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-async function resolveChatId(
+function recordArg(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function projectTargetFromArgs(
+  args: Record<string, unknown>,
+  createFlagName = "createIfMissing",
+): CodexProjectTarget | undefined {
+  const nested = recordArg(args.project);
+  const projectId = optionalString(nested?.projectId ?? args.projectId);
+  const projectHandle = optionalString(nested?.projectHandle ?? args.projectHandle);
+  const projectName = optionalString(nested?.projectName ?? args.projectName);
+  const workspacePath = optionalString(nested?.workspacePath ?? args.workspacePath);
+  const createIfMissing = optionalBoolean(nested?.createIfMissing ?? args[createFlagName]);
+  if (!projectId && !projectHandle && !projectName && !workspacePath && createIfMissing === undefined) return undefined;
+  return { projectId, projectHandle, projectName, workspacePath, createIfMissing };
+}
+
+function threadTargetFromArgs(args: Record<string, unknown>): CodexThreadTarget | undefined {
+  const nested = recordArg(args.thread);
+  const chatId = optionalString(nested?.chatId ?? args.chatId);
+  const threadHandle = optionalString(nested?.threadHandle ?? args.threadHandle);
+  const chatName = optionalString(nested?.chatName ?? args.chatName ?? args.name);
+  const newChatName = optionalString(nested?.newChatName ?? args.newChatName);
+  const createIfMissing = optionalBoolean(nested?.createIfMissing ?? args.createThreadIfMissing);
+  const forceNew = optionalBoolean(nested?.forceNew ?? args.forceNew);
+  if (!chatId && !threadHandle && !chatName && !newChatName && createIfMissing === undefined && forceNew === undefined) {
+    return undefined;
+  }
+  return { chatId, threadHandle, chatName, newChatName, createIfMissing, forceNew };
+}
+
+async function resolveProjectId(project: CodexProjectTarget | undefined): Promise<string | undefined> {
+  if (!project) return undefined;
+  if (project.projectId) return project.projectId;
+  const projects = await window.codexVoice.listProjectThreads({ project });
+  if (projects.length !== 1) throw new Error("Project target did not resolve to exactly one project.");
+  return projects[0].projectId;
+}
+
+async function resolveChatIdInProject(
+  project: CodexProjectTarget,
   chatId: string | undefined,
   name?: string,
+  threadHandle?: string,
   allowAll = false,
 ): Promise<string | undefined> {
   if (chatId) return chatId;
+  if (!name && !threadHandle) return allowAll ? undefined : undefined;
+  const projects = await window.codexVoice.listProjectThreads({ project });
+  const chats = projects.flatMap((projectRuntime) => projectRuntime.chats);
+  if (threadHandle) {
+    const normalizedHandle = normalizeHandlePath(threadHandle);
+    const exactHandle = chats.filter((chat) => normalizeHandlePath(chat.handle) === normalizedHandle || chat.threadId === threadHandle);
+    if (exactHandle.length === 1) return exactHandle[0].chatId;
+    if (exactHandle.length > 1) throw new Error(`More than one thread matched handle "${threadHandle}".`);
+  }
   if (!name) return allowAll ? undefined : undefined;
+  const needle = normalizeLookupText(name);
+  const exact = chats.filter((chat) => normalizeLookupText(chat.displayName) === needle || chat.chatId === name || chat.threadId === name);
+  if (exact.length === 1) return exact[0].chatId;
+  if (exact.length > 1) throw new Error(`More than one thread matched "${name}".`);
+  const partial = chats.filter((chat) => normalizeLookupText(chat.displayName).includes(needle));
+  if (partial.length === 1) return partial[0].chatId;
+  if (partial.length > 1) throw new Error(`More than one thread matched "${name}".`);
+  throw new Error(`No thread matched "${name}".`);
+}
+
+async function resolveActiveChatIdInProject(project: CodexProjectTarget): Promise<string | undefined> {
+  const projects = await window.codexVoice.listProjectThreads({ project });
+  const projectRuntime = projects[0];
+  return projectRuntime?.activeChatId ?? projectRuntime?.chats[0]?.chatId;
+}
+
+function normalizeLookupText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeHandlePath(value: string): string {
+  return value
+    .split("/")
+    .map((segment) =>
+      segment
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .replace(/_{2,}/g, "_"),
+    )
+    .filter(Boolean)
+    .join("/");
+}
+
+async function resolveChatId(
+  chatId: string | undefined,
+  name?: string,
+  threadHandle?: string,
+  allowAll = false,
+): Promise<string | undefined> {
+  if (chatId) return chatId;
+  if (!name && !threadHandle) return allowAll ? undefined : undefined;
   const state = await window.codexVoice.getState();
+  if (threadHandle) {
+    const normalizedHandle = normalizeHandlePath(threadHandle);
+    const runtimes = state.runtime.projectThreads.flatMap((project) => project.chats);
+    const exactHandle = runtimes.filter((chat) => normalizeHandlePath(chat.handle) === normalizedHandle || chat.threadId === threadHandle);
+    if (exactHandle.length === 1) return exactHandle[0].chatId;
+    if (exactHandle.length > 1) throw new Error(`More than one thread matched handle "${threadHandle}".`);
+  }
+  if (!name) return allowAll ? undefined : undefined;
   const chat = findChatByName(state, name);
-  if (!chat) throw new Error(`No chat matched "${name}".`);
+  if (!chat) throw new Error(`No thread matched "${name}".`);
   return chat.id;
 }
 
@@ -1012,10 +1385,10 @@ function findChatByName(state: AppState, name: string): VoiceChat | null {
   const chats = visibleChats(activeProject?.chats ?? []);
   const exact = chats.filter((chat) => chat.displayName.toLowerCase() === needle || chat.id === name);
   if (exact.length === 1) return exact[0];
-  if (exact.length > 1) throw new Error(`More than one chat matched "${name}".`);
+  if (exact.length > 1) throw new Error(`More than one thread matched "${name}".`);
   const partial = chats.filter((chat) => chat.displayName.toLowerCase().includes(needle));
   if (partial.length === 1) return partial[0];
-  if (partial.length > 1) throw new Error(`More than one chat matched "${name}".`);
+  if (partial.length > 1) throw new Error(`More than one thread matched "${name}".`);
   return null;
 }
 
@@ -1250,6 +1623,27 @@ function transcriptHistoryContext(
       "Do not summarize it aloud unless asked, and do not call tools because of this context.",
       lines.join("\n"),
     ].join("\n\n"),
+  };
+}
+
+function userInputLogMessage(text: string, attachments: RealtimeUserAttachment[]): string {
+  const imageText =
+    attachments.length === 0
+      ? ""
+      : attachments.length === 1
+        ? `Image: ${attachments[0].name}`
+        : `${attachments.length} images`;
+  return [text, imageText].filter(Boolean).join("\n") || imageText || "User input";
+}
+
+function sanitizeAttachmentForLog(attachment: RealtimeUserAttachment): RealtimeUserAttachmentMetadata {
+  return {
+    id: attachment.id,
+    kind: attachment.kind,
+    name: attachment.name,
+    mimeType: attachment.mimeType,
+    sizeBytes: attachment.sizeBytes,
+    localPath: attachment.localPath ?? null,
   };
 }
 

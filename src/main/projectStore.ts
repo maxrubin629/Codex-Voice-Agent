@@ -88,7 +88,10 @@ export class ProjectStore {
   async createProject(displayName?: string, workspacePath?: string | null): Promise<VoiceProject> {
     const now = new Date();
     const id = randomUUID();
-    const safeName = sanitizeProjectName(displayName || "Voice Project");
+    const normalizedWorkspacePath = stringOrNull(workspacePath) ? normalizeStoredPath(workspacePath, "") : null;
+    const resolvedDisplayName = projectDisplayName(displayName, normalizedWorkspacePath);
+    const displayNameSource = normalizedWorkspacePath ? "workspace" : "custom";
+    const safeName = sanitizeProjectName(resolvedDisplayName);
     const folderName = `${formatFolderTimestamp(now)} - ${safeName}`;
     const folderPath = await this.uniqueFolderPath(folderName);
 
@@ -96,9 +99,10 @@ export class ProjectStore {
 
     const project: VoiceProject = {
       id,
-      displayName: displayName?.trim() || "Voice Project",
+      displayName: resolvedDisplayName,
+      displayNameSource,
       folderPath,
-      workspacePath: normalizeStoredPath(workspacePath, folderPath),
+      workspacePath: normalizedWorkspacePath ?? folderPath,
       activeChatId: null,
       chats: [],
       codexThreadId: null,
@@ -508,6 +512,15 @@ function normalizeProject(value: unknown): VoiceProject {
   };
   const createdAt = stringOrNow(project.createdAt);
   const updatedAt = stringOrNow(project.updatedAt);
+  const folderPath = normalizeStoredPath((project as { folderPath?: unknown }).folderPath, "");
+  const workspacePath = normalizeStoredPath((project as { workspacePath?: unknown }).workspacePath, folderPath);
+  const workspaceBacked = Boolean(workspacePath && folderPath && path.resolve(workspacePath) !== path.resolve(folderPath));
+  const storedDisplayNameSource = (project as { displayNameSource?: unknown }).displayNameSource;
+  const displayNameSource =
+    storedDisplayNameSource === "custom" ? "custom" : workspaceBacked ? "workspace" : "custom";
+  const displayName = displayNameSource === "workspace"
+    ? projectDisplayName(undefined, workspacePath)
+    : stringOrNull(project.displayName) ?? "Voice Project";
   const projectModel = stringOrNull(project.model) ?? DEFAULT_CODEX_MODEL;
   const projectReasoningEffort =
     reasoningEffortOrNull(project.reasoningEffort) ?? DEFAULT_CODEX_REASONING_EFFORT;
@@ -538,10 +551,13 @@ function normalizeProject(value: unknown): VoiceProject {
 
   return {
     ...project,
+    displayName,
+    displayNameSource,
+    folderPath,
     createdAt,
     updatedAt,
     archivedAt: stringOrNull(project.archivedAt),
-    workspacePath: normalizeStoredPath((project as { workspacePath?: unknown }).workspacePath, project.folderPath),
+    workspacePath,
     activeChatId,
     chats,
     codexThreadId: activeChat?.codexThreadId ?? null,
@@ -756,6 +772,11 @@ function sanitizeProjectName(name: string): string {
     .slice(0, 64)
     .replace(/\s/g, "-")
     .toLowerCase() || "voice-project";
+}
+
+function projectDisplayName(displayName: string | undefined, workspacePath: string | null): string {
+  const workspaceName = workspacePath ? path.basename(workspacePath) : "";
+  return workspaceName || displayName?.trim() || "Voice Project";
 }
 
 function formatFolderTimestamp(date: Date): string {

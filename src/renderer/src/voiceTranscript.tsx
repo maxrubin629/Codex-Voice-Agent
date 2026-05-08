@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   ActiveThreadSummary,
   AppEvent,
@@ -12,16 +12,17 @@ import type {
 } from "../../shared/types";
 import { transcriptMessageIdFromEvent } from "../../shared/transcriptMessages";
 
-type MessageTone = "user" | "assistant";
-type ActivityIcon = "terminal" | "edit" | "search" | "list" | "globe" | "tool" | "check" | "alert" | "branch" | "spark";
-type ActivityTone = "normal" | "muted" | "success" | "warning";
+export type MessageTone = "user" | "assistant";
+export type ActivityIcon = "terminal" | "edit" | "search" | "list" | "globe" | "tool" | "check" | "alert" | "branch" | "spark";
+export type ActivityTone = "normal" | "muted" | "success" | "warning";
 
-type TranscriptEntry =
+export type TranscriptEntry =
   | {
       kind: "message";
       id: string;
       tone: MessageTone;
       body: string;
+      attachments?: TranscriptAttachment[];
       streaming?: boolean;
     }
   | {
@@ -59,7 +60,7 @@ type TranscriptEntry =
       active?: boolean;
     };
 
-type ActivityRow = {
+export type ActivityRow = {
   id: string;
   icon?: ActivityIcon;
   label: string;
@@ -69,9 +70,37 @@ type ActivityRow = {
   tone?: ActivityTone;
 };
 
+type TranscriptAttachment = {
+  id: string;
+  kind: "image";
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  localPath?: string | null;
+};
+
 type TimelineItem =
   | { kind: "entry"; entry: TranscriptEntry }
   | { kind: "turn"; turnId: string };
+
+export type TranscriptContext = {
+  chat: VoiceChat | null;
+  chatId: string | null;
+  threadId: string | null;
+};
+
+export type VoiceTranscriptBuildInput = {
+  events: AppEvent[];
+  state: AppState;
+  summary: ActiveThreadSummary | null;
+  messages?: VoiceTranscriptMessage[];
+  context?: TranscriptContext;
+};
+
+type TranscriptExpansionController = {
+  expandedById: Record<string, boolean>;
+  setExpanded: (entryId: string, expanded: boolean) => void;
+};
 
 type TurnDraft = {
   id: string;
@@ -146,6 +175,7 @@ export function VoiceTranscriptContent({
   events,
   summary,
   messages = [],
+  context,
   className,
 }: {
   open?: boolean;
@@ -153,33 +183,74 @@ export function VoiceTranscriptContent({
   events: AppEvent[];
   summary?: ActiveThreadSummary | null;
   messages?: VoiceTranscriptMessage[];
+  context?: TranscriptContext;
   className?: string;
 }): React.ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const pinnedToBottomRef = useRef(true);
+  const hasOpenedAtLatestRef = useRef(false);
+  const [expandedById, setExpandedById] = useState<Record<string, boolean>>({});
   const entries = useMemo(
-    () => buildTranscriptEntries(events, state, summary ?? null, messages),
-    [events, messages, state, summary],
+    () => buildVoiceTranscriptEntries({ events, state, summary: summary ?? null, messages, context }),
+    [context, events, messages, state, summary],
   );
   const latestEntrySignature = transcriptEntryScrollSignature(entries.at(-1) ?? null);
+  const expansion = useMemo<TranscriptExpansionController>(
+    () => ({
+      expandedById,
+      setExpanded: (entryId, expanded) => {
+        setExpandedById((current) => {
+          if (current[entryId] === expanded) return current;
+          return { ...current, [entryId]: expanded };
+        });
+      },
+    }),
+    [expandedById],
+  );
 
-  useEffect(() => {
-    if (!open) return;
+  const updatePinnedState = (node: HTMLDivElement): boolean => {
+    const pinned = isPinnedToTranscriptBottom(node);
+    pinnedToBottomRef.current = pinned;
+    return pinned;
+  };
+
+  useLayoutEffect(() => {
+    if (!open) {
+      hasOpenedAtLatestRef.current = false;
+      return;
+    }
     const node = scrollRef.current;
     if (!node) return;
-    node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+    if (!hasOpenedAtLatestRef.current) {
+      hasOpenedAtLatestRef.current = true;
+      node.scrollTop = node.scrollHeight;
+      updatePinnedState(node);
+      return;
+    }
+    if (pinnedToBottomRef.current) {
+      node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+      return;
+    }
+    updatePinnedState(node);
   }, [latestEntrySignature, open]);
 
   return (
-    <div ref={scrollRef} className={["voice-transcript-list", className].filter(Boolean).join(" ")}>
-      {entries.length === 0 ? (
-        <div className="voice-transcript-empty">
-          <TranscriptIcon icon="spark" />
-          <strong>No messages yet</strong>
-          <small>Your conversation and Codex activity will appear here.</small>
-        </div>
-      ) : (
-        entries.map((entry) => <VoiceConversationEntry key={entry.id} entry={entry} />)
-      )}
+    <div className="voice-transcript-shell">
+      <div
+        ref={scrollRef}
+        className={["voice-transcript-list", className].filter(Boolean).join(" ")}
+        onScroll={(event) => updatePinnedState(event.currentTarget)}
+      >
+        {entries.length === 0 ? (
+          <div className="voice-transcript-empty">
+            <TranscriptIcon icon="spark" />
+            <strong>No messages yet</strong>
+            <small>Your conversation and Codex activity will appear here.</small>
+          </div>
+        ) : (
+          entries.map((entry) => <VoiceConversationEntry key={entry.id} entry={entry} expansion={expansion} />)
+        )}
+      </div>
     </div>
   );
 }
@@ -201,12 +272,19 @@ function transcriptEntryScrollSignature(entry: TranscriptEntry | null): string {
   return `${entry.id}:${entry.title}:${entry.body?.length ?? 0}:${entry.active ? "active" : "idle"}`;
 }
 
-function VoiceConversationEntry({ entry }: { entry: TranscriptEntry }): React.ReactElement {
+function VoiceConversationEntry({
+  entry,
+  expansion,
+}: {
+  entry: TranscriptEntry;
+  expansion: TranscriptExpansionController;
+}): React.ReactElement {
   if (entry.kind === "message") {
     if (entry.tone === "user") {
       return (
         <article className="voice-transcript-entry user">
           <p>{entry.body}</p>
+          <TranscriptAttachments attachments={entry.attachments} />
         </article>
       );
     }
@@ -217,18 +295,34 @@ function VoiceConversationEntry({ entry }: { entry: TranscriptEntry }): React.Re
     );
   }
 
-  if (entry.kind === "work") return <WorkEntry entry={entry} />;
-  if (entry.kind === "activity") return <ActivityEntry entry={entry} />;
-  if (entry.kind === "reasoning") return <ReasoningEntry entry={entry} />;
+  if (entry.kind === "work") return <WorkEntry entry={entry} expansion={expansion} />;
+  if (entry.kind === "activity") return <ActivityEntry entry={entry} expansion={expansion} />;
+  if (entry.kind === "reasoning") return <ReasoningEntry entry={entry} expansion={expansion} />;
   return <StatusEntry entry={entry} />;
 }
 
-function WorkEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "work" }> }): React.ReactElement {
-  const [expanded, setExpanded] = useState(entry.defaultExpanded);
+function TranscriptAttachments({ attachments }: { attachments?: TranscriptAttachment[] }): React.ReactElement | null {
+  if (!attachments?.length) return null;
+  return (
+    <div className="voice-transcript-attachments">
+      {attachments.map((attachment) => (
+        <span key={attachment.id} className="voice-transcript-attachment">
+          <TranscriptIcon icon="spark" />
+          <span>{attachment.name}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
 
-  useEffect(() => {
-    if (entry.active) setExpanded(true);
-  }, [entry.active]);
+function WorkEntry({
+  entry,
+  expansion,
+}: {
+  entry: Extract<TranscriptEntry, { kind: "work" }>;
+  expansion: TranscriptExpansionController;
+}): React.ReactElement {
+  const expanded = expansion.expandedById[entry.id] ?? entry.defaultExpanded;
 
   return (
     <section className={`voice-work-group${entry.active ? " active" : ""}`}>
@@ -236,7 +330,7 @@ function WorkEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "work" }
         type="button"
         className="voice-work-toggle"
         aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
+        onClick={() => expansion.setExpanded(entry.id, !expanded)}
       >
         <span>{entry.summary}</span>
         <ChevronIcon expanded={expanded} />
@@ -244,7 +338,7 @@ function WorkEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "work" }
       {expanded && (
         <div className="voice-work-children">
           {entry.children.map((child) => (
-            <VoiceConversationEntry key={child.id} entry={child} />
+            <VoiceConversationEntry key={child.id} entry={child} expansion={expansion} />
           ))}
         </div>
       )}
@@ -252,13 +346,15 @@ function WorkEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "work" }
   );
 }
 
-function ActivityEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "activity" }> }): React.ReactElement {
-  const [expanded, setExpanded] = useState(entry.defaultExpanded);
+function ActivityEntry({
+  entry,
+  expansion,
+}: {
+  entry: Extract<TranscriptEntry, { kind: "activity" }>;
+  expansion: TranscriptExpansionController;
+}): React.ReactElement {
+  const expanded = expansion.expandedById[entry.id] ?? entry.defaultExpanded;
   const canExpand = entry.rows.length > 0;
-
-  useEffect(() => {
-    if (entry.active) setExpanded(true);
-  }, [entry.active]);
 
   return (
     <section className={`voice-activity-group${entry.active ? " active" : ""}`}>
@@ -266,7 +362,7 @@ function ActivityEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "act
         type="button"
         className="voice-activity-summary"
         aria-expanded={expanded}
-        onClick={() => canExpand && setExpanded((value) => !value)}
+        onClick={() => canExpand && expansion.setExpanded(entry.id, !expanded)}
       >
         <TranscriptIcon icon={entry.icon} />
         <span>{entry.summary}</span>
@@ -283,14 +379,16 @@ function ActivityEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "act
   );
 }
 
-function ReasoningEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "reasoning" }> }): React.ReactElement {
-  const [expanded, setExpanded] = useState(entry.defaultExpanded);
+function ReasoningEntry({
+  entry,
+  expansion,
+}: {
+  entry: Extract<TranscriptEntry, { kind: "reasoning" }>;
+  expansion: TranscriptExpansionController;
+}): React.ReactElement {
+  const expanded = expansion.expandedById[entry.id] ?? entry.defaultExpanded;
   const hasBody = entry.content.trim().length > 0;
   const label = entry.active ? "Thinking" : entry.elapsedMs ? `Thought for ${formatDuration(entry.elapsedMs)}` : "Thought";
-
-  useEffect(() => {
-    if (entry.active) setExpanded(true);
-  }, [entry.active]);
 
   return (
     <section className={`voice-reasoning${entry.active ? " active" : ""}`}>
@@ -298,7 +396,7 @@ function ReasoningEntry({ entry }: { entry: Extract<TranscriptEntry, { kind: "re
         type="button"
         className="voice-reasoning-summary"
         aria-expanded={expanded}
-        onClick={() => hasBody && setExpanded((value) => !value)}
+        onClick={() => hasBody && expansion.setExpanded(entry.id, !expanded)}
       >
         <TranscriptIcon icon="spark" />
         <span>{label}</span>
@@ -462,15 +560,27 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[
   return nodes;
 }
 
+export function buildVoiceTranscriptEntries(input: VoiceTranscriptBuildInput): TranscriptEntry[] {
+  return buildTranscriptEntries(input.events, input.state, input.summary, input.messages ?? [], input.context);
+}
+
+export function isPinnedToTranscriptBottom(
+  metrics: Pick<Element, "scrollHeight" | "scrollTop" | "clientHeight">,
+  thresholdPx = 80,
+): boolean {
+  return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight <= thresholdPx;
+}
+
 function buildTranscriptEntries(
   events: AppEvent[],
   state: AppState,
   summary: ActiveThreadSummary | null,
   messages: VoiceTranscriptMessage[] = [],
+  context?: TranscriptContext,
 ): TranscriptEntry[] {
-  const activeChat = activeChatFromState(state);
-  const activeChatId = state.runtime.activeChatId ?? activeChat?.id ?? null;
-  const activeThreadId = activeChat?.codexThreadId ?? state.activeProject?.codexThreadId ?? null;
+  const activeChat = context?.chat ?? activeChatFromState(state);
+  const activeChatId = context?.chatId ?? state.runtime.activeChatId ?? activeChat?.id ?? null;
+  const activeThreadId = context?.threadId ?? activeChat?.codexThreadId ?? state.activeProject?.codexThreadId ?? null;
   const chronologicalEvents = [...events].reverse();
   const completedRealtimeStreams = new Set<string>();
   const realtimeStreamingEntryIndexes = new Map<string, number>();
@@ -716,6 +826,7 @@ function hydrateTranscriptMessages(
       id: `stored-${message.id}`,
       tone: message.role,
       body,
+      attachments: transcriptAttachmentsFromMetadata(message.metadata),
       streaming: message.status === "streaming",
     });
   }
@@ -860,12 +971,20 @@ function normalizeTurnItem(item: TurnItemDraft): NormalizedTurnEntry | null {
       return todoListEntry(item);
     case "plan":
       return statusEntry(`plan-${item.id}`, "check", "Updated plan", planText(raw) ?? undefined, false);
+    case "hookPrompt":
+      return hookPromptEntry(item);
+    case "imageView":
+      return imageViewEntry(item);
     case "generatedImage":
       return generatedImageEntry(item);
+    case "enteredReviewMode":
+      return reviewModeEntry(item, "entered");
+    case "exitedReviewMode":
+      return reviewModeEntry(item, "exited");
     case "contextCompaction":
-      return statusEntry(`context-${item.id}`, "spark", "Compacted context", undefined, false);
+      return statusEntry(`context-${item.id}`, "spark", "Compacted context", contextCompactionText(raw) ?? undefined, false);
     default:
-      return null;
+      return unknownItemEntry(item);
   }
 }
 
@@ -1082,12 +1201,58 @@ function todoListEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "s
   );
 }
 
+function hookPromptEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "status" }> {
+  return statusEntry(
+    `hook-${item.id}`,
+    "tool",
+    "Added hook context",
+    firstText(item.raw, ["text", "prompt", "message", "content", "summary", "fragments"]) ?? undefined,
+    itemIsActive(item),
+  );
+}
+
+function imageViewEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "status" }> {
+  const target = firstText(item.raw, ["path", "filePath", "file_path", "url", "uri", "src"]);
+  return statusEntry(
+    `image-view-${item.id}`,
+    "spark",
+    itemIsActive(item) ? "Viewing image" : "Viewed image",
+    target ? displayPath(target) : firstText(item.raw, ["title", "description", "text"]) ?? undefined,
+    itemIsActive(item),
+  );
+}
+
 function generatedImageEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "status" }> {
+  const target =
+    firstText(item.raw, ["savedPath", "saved_path", "path", "filePath", "file_path", "url", "imageUrl", "image_url", "src"]) ??
+    firstText(item.raw, ["prompt", "revisedPrompt", "revised_prompt", "description"]);
   return statusEntry(
     `image-${item.id}`,
     "spark",
     itemIsActive(item) ? "Generating image" : "Generated image",
-    firstText(item.raw, ["prompt", "description", "url", "path", "filePath"]) ?? undefined,
+    target ? displayPath(target) : undefined,
+    itemIsActive(item),
+  );
+}
+
+function reviewModeEntry(item: TurnItemDraft, phase: "entered" | "exited"): Extract<TranscriptEntry, { kind: "status" }> {
+  const entered = phase === "entered";
+  return statusEntry(
+    `review-${phase}-${item.id}`,
+    entered ? "alert" : "check",
+    entered ? "Review mode started" : "Review mode finished",
+    firstText(item.raw, ["review", "text", "summary", "message", "reason", "description"]) ?? undefined,
+    itemIsActive(item),
+  );
+}
+
+function unknownItemEntry(item: TurnItemDraft): Extract<TranscriptEntry, { kind: "status" }> {
+  const originalType = stringFromUnknown(item.raw.originalType) ?? item.type;
+  return statusEntry(
+    `unknown-${item.id}`,
+    "tool",
+    humanizeItemType(originalType),
+    firstText(item.raw, ["text", "summary", "message", "description", "content", "result", "output"]) ?? undefined,
     itemIsActive(item),
   );
 }
@@ -1148,6 +1313,19 @@ function pendingRequestEntryFromRaw(raw: Record<string, unknown> | null, id: str
 
 function looseEntryFromEvent(event: AppEvent): TranscriptEntry | null {
   const raw = recordFromUnknown(event.raw);
+
+  if (event.source === "realtime" && event.kind === "userInput") {
+    const body = realtimeTranscriptText(event, raw);
+    return body
+      ? {
+          kind: "message",
+          id: stableEventId(event),
+          tone: "user",
+          body,
+          attachments: transcriptAttachmentsFromMetadata(raw),
+        }
+      : null;
+  }
 
   if (event.source === "realtime" && isRealtimeUserTranscript(event.kind)) {
     const body = realtimeTranscriptText(event, raw);
@@ -1257,9 +1435,9 @@ function mergeTurnItem(turn: TurnDraft, rawItem: Record<string, unknown>, event:
     else if (text) turn.assistantDraft = text;
     return;
   }
-  if (type === "userMessage" && turn.userMessages.length === 0) {
+  if (type === "userMessage") {
     const text = userMessageText(rawItem);
-    if (text) {
+    if (text && turn.userMessages.length === 0) {
       pushUniqueMessage(turn.userMessages, {
         kind: "message",
         id: `stored-user-${turn.id}`,
@@ -1486,9 +1664,21 @@ function normalizeTranscriptItemType(value: string): string {
   }
   if (normalized === "todo-list") return "todoList";
   if (normalized === "proposed-plan" || normalized === "plan-implementation") return "plan";
+  if (normalized === "hook-prompt") return "hookPrompt";
+  if (normalized === "image-view") return "imageView";
+  if (normalized === "entered-review-mode") return "enteredReviewMode";
+  if (normalized === "exited-review-mode") return "exitedReviewMode";
   if (normalized === "context-compaction") return "contextCompaction";
   if (normalized === "generated-image" || normalized === "image-generation") return "generatedImage";
   return value;
+}
+
+function humanizeItemType(value: string): string {
+  const spaced = value
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[_/-]+/g, " ")
+    .trim();
+  return capitalize(spaced.toLowerCase());
 }
 
 function firstText(record: Record<string, unknown>, fields: string[]): string | null {
@@ -1522,6 +1712,10 @@ function turnIsInProgress(status: string | null): boolean {
 
 function planText(raw: Record<string, unknown>): string | null {
   return firstText(raw, ["text", "summary", "description", "title"]);
+}
+
+function contextCompactionText(raw: Record<string, unknown>): string | null {
+  return firstText(raw, ["summary", "text", "message", "description"]);
 }
 
 function todoTaskRecords(raw: Record<string, unknown>): Record<string, unknown>[] {
@@ -1900,6 +2094,31 @@ function arrayStrings(value: unknown): string[] {
       return record ? firstText(record, ["text", "summary", "content", "message"]) : null;
     })
     .filter((item): item is string => Boolean(item));
+}
+
+function transcriptAttachmentsFromMetadata(metadata: unknown): TranscriptAttachment[] | undefined {
+  const record = recordFromUnknown(metadata);
+  const value = Array.isArray(metadata) ? metadata : record?.attachments;
+  if (!Array.isArray(value)) return undefined;
+  const attachments = value
+    .map((item): TranscriptAttachment | null => {
+      const attachment = recordFromUnknown(item);
+      if (!attachment) return null;
+      const name = stringFromUnknown(attachment.name);
+      const mimeType = stringFromUnknown(attachment.mimeType);
+      const sizeBytes = numberFromUnknown(attachment.sizeBytes);
+      if (!name || !mimeType || sizeBytes === null) return null;
+      return {
+        id: stringFromUnknown(attachment.id) ?? name,
+        kind: "image",
+        name,
+        mimeType,
+        sizeBytes,
+        localPath: stringFromUnknown(attachment.localPath),
+      };
+    })
+    .filter((item): item is TranscriptAttachment => item !== null);
+  return attachments.length > 0 ? attachments : undefined;
 }
 
 function recordFromUnknown(value: unknown): Record<string, unknown> | null {

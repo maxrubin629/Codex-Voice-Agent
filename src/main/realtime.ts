@@ -18,12 +18,15 @@ import {
   type VoiceWebSearchResult,
   type VoiceWebSearchSource,
 } from "../shared/types";
-import { getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
+import { getExaApiKey, getExaApiKeyStatus, getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
 
 const REALTIME_ENDPOINT = "https://api.openai.com/v1/realtime/client_secrets";
-const RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
+const EXA_SEARCH_ENDPOINT = "https://api.exa.ai/search";
 const SETTINGS_FILE_NAME = "codex-voice-realtime-settings.json";
-const DEFAULT_REALTIME_WEB_SEARCH_MODEL = "gpt-5.4-mini";
+const DEFAULT_EXA_SEARCH_TYPE = "instant";
+const DEFAULT_EXA_NUM_RESULTS = 5;
+const DEFAULT_EXA_LIVECRAWL_TIMEOUT_MS = 5000;
+const EXA_SEARCH_TYPES = new Set(["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"]);
 const webSearchControllers = new Map<string, AbortController>();
 
 type RealtimeSettingsFile = {
@@ -32,6 +35,21 @@ type RealtimeSettingsFile = {
   voice?: RealtimeVoiceId | null;
   reasoningEffort?: RealtimeReasoningEffort | null;
   updatedAt?: string;
+};
+
+type ExaSearchResult = {
+  title?: unknown;
+  url?: unknown;
+  author?: unknown;
+  publishedDate?: unknown;
+  highlights?: unknown;
+  highlightScores?: unknown;
+  score?: unknown;
+};
+
+type ExaSearchResponse = {
+  requestId?: unknown;
+  results?: unknown;
 };
 
 export function realtimeConfig(): AppState["realtime"] {
@@ -59,6 +77,17 @@ export function realtimeConfig(): AppState["realtime"] {
     reason: available
       ? null
       : "Add an OpenAI API key from the menu to enable Realtime voice.",
+    apiKeySource: status.source,
+    apiKeyEncrypted: status.encrypted,
+  };
+}
+
+export function webSearchConfig(): AppState["webSearch"] {
+  const status = getExaApiKeyStatus();
+  return {
+    available: status.configured,
+    provider: "exa",
+    reason: status.configured ? null : "Add an Exa API key to enable voice web search.",
     apiKeySource: status.source,
     apiKeyEncrypted: status.encrypted,
   };
@@ -177,43 +206,38 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
 }
 
 export async function searchWebForRealtime(args: VoiceWebSearchArgs): Promise<VoiceWebSearchResult> {
-  const apiKey = getOpenAiApiKey();
+  const apiKey = getExaApiKey();
   if (!apiKey) {
-    throw new Error("Add an OpenAI API key to use web search.");
+    throw new Error("Set EXA_API_KEY to use web search.");
   }
 
   const query = requireSearchQuery(args?.query);
   const context = optionalSearchContext(args?.context);
-  const model = realtimeWebSearchModel();
+  const searchType = exaSearchType();
+  const numResults = exaNumResults();
   const requestId = optionalRequestId(args?.requestId);
   const controller = requestId ? new AbortController() : null;
   if (requestId && controller) {
     webSearchControllers.set(requestId, controller);
   }
-  const input = [
-    "Search the web for the voice assistant's user.",
-    "Return a concise, source-backed answer suitable for a spoken follow-up.",
-    "Do not include markdown footnote syntax; include source URLs in the answer when they are important.",
-    "",
-    `Query: ${query}`,
-    context ? `Conversation context: ${context}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const exaQuery = context ? `${query}\n\nContext: ${context}` : query;
 
   try {
-    const response = await fetch(RESPONSES_ENDPOINT, {
+    const response = await fetch(EXA_SEARCH_ENDPOINT, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        "x-api-key": apiKey,
         "Content-Type": "application/json",
       },
       signal: controller?.signal,
       body: JSON.stringify({
-        model,
-        tools: [{ type: "web_search" }],
-        input,
-        max_output_tokens: 900,
+        query: exaQuery,
+        type: searchType,
+        numResults,
+        contents: {
+          highlights: true,
+          livecrawlTimeout: exaLivecrawlTimeoutMs(),
+        },
       }),
     });
 
@@ -222,15 +246,23 @@ export async function searchWebForRealtime(args: VoiceWebSearchArgs): Promise<Vo
       throw new Error(`Web search failed: ${response.status} ${text}`);
     }
 
-    const data = (await response.json()) as Record<string, unknown>;
-    const answer = responseOutputText(data) || "The web search completed, but no answer text was returned.";
+    const data = (await response.json()) as ExaSearchResponse;
+    const results = exaSearchResults(data);
 
     return {
       query,
-      answer,
-      sources: responseUrlCitations(data),
-      actions: responseWebSearchActions(data),
-      model,
+      answer: exaSearchEvidenceText(query, results),
+      sources: exaSearchSources(results),
+      actions: [
+        {
+          type: "search",
+          query,
+        },
+      ],
+      model: `exa:${searchType}`,
+      provider: "exa",
+      searchType,
+      requestId: stringFromUnknown(data.requestId),
     };
   } catch (error) {
     if (controller?.signal.aborted) {
@@ -251,11 +283,6 @@ export function cancelWebSearchForRealtime(requestId: string): void {
   webSearchControllers.delete(requestId);
 }
 
-function realtimeWebSearchModel(): string {
-  const configured = process.env.OPENAI_REALTIME_WEB_SEARCH_MODEL?.trim();
-  return configured || DEFAULT_REALTIME_WEB_SEARCH_MODEL;
-}
-
 function requireSearchQuery(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error("web_search requires a non-empty query.");
@@ -271,56 +298,75 @@ function optionalRequestId(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, 120) : null;
 }
 
-function responseOutputText(data: Record<string, unknown>): string {
-  const direct = stringFromUnknown(data.output_text);
-  if (direct) return direct;
-
-  const chunks: string[] = [];
-  for (const item of arrayRecords(data.output)) {
-    if (stringFromUnknown(item.type) !== "message") continue;
-    for (const content of arrayRecords(item.content)) {
-      const text = stringFromUnknown(content.text);
-      if (text) chunks.push(text);
-    }
-  }
-  return chunks.join("\n\n").trim();
+function exaSearchType(): string {
+  const configured = process.env.EXA_WEB_SEARCH_TYPE?.trim();
+  return configured && EXA_SEARCH_TYPES.has(configured) ? configured : DEFAULT_EXA_SEARCH_TYPE;
 }
 
-function responseUrlCitations(data: Record<string, unknown>): VoiceWebSearchSource[] {
+function exaNumResults(): number {
+  return boundedInteger(process.env.EXA_WEB_SEARCH_NUM_RESULTS, DEFAULT_EXA_NUM_RESULTS, 1, 10);
+}
+
+function exaLivecrawlTimeoutMs(): number {
+  return boundedInteger(
+    process.env.EXA_WEB_SEARCH_LIVECRAWL_TIMEOUT_MS,
+    DEFAULT_EXA_LIVECRAWL_TIMEOUT_MS,
+    1000,
+    20000,
+  );
+}
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function exaSearchResults(data: ExaSearchResponse): ExaSearchResult[] {
+  return arrayRecords(data.results);
+}
+
+function exaSearchSources(results: ExaSearchResult[]): VoiceWebSearchSource[] {
   const sources = new Map<string, VoiceWebSearchSource>();
-  for (const item of arrayRecords(data.output)) {
-    if (stringFromUnknown(item.type) !== "message") continue;
-    for (const content of arrayRecords(item.content)) {
-      for (const annotation of arrayRecords(content.annotations)) {
-        if (stringFromUnknown(annotation.type) !== "url_citation") continue;
-        const url = stringFromUnknown(annotation.url);
-        if (!url || sources.has(url)) continue;
-        sources.set(url, {
-          url,
-          title: stringFromUnknown(annotation.title),
-        });
-      }
-    }
-  }
-  return [...sources.values()].slice(0, 8);
-}
-
-function responseWebSearchActions(data: Record<string, unknown>): VoiceWebSearchAction[] {
-  const actions: VoiceWebSearchAction[] = [];
-  for (const item of arrayRecords(data.output)) {
-    if (stringFromUnknown(item.type) !== "web_search_call") continue;
-    const action = recordFromUnknown(item.action);
-    if (!action) continue;
-    const type = stringFromUnknown(action.type) ?? "search";
-    const query = stringFromUnknown(action.query);
-    const queries = arrayStrings(action.queries);
-    actions.push({
-      type,
-      ...(query ? { query } : {}),
-      ...(queries.length > 0 ? { queries } : {}),
+  for (const result of results) {
+    const url = stringFromUnknown(result.url);
+    if (!url || sources.has(url)) continue;
+    sources.set(url, {
+      url,
+      title: stringFromUnknown(result.title),
+      author: stringFromUnknown(result.author),
+      publishedDate: stringFromUnknown(result.publishedDate),
+      highlights: arrayStrings(result.highlights).slice(0, 5),
+      score: numberFromUnknown(result.score),
     });
   }
-  return actions.slice(0, 12);
+  return [...sources.values()];
+}
+
+function exaSearchEvidenceText(query: string, results: ExaSearchResult[]): string {
+  if (results.length === 0) {
+    return `No Exa web search results were returned for "${query}".`;
+  }
+
+  const lines = [`Exa web search results for "${query}". Synthesize an answer from these sources; do not treat this as a prewritten answer.`];
+  results.slice(0, 8).forEach((result, index) => {
+    const title = stringFromUnknown(result.title) ?? "Untitled result";
+    const url = stringFromUnknown(result.url) ?? "No URL";
+    const author = stringFromUnknown(result.author);
+    const publishedDate = stringFromUnknown(result.publishedDate);
+    const highlights = arrayStrings(result.highlights)
+      .map((highlight) => highlight.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    lines.push(`${index + 1}. ${title}`);
+    lines.push(`URL: ${url}`);
+    if (publishedDate) lines.push(`Published: ${publishedDate}`);
+    if (author) lines.push(`Author: ${author}`);
+    if (highlights.length > 0) {
+      lines.push(`Highlights: ${highlights.join(" / ")}`);
+    }
+  });
+  return lines.join("\n");
 }
 
 function arrayRecords(value: unknown): Array<Record<string, unknown>> {
@@ -337,12 +383,12 @@ function arrayStrings(value: unknown): string[] {
     : [];
 }
 
-function recordFromUnknown(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-
 function stringFromUnknown(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function numberFromUnknown(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function normalizeRealtimeModel(value: unknown): RealtimeModelId | null {
@@ -441,35 +487,39 @@ function realtimeInstructions(): string {
     "# Boundary",
     "- Codex is the primary computer-use agent. Use submit_to_codex for substantial, ambiguous, or multi-step coding work.",
     "- You may inspect/search files and run focused local commands with exec_command when that helps you answer or triage quickly.",
-    "- You have a web_search tool for current public web information. Use it when the user asks for latest/current facts or explicitly asks you to search the web.",
-    "- You may edit files with apply_patch for small, clear, well-scoped changes. Larger changes should be handed to Codex.",
+    "- You have a web_search tool backed by Exa retrieval for current public web information. Use it when the user asks for latest/current facts or explicitly asks you to search the web.",
+    "- You are Codex. The dedicated Codex threads are also Codex. Do not describe yourself as a separate assistant competing with or merely proxying Codex.",
+    "- Think of yourself as the live Codex orchestrator: you can talk, inspect, patch small files, align plan files, manage projects/threads, and hand longer work to dedicated Codex threads.",
+    "- You may edit files with apply_patch for small, clear, well-scoped changes. Longer implementation, risky changes, broad refactors, or work that should persist as a focused workstream should be dispatched to a dedicated Codex thread.",
     "- Multi-file edits are not a separate tool. They are just repeated apply_patch calls, or one patch that contains several file sections.",
     "- Do not invent hard tool-side size, risk, or file-count limits. Use judgment in guidance: inspect first, edit deliberately, and delegate bigger work to Codex.",
     "- The active Codex permission mode also governs your file/command tools. Full access means no filesystem sandbox; custom config follows Codex config when available.",
     "- Prefer rg for search, read files before editing them, keep workdir explicit when it matters, and verify edits with targeted commands when reasonable.",
     "- Reading project docs, plan files, AGENTS.md, README files, tests, and nearby source is often the best use of your file tools before deciding what to do.",
-    "- A strong voice workflow is to turn the user's live thinking into a concise plan file, then ask Codex to implement that plan. Use apply_patch for the plan file when the plan is clear, and submit_to_codex when implementation begins.",
-    "- When several Codex chats are running at once, act as the coordinator: create or switch chats, read or update per-workstream plan files, submit focused tasks to the right chat, steer running chats with new context, and use get_codex_chat_status before summarizing progress.",
+    "- A strong voice workflow is to turn the user's live thinking into a concise plan file, then dispatch a dedicated Codex thread to implement that plan. Use apply_patch for the plan file when the plan is clear, and dispatch_codex_task when implementation begins.",
+    "- Projects are workspace/path-bound containers. Threads are named workstreams inside a project. You operate above all projects and can coordinate work across them.",
+    "- Prefer canonical handles from status/list tool results, such as projectHandle and thread handle, when targeting a project or thread. Handles are the most reliable routing vocabulary.",
+    "- When several Codex threads are running at once, act as the coordinator: create or switch threads, read or update per-workstream plan files, dispatch focused tasks to the right project/thread, steer running threads with new context, and use get_all_codex_thread_status before summarizing progress.",
     "- Keep plan files practical: current goal, relevant files, decisions, open questions, and the next concrete Codex task. Do not bloat them with generic process text.",
-    "- If the user asks for a computer task beyond a small direct inspection or edit, call submit_to_codex with the user's request as faithfully as possible.",
-    "- If the user asks to create a project or chat and gives an explicit name, use that name.",
-    "- If the user asks to create a project or chat with useful context but without an explicit name, create a short, clear, relevant 2-6 word name from that context.",
-    "- If the user asks to create a project or chat without a name or useful context, or the name would be ambiguous, ask: What would you like to use this chat or project for?",
-    "- Creating a project only creates the project record. Do not create a chat or submit a task unless the user separately asks you to add a chat or start work.",
+    "- If the user asks for a computer task beyond a small direct inspection or edit, call dispatch_codex_task with the user's request as faithfully as possible.",
+    "- If the user asks to create a project or thread and gives an explicit name, use that name.",
+    "- If the user asks to create a project or thread with useful context but without an explicit name, create a short, clear, relevant 2-6 word name from that context.",
+    "- If the user asks to create a project or thread without a name or useful context, or the name would be ambiguous, ask: What would you like to use this thread or project for?",
+    "- Creating a project only creates the project record. Do not create a thread or submit a task unless the user separately asks you to add a thread or start work.",
     "- When the user names a repo, folder, cwd, or workspace path, pass it as workspacePath so Codex threads are filed under that real workspace in the Codex app.",
-    "- Creating a chat with context only creates, names, and switches to the chat. Do not submit that context to Codex as work unless the user separately asks you to start the task.",
-    "- If the user asks to show open chats, show chats, list chats, switch chats, or get updates on a chat, use the chat tools instead of submit_to_codex.",
+    "- Creating a thread with context only creates, names, and switches to the thread. Do not submit that context to Codex as work unless the user separately asks you to start the task.",
+    "- If the user asks to show open threads, list threads, switch threads, or get updates on a thread, use the thread/status tools instead of submit_to_codex.",
     "- Only add context that came from the current live voice conversation.",
     "- Do not make the task more ambitious than what the user asked.",
     "",
     "# Reasoning",
     "- For greetings, direct status checks, approval answers, and short confirmations, respond quickly.",
-    "- For multi-step user requests, chat routing, task handoff, or possible ambiguity, reason briefly before speaking or calling a tool.",
+    "- For multi-step user requests, thread routing, task handoff, or possible ambiguity, reason briefly before speaking or calling a tool.",
     "- Do not spend extra reasoning effort trying to reconstruct unclear audio.",
     "",
     "# Preambles",
     "- Use one short spoken preamble only when you are about to hand off noticeable work to Codex or wait for a tool result.",
-    "- Skip preambles for yes/no approvals, user corrections, status answers, unclear audio, and lightweight chat/project tools.",
+    "- Skip preambles for yes/no approvals, user corrections, status answers, unclear audio, and lightweight thread/project tools.",
     "- Describe the action, not your internal reasoning. Avoid filler like 'let me think' or 'one moment while I process that'.",
     "",
     "# Unclear Audio",
@@ -480,7 +530,7 @@ function realtimeInstructions(): string {
     "# Tool Behavior",
     "- Use only tools explicitly provided in the current tool list.",
     "- Do not invent, rename, simulate, or claim to use unavailable tools.",
-    "- When web_search succeeds, ground your spoken answer in its result and mention source URLs only when they are useful to the user.",
+    "- When web_search succeeds, synthesize from the returned Exa titles, URLs, and highlights. Treat the tool output as search evidence, not a prewritten answer.",
     "- Only say Codex completed or changed something after the relevant tool result confirms it.",
     "- If a tool fails, explain the failure briefly in user-friendly language and offer the next useful step.",
     "",
@@ -496,9 +546,9 @@ function realtimeInstructions(): string {
     "- If the user says cancel, stop, or abort in response to an approval, call answer_codex_approval with decision cancel.",
     "- If Codex asks a question and the user answers by voice, call answer_codex_question.",
     "- When asked for status, use get_codex_status instead of guessing.",
-    "- When asked for chat-specific status or updates, use get_codex_chat_status.",
+    "- When asked for project or thread-specific status, or before summarizing parallel work, use get_all_codex_thread_status or get_codex_thread_status.",
     "- When asked which Codex model or reasoning effort is in use, use get_codex_status.",
-    "- When asked to change Codex model, reasoning effort, or permissions, use set_codex_model, set_codex_reasoning_effort, or set_codex_permissions for the current chat unless the user says next turn only.",
+    "- When asked to change Codex model, reasoning effort, or permissions, use set_codex_model, set_codex_reasoning_effort, or set_codex_permissions for the current thread unless the user says next turn only.",
   ].join("\n");
 }
 
@@ -516,7 +566,7 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "submit_to_codex",
       description:
-        "Pass the user's spoken request to Codex, the actual computer-use agent. Use for implementation work, and target a named chat when coordinating parallel workstreams.",
+        "Legacy direct handoff to Codex. Prefer dispatch_codex_task when the user names a project, workspace, thread, or workstream.",
       parameters: {
         type: "object",
         properties: {
@@ -530,11 +580,15 @@ function realtimeTools(): unknown[] {
           },
           chatId: {
             type: "string",
-            description: "Optional target chat id when the user explicitly names a chat and it has already been resolved.",
+            description: "Optional target thread id when the user explicitly names a thread and it has already been resolved.",
+          },
+          threadHandle: {
+            type: "string",
+            description: "Optional canonical thread handle returned by status/list tools.",
           },
           chatName: {
             type: "string",
-            description: "Optional target chat name when the user explicitly names an existing chat.",
+            description: "Optional target thread name when the user explicitly names an existing thread.",
           },
           workspacePath: {
             type: "string",
@@ -547,14 +601,90 @@ function realtimeTools(): unknown[] {
     },
     {
       type: "function",
+      name: "dispatch_codex_task",
+      description:
+        "Resolve or create a workspace-bound project and a named thread/workstream, then start a Codex turn there. Use this for implementation or substantial computer-use tasks, especially when coordinating multiple projects or threads.",
+      parameters: {
+        type: "object",
+        properties: {
+          request: {
+            type: "string",
+            description: "The user's request, preserved as faithfully as possible.",
+          },
+          context: {
+            type: "string",
+            description:
+              "Brief relevant context from the current live voice conversation only. Include plan file paths or workstream intent when useful.",
+          },
+          project: {
+            type: "object",
+            description:
+              "Project/workspace target. Prefer workspacePath when the user names a real repo/folder; use projectName for a known project nickname.",
+              properties: {
+                projectId: { type: "string" },
+                projectHandle: {
+                  type: "string",
+                  description: "Canonical project handle returned by status/list tools, such as codex_voice.",
+                },
+                projectName: { type: "string" },
+                workspacePath: {
+                  type: "string",
+                description: "Absolute or ~/ workspace/repo directory, such as ~/workspace/codex-voice.",
+              },
+              createIfMissing: {
+                type: "boolean",
+                description:
+                  "Use true when the user wants to work in a named workspace/project and it may not exist in Codex Voice yet.",
+              },
+            },
+          },
+          thread: {
+            type: "object",
+            description:
+              "Thread/workstream target inside the project. Use a clear short name when creating or resolving a workstream.",
+              properties: {
+                chatId: { type: "string" },
+                threadHandle: {
+                  type: "string",
+                  description:
+                    "Canonical thread handle returned by status/list tools, such as codex_voice/main_panel.",
+                },
+                chatName: { type: "string" },
+                newChatName: {
+                  type: "string",
+                description:
+                  "Name for a new thread/workstream if one should be created, such as main panel or left pane UX.",
+              },
+              createIfMissing: {
+                type: "boolean",
+                description: "Create the named thread if it does not already exist. Defaults to true for named threads.",
+              },
+              forceNew: {
+                type: "boolean",
+                description: "Create a fresh thread even if a similarly named thread already exists.",
+              },
+            },
+          },
+        },
+        required: ["request"],
+      },
+    },
+    {
+      type: "function",
       name: "steer_codex",
-      description: "Append an update, correction, or extra instruction to a running Codex turn. Use chatId or chatName when several chats are active.",
+      description:
+        "Append an update, correction, or extra instruction to a running Codex turn. Use threadHandle, chatId, or chatName when several threads are active.",
       parameters: {
         type: "object",
         properties: {
           message: { type: "string" },
+          threadHandle: { type: "string" },
           chatId: { type: "string" },
           chatName: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
         },
         required: ["message"],
       },
@@ -567,8 +697,13 @@ function realtimeTools(): unknown[] {
         type: "object",
         properties: {
           reason: { type: "string" },
+          threadHandle: { type: "string" },
           chatId: { type: "string" },
           chatName: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
         },
       },
     },
@@ -586,7 +721,7 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "web_search",
       description:
-        "Search the live web for current public information, recent facts, news, pricing, docs, or anything the user explicitly asks to look up. Returns a concise answer and source URLs.",
+        "Search the live web with Exa for current public information, recent facts, news, pricing, docs, or anything the user explicitly asks to look up. Returns titles, URLs, and extractive highlights for the voice model to synthesize.",
       parameters: {
         type: "object",
         properties: {
@@ -736,7 +871,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "set_codex_model",
-      description: "Set the Codex model for the current chat or next turn only.",
+      description: "Set the Codex model for the current thread or next turn only.",
       parameters: {
         type: "object",
         properties: {
@@ -744,7 +879,7 @@ function realtimeTools(): unknown[] {
           scope: {
             type: "string",
             enum: ["chat", "nextTurn"],
-            description: "Use chat unless the user says this is only for the next request/turn.",
+            description: "Use chat for the current thread setting unless the user says this is only for the next request/turn.",
           },
         },
         required: ["model", "scope"],
@@ -753,7 +888,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "set_codex_reasoning_effort",
-      description: "Set the Codex reasoning effort for the current chat or next turn only.",
+      description: "Set the Codex reasoning effort for the current thread or next turn only.",
       parameters: {
         type: "object",
         properties: {
@@ -764,7 +899,7 @@ function realtimeTools(): unknown[] {
           scope: {
             type: "string",
             enum: ["chat", "nextTurn"],
-            description: "Use chat unless the user says this is only for the next request/turn.",
+            description: "Use chat for the current thread setting unless the user says this is only for the next request/turn.",
           },
         },
         required: ["reasoningEffort", "scope"],
@@ -774,7 +909,7 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "set_codex_permissions",
       description:
-        "Set the Codex permission mode for the current chat, or next turn only if the user explicitly asks. Default permissions asks when Codex decides approval is needed; auto-review routes eligible approval prompts through Codex auto-review; full access runs without approval prompts or filesystem sandboxing; custom config.toml defers approval and sandbox settings to the active Codex config.",
+        "Set the Codex permission mode for the current thread, or next turn only if the user explicitly asks. Default permissions asks when Codex decides approval is needed; auto-review routes eligible approval prompts through Codex auto-review; full access runs without approval prompts or filesystem sandboxing; custom config.toml defers approval and sandbox settings to the active Codex config.",
       parameters: {
         type: "object",
         properties: {
@@ -785,7 +920,7 @@ function realtimeTools(): unknown[] {
           scope: {
             type: "string",
             enum: ["chat", "nextTurn"],
-            description: "Use chat unless the user says this is only for the next request/turn.",
+            description: "Use chat for the current thread setting unless the user says this is only for the next request/turn.",
           },
         },
         required: ["permissionMode", "scope"],
@@ -795,7 +930,7 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "create_new_codex_project",
       description:
-        "Create a new Codex voice project record, without creating a chat/thread or submitting work. Provide a short name when available or infer one from useful context; pass workspacePath when the user names a real repo/folder so future Codex threads appear under that workspace.",
+        "Create a new Codex Voice project record, without creating a thread or submitting work. Provide a short name when available or infer one from useful context; pass workspacePath when the user names a real repo/folder so future Codex threads appear under that workspace.",
       parameters: {
         type: "object",
         properties: {
@@ -810,16 +945,31 @@ function realtimeTools(): unknown[] {
     },
     {
       type: "function",
-      name: "create_new_codex_chat",
+      name: "create_new_codex_thread",
       description:
-        "Create a new chat/thread inside the current Codex voice project for a distinct workstream, make it active, and do not submit work to Codex. Requires a short clear name; ask the user what the chat is for if no useful name/context exists.",
+        "Create a new thread/workstream inside a target Codex Voice project, make it active, and do not submit work to Codex. Requires a short clear name; ask the user what the thread is for if no useful name/context exists.",
       parameters: {
         type: "object",
         properties: {
           name: { type: "string" },
           context: {
             type: "string",
-            description: "Context used only to choose the chat name, not submitted to Codex as a task.",
+            description: "Context used only to choose the thread name, not submitted to Codex as a task.",
+          },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: {
+            type: "string",
+            description: "Optional real workspace/repo directory for the project that should contain this thread.",
+          },
+          createProjectIfMissing: {
+            type: "boolean",
+            description: "Create the target project if it does not exist yet.",
+          },
+          forceNew: {
+            type: "boolean",
+            description: "Create a fresh thread even if a matching thread name exists.",
           },
         },
         required: ["name"],
@@ -827,41 +977,77 @@ function realtimeTools(): unknown[] {
     },
     {
       type: "function",
-      name: "list_codex_chats",
-      description: "List chats/threads in the current Codex voice project.",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
-    },
-    {
-      type: "function",
-      name: "switch_codex_chat",
-      description: "Switch the active chat in the current Codex voice project by id or name.",
+      name: "list_codex_threads",
+      description:
+        "List Codex threads/workstreams in the current Codex Voice project, a target project, or all projects. Use this to get canonical projectHandle and thread handle values for later routing.",
       parameters: {
         type: "object",
         properties: {
-          chatId: { type: "string" },
-          name: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
+          allProjects: {
+            type: "boolean",
+            description: "Use true when the user asks for all projects/threads rather than one project.",
+          },
         },
       },
     },
     {
       type: "function",
-      name: "get_codex_chat_status",
-      description: "Get updates/status for one chat or all chats in the current project. Use this before coordinating or summarizing parallel Codex work.",
+      name: "get_all_codex_thread_status",
+      description:
+        "Get current status for active/open Codex threads across all projects or within one target project. Use before summarizing orchestration progress.",
       parameters: {
         type: "object",
         properties: {
-          chatId: { type: "string" },
-          name: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
         },
       },
     },
     {
       type: "function",
-      name: "show_open_codex_chats",
-      description: "Open the current project's chat drawer, equivalent to clicking the active project card.",
+      name: "switch_codex_thread",
+      description: "Switch the active thread in the current or target Codex Voice project by id, name, or canonical threadHandle.",
+      parameters: {
+        type: "object",
+        properties: {
+          chatId: { type: "string" },
+          threadHandle: { type: "string" },
+          name: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
+      name: "get_codex_thread_status",
+      description:
+        "Get updates/status for one thread or all threads in the current project. Use this before coordinating or summarizing parallel Codex work.",
+      parameters: {
+        type: "object",
+        properties: {
+          chatId: { type: "string" },
+          threadHandle: { type: "string" },
+          name: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
+      name: "show_open_codex_threads",
+      description: "Open the current project's thread list, equivalent to clicking the active project card.",
       parameters: {
         type: "object",
         properties: {},
@@ -870,7 +1056,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "list_recent_codex_projects",
-      description: "List recent Codex voice projects that can be summarized or continued.",
+      description: "List Codex voice projects that can be summarized, continued, or used as routing targets.",
       parameters: {
         type: "object",
         properties: {},
@@ -884,19 +1070,92 @@ function realtimeTools(): unknown[] {
         type: "object",
         properties: {
           projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
         },
       },
     },
     {
       type: "function",
       name: "summarize_recent_project",
-      description: "Ask Codex to summarize a recent project or chat, then return that summary for voice narration.",
+      description: "Ask Codex to summarize a recent project or thread, then return that summary for voice narration.",
       parameters: {
         type: "object",
         properties: {
           projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
           chatId: { type: "string" },
+          threadHandle: { type: "string" },
           chatName: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
+      name: "rename_codex_project",
+      description: "Rename a Codex Voice project after the user asks to rename it.",
+      parameters: {
+        type: "object",
+        properties: {
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
+          name: { type: "string" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      type: "function",
+      name: "rename_codex_thread",
+      description: "Rename a Codex Voice thread after the user asks to rename it.",
+      parameters: {
+        type: "object",
+        properties: {
+          chatId: { type: "string" },
+          threadHandle: { type: "string" },
+          chatName: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
+          name: { type: "string" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      type: "function",
+      name: "remove_codex_project",
+      description: "Remove a Codex Voice project from this app after the user asks to remove it.",
+      parameters: {
+        type: "object",
+        properties: {
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
+      name: "remove_codex_thread",
+      description: "Remove a Codex Voice thread from this app after the user asks to remove it.",
+      parameters: {
+        type: "object",
+        properties: {
+          chatId: { type: "string" },
+          threadHandle: { type: "string" },
+          chatName: { type: "string" },
+          projectId: { type: "string" },
+          projectHandle: { type: "string" },
+          projectName: { type: "string" },
+          workspacePath: { type: "string" },
         },
       },
     },

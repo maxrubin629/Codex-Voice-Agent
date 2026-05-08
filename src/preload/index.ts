@@ -7,6 +7,9 @@ import type {
   CodexSettingsScope,
   CodexServiceTier,
   CodexVoiceApi,
+  CreateCodexThreadArgs,
+  DispatchCodexTaskArgs,
+  ListCodexThreadsArgs,
   ReasoningEffort,
   RightPanelOpenTarget,
   RightPanelPreviewRequest,
@@ -30,12 +33,19 @@ const api: CodexVoiceApi = {
   createProject: (name?: string, workspacePath?: string | null) =>
     ipcRenderer.invoke("projects:create", { name, workspacePath }),
   resumeProject: (projectId: string) => ipcRenderer.invoke("projects:resume", { projectId }),
+  renameProject: (projectId: string, name: string) =>
+    ipcRenderer.invoke("projects:rename", { projectId, name }),
+  removeProject: (projectId: string) => ipcRenderer.invoke("projects:remove", { projectId }),
   archiveProject: (projectId: string) => ipcRenderer.invoke("projects:archive", { projectId }),
   restoreProject: (projectId: string) => ipcRenderer.invoke("projects:restore", { projectId }),
   createChat: (name: string, projectId?: string) =>
     ipcRenderer.invoke("projects:createChat", { name, projectId }),
   switchChat: (chatId: string, projectId?: string) =>
     ipcRenderer.invoke("projects:switchChat", { chatId, projectId }),
+  renameChat: (chatId: string, name: string, projectId?: string) =>
+    ipcRenderer.invoke("projects:renameChat", { chatId, name, projectId }),
+  removeChat: (chatId: string, projectId?: string) =>
+    ipcRenderer.invoke("projects:removeChat", { chatId, projectId }),
   archiveChat: (chatId: string, projectId?: string) =>
     ipcRenderer.invoke("projects:archiveChat", { chatId, projectId }),
   restoreChat: (chatId: string, projectId?: string) =>
@@ -44,10 +54,17 @@ const api: CodexVoiceApi = {
   showProjectChats: (open?: boolean) => ipcRenderer.invoke("projects:showChats", { open }),
   summarizeProject: (projectId?: string, chatId?: string) =>
     ipcRenderer.invoke("projects:summarize", { projectId, chatId }),
+  createThread: (args: CreateCodexThreadArgs) => ipcRenderer.invoke("projects:createThread", args),
+  listProjectThreads: (args?: ListCodexThreadsArgs) => ipcRenderer.invoke("projects:listThreads", args ?? {}),
+  getAllThreadStatus: (args?: ListCodexThreadsArgs) =>
+    ipcRenderer.invoke("projects:allThreadStatus", args ?? {}),
+  dispatchCodexTask: (args: DispatchCodexTaskArgs) => ipcRenderer.invoke("codex:dispatchTask", args),
   sendToCodex: (text: string, chatId?: string, workspacePath?: string | null) =>
     ipcRenderer.invoke("codex:send", { text, chatId, workspacePath }),
   steerCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:steer", { text, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
+  openCodexThreadInApp: (threadId: string) =>
+    ipcRenderer.invoke("codex:openThreadInApp", { threadId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
   setCodexSettings: (
     settings: {
@@ -80,6 +97,12 @@ const api: CodexVoiceApi = {
   cancelWebSearch: (requestId: string) => ipcRenderer.invoke("voiceTools:cancelWebSearch", { requestId }),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
+  revealOpenAiApiKey: () => ipcRenderer.invoke("settings:revealOpenAiApiKey"),
+  copyOpenAiApiKey: () => ipcRenderer.invoke("settings:copyOpenAiApiKey"),
+  saveExaApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveExaApiKey", { apiKey }),
+  clearExaApiKey: () => ipcRenderer.invoke("settings:clearExaApiKey"),
+  revealExaApiKey: () => ipcRenderer.invoke("settings:revealExaApiKey"),
+  copyExaApiKey: () => ipcRenderer.invoke("settings:copyExaApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),
   setRealtimeSettings: (settings) => ipcRenderer.invoke("realtime:setSettings", { settings }),
   onWindowChromeState: (listener: (state: WindowChromeState) => void) => {

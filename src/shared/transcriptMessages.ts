@@ -62,6 +62,8 @@ function transcriptMetadata(event: AppEvent, raw: Record<string, unknown> | null
   if (outputIndex !== null) metadata.outputIndex = outputIndex;
   const contentIndex = numberField(raw?.content_index) ?? numberField(raw?.contentIndex);
   if (contentIndex !== null) metadata.contentIndex = contentIndex;
+  const attachments = transcriptAttachments(raw?.attachments);
+  if (attachments.length > 0) metadata.attachments = attachments;
   return metadata;
 }
 
@@ -71,6 +73,9 @@ function realtimeTranscriptDetails(
 ): { role: VoiceTranscriptMessageRole; phase: "streaming" | "completed" } | null {
   const rawType = stringField(raw?.type);
   if (event.source !== "realtime") return null;
+  if (event.kind === "userInput" || rawType === "codex_voice.user_input") {
+    return { role: "user", phase: "completed" };
+  }
   if (event.kind === "userTranscriptDelta" || rawType === "conversation.item.input_audio_transcription.delta") {
     return { role: "user", phase: "streaming" };
   }
@@ -100,12 +105,16 @@ function realtimeTranscriptText(
       ? streamedString(raw?.delta) ?? stringField(raw?.transcript) ?? stringField(raw?.text)
       : stringField(raw?.transcript) ?? stringField(raw?.text);
   if (text) return text;
+  const attachmentText = attachmentTranscriptText(raw?.attachments);
+  if (attachmentText) return attachmentText;
   const fallback = stringField(event.message);
   if (!fallback || fallback === event.kind || fallback.includes("_audio_transcript")) return null;
   return fallback;
 }
 
 function realtimeTranscriptKey(role: VoiceTranscriptMessageRole, raw: Record<string, unknown> | null): string | null {
+  const userInputId = stringField(raw?.userInputId);
+  if (userInputId) return `${role}:${userInputId}`;
   const itemId = stringField(raw?.item_id) ?? stringField(raw?.itemId);
   const responseId = stringField(raw?.response_id) ?? stringField(raw?.responseId);
   const outputIndex = numberField(raw?.output_index) ?? numberField(raw?.outputIndex);
@@ -130,4 +139,33 @@ function streamedString(value: unknown): string | null {
 
 function numberField(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function transcriptAttachments(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): Record<string, unknown> | null => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const record = item as Record<string, unknown>;
+      const name = stringField(record.name);
+      const mimeType = stringField(record.mimeType);
+      const sizeBytes = numberField(record.sizeBytes);
+      if (!name || !mimeType || sizeBytes === null) return null;
+      return {
+        id: stringField(record.id) ?? name,
+        kind: stringField(record.kind) ?? "image",
+        name,
+        mimeType,
+        sizeBytes,
+        localPath: stringField(record.localPath),
+      };
+    })
+    .filter((item): item is Record<string, unknown> => item !== null);
+}
+
+function attachmentTranscriptText(value: unknown): string | null {
+  const attachments = transcriptAttachments(value);
+  if (attachments.length === 0) return null;
+  if (attachments.length === 1) return `Image: ${stringField(attachments[0].name) ?? "attachment"}`;
+  return `${attachments.length} images`;
 }

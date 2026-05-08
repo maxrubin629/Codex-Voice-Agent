@@ -100,6 +100,13 @@ export async function openRightPanelTarget(target: RightPanelOpenTarget): Promis
   if (result) throw new Error(result);
 }
 
+export async function openCodexThreadInApp(threadId: string | null | undefined): Promise<void> {
+  const normalized = threadId?.trim();
+  if (!normalized) throw new Error("A Codex thread id is required.");
+  if (!isUuid(normalized)) throw new Error(`Codex thread id is not a valid deep-link id: ${normalized}`);
+  await shell.openExternal(`codex://threads/${encodeURIComponent(normalized)}`);
+}
+
 async function previewUrl(urlValue: string | undefined): Promise<RightPanelPreviewResult> {
   const raw = urlValue?.trim();
   if (!raw) return emptyPreview("No URL selected.");
@@ -411,6 +418,10 @@ function isLocalPreviewUrl(url: URL): boolean {
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   const host = url.hostname.toLowerCase();
   return host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".localhost");
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 function formatBytes(bytes: number): string {
