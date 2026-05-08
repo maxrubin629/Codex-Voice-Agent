@@ -160,14 +160,14 @@ export function VoiceTranscriptContent({
     () => buildTranscriptEntries(events, state, summary ?? null, messages),
     [events, messages, state, summary],
   );
-  const latestEntryId = entries.length > 0 ? entries[entries.length - 1].id : "";
+  const latestEntrySignature = transcriptEntryScrollSignature(entries.at(-1) ?? null);
 
   useEffect(() => {
     if (!open) return;
     const node = scrollRef.current;
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-  }, [latestEntryId, open]);
+  }, [latestEntrySignature, open]);
 
   return (
     <div ref={scrollRef} className={["voice-transcript-list", className].filter(Boolean).join(" ")}>
@@ -182,6 +182,23 @@ export function VoiceTranscriptContent({
       )}
     </div>
   );
+}
+
+function transcriptEntryScrollSignature(entry: TranscriptEntry | null): string {
+  if (!entry) return "";
+  if (entry.kind === "message") {
+    return `${entry.id}:${entry.body.length}:${entry.streaming ? "streaming" : "done"}`;
+  }
+  if (entry.kind === "work") {
+    return `${entry.id}:${entry.children.length}:${entry.active ? "active" : "idle"}`;
+  }
+  if (entry.kind === "activity") {
+    return `${entry.id}:${entry.summary}:${entry.rows.length}:${entry.active ? "active" : "idle"}`;
+  }
+  if (entry.kind === "reasoning") {
+    return `${entry.id}:${entry.content.length}:${entry.active ? "active" : "idle"}`;
+  }
+  return `${entry.id}:${entry.title}:${entry.body?.length ?? 0}:${entry.active ? "active" : "idle"}`;
 }
 
 function VoiceConversationEntry({ entry }: { entry: TranscriptEntry }): React.ReactElement {
@@ -458,6 +475,7 @@ function buildTranscriptEntries(
   const completedRealtimeStreams = new Set<string>();
   const realtimeStreamingEntryIndexes = new Map<string, number>();
   const storedTranscriptMessageIds = new Set<string>();
+  const liveTranscriptMessageIds = new Set<string>();
   const seenPendingRequestIds = new Set<string>();
   const turns = new Map<string, TurnDraft>();
   const timeline: TimelineItem[] = [];
@@ -493,11 +511,10 @@ function buildTranscriptEntries(
     timeline.push({ kind: "entry", entry });
   };
 
-  hydrateThreadSummary(summary, activeChatId, activeThreadId, ensureTurn);
-  hydrateTranscriptMessages(messages, activeChatId, activeThreadId, storedTranscriptMessageIds, pushEntry);
-
   for (const event of chronologicalEvents) {
     const raw = recordFromUnknown(event.raw);
+    const transcriptMessageId = transcriptMessageIdFromEvent(event);
+    if (transcriptMessageId) liveTranscriptMessageIds.add(transcriptMessageId);
     if (event.source === "realtime" && isRealtimeUserTranscript(event.kind)) {
       completedRealtimeStreams.add(realtimeStreamKey("user", raw, event));
     }
@@ -505,6 +522,9 @@ function buildTranscriptEntries(
       completedRealtimeStreams.add(realtimeStreamKey("assistant", raw, event));
     }
   }
+
+  hydrateThreadSummary(summary, activeChatId, activeThreadId, ensureTurn);
+  hydrateTranscriptMessages(messages, activeChatId, activeThreadId, storedTranscriptMessageIds, liveTranscriptMessageIds, pushEntry);
 
   for (const event of chronologicalEvents) {
     if (!eventBelongsToActiveChat(event, activeChatId, activeThreadId)) continue;
@@ -680,12 +700,14 @@ function hydrateTranscriptMessages(
   activeChatId: string | null,
   activeThreadId: string | null,
   seenMessageIds: Set<string>,
+  liveMessageIds: Set<string>,
   pushEntry: (entry: TranscriptEntry) => void,
 ): void {
   const sortedMessages = [...messages].sort(compareStoredTranscriptMessages);
   for (const message of sortedMessages) {
     if (activeChatId && message.chatId !== activeChatId) continue;
     if (message.threadId && activeThreadId && message.threadId !== activeThreadId) continue;
+    if (liveMessageIds.has(message.id)) continue;
     const body = message.text.trim();
     if (!body) continue;
     seenMessageIds.add(message.id);
@@ -1602,11 +1624,12 @@ function webSearchQuery(raw: Record<string, unknown>): string | null {
 function realtimeToolRows(name: string, args: Record<string, unknown> | null, id: string): ActivityRow[] {
   const details = args ? humanReadableArgumentDetails(args) : [];
   const label = realtimeToolCallBody(name, args);
+  const icon: ActivityIcon = name === "web_search" ? "globe" : name.includes("codex") ? "branch" : "tool";
   return [
-    { id: `${id}-main`, icon: name.includes("codex") ? "branch" : "tool", label },
+    { id: `${id}-main`, icon, label },
     ...details.map((detail, index) => ({
       id: `${id}-detail-${index}`,
-      icon: "tool" as ActivityIcon,
+      icon,
       label: detail.label,
       meta: detail.value,
       tone: "muted" as ActivityTone,
@@ -1636,6 +1659,10 @@ function realtimeToolCallBody(name: string, args: Record<string, unknown> | null
   }
   if (name === "write_stdin") return "Sending input to a running command";
   if (name === "apply_patch") return "Applying a file change";
+  if (name === "web_search") {
+    const query = stringFromUnknown(args?.query);
+    return query ? `Searching web for ${compactValue(query, 140)}` : "Searching the web";
+  }
   if (name === "submit_to_codex") return "Sending a request to Codex";
   if (name === "steer_codex") return "Sending an update to the active Codex turn";
   if (name === "interrupt_codex") return "Asking Codex to stop";
@@ -1661,6 +1688,7 @@ function realtimeToolResultBody(
   if (name === "exec_command") return "Command completed";
   if (name === "write_stdin") return "Input sent";
   if (name === "apply_patch") return "File change applied";
+  if (name === "web_search") return "Web search completed";
   if (name === "submit_to_codex") return "Codex received the request";
   if (name === "steer_codex") return "Codex received the update";
   if (name === "interrupt_codex") return "Interruption requested";
@@ -1954,6 +1982,7 @@ function readableToolName(name: string): string {
     .replace(/^exec_command$/, "Shell command")
     .replace(/^write_stdin$/, "Write stdin")
     .replace(/^apply_patch$/, "Apply patch")
+    .replace(/^web_search$/, "Web search")
     .replace(/_/g, " ")
     .split(/\s+/)
     .map((part, index) => (index === 0 ? capitalize(part) : part))

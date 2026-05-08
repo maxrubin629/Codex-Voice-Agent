@@ -6,13 +6,14 @@ import type {
 
 export function transcriptMessageFromEvent(event: AppEvent): VoiceTranscriptMessage | null {
   const raw = recordFromUnknown(event.raw);
-  const role = realtimeCompletedTranscriptRole(event, raw);
-  if (!role) return null;
+  const transcript = realtimeTranscriptDetails(event, raw);
+  if (!transcript) return null;
+  const role = transcript.role;
 
   const chatId = stringField(raw?.chatId);
   if (!chatId) return null;
 
-  const text = realtimeTranscriptText(event, raw);
+  const text = realtimeTranscriptText(event, raw, transcript.phase);
   if (!text) return null;
 
   const id = transcriptMessageIdFromEvent(event);
@@ -32,8 +33,8 @@ export function transcriptMessageFromEvent(event: AppEvent): VoiceTranscriptMess
     role,
     text,
     createdAt: event.at,
-    completedAt: event.at,
-    status: "completed",
+    completedAt: transcript.phase === "completed" ? event.at : null,
+    status: transcript.phase === "completed" ? "completed" : "streaming",
     ...(turnId ? { turnId } : {}),
     ...(responseId ? { responseId } : {}),
     ...(itemId ? { itemId } : {}),
@@ -43,12 +44,12 @@ export function transcriptMessageFromEvent(event: AppEvent): VoiceTranscriptMess
 
 export function transcriptMessageIdFromEvent(event: AppEvent): string | null {
   const raw = recordFromUnknown(event.raw);
-  const role = realtimeCompletedTranscriptRole(event, raw);
-  if (!role) return null;
+  const transcript = realtimeTranscriptDetails(event, raw);
+  if (!transcript) return null;
   const chatId = stringField(raw?.chatId);
   if (!chatId) return null;
-  const key = realtimeTranscriptKey(role, raw);
-  return `realtime:${chatId}:${key || `${role}:${event.at}`}`;
+  const key = realtimeTranscriptKey(transcript.role, raw);
+  return `realtime:${chatId}:${key || `${transcript.role}:${event.at}`}`;
 }
 
 function transcriptMetadata(event: AppEvent, raw: Record<string, unknown> | null): Record<string, unknown> {
@@ -64,23 +65,40 @@ function transcriptMetadata(event: AppEvent, raw: Record<string, unknown> | null
   return metadata;
 }
 
-function realtimeCompletedTranscriptRole(
+function realtimeTranscriptDetails(
   event: AppEvent,
   raw: Record<string, unknown> | null,
-): VoiceTranscriptMessageRole | null {
+): { role: VoiceTranscriptMessageRole; phase: "streaming" | "completed" } | null {
   const rawType = stringField(raw?.type);
   if (event.source !== "realtime") return null;
+  if (event.kind === "userTranscriptDelta" || rawType === "conversation.item.input_audio_transcription.delta") {
+    return { role: "user", phase: "streaming" };
+  }
+  if (
+    event.kind === "voiceDelta" ||
+    event.kind === "assistantTranscriptDelta" ||
+    rawType === "response.output_audio_transcript.delta"
+  ) {
+    return { role: "assistant", phase: "streaming" };
+  }
   if (event.kind === "userTranscript" || rawType === "conversation.item.input_audio_transcription.completed") {
-    return "user";
+    return { role: "user", phase: "completed" };
   }
   if (event.kind === "assistantTranscript" || rawType === "response.output_audio_transcript.done") {
-    return "assistant";
+    return { role: "assistant", phase: "completed" };
   }
   return null;
 }
 
-function realtimeTranscriptText(event: AppEvent, raw: Record<string, unknown> | null): string | null {
-  const text = stringField(raw?.transcript) ?? stringField(raw?.text);
+function realtimeTranscriptText(
+  event: AppEvent,
+  raw: Record<string, unknown> | null,
+  phase: "streaming" | "completed",
+): string | null {
+  const text =
+    phase === "streaming"
+      ? streamedString(raw?.delta) ?? stringField(raw?.transcript) ?? stringField(raw?.text)
+      : stringField(raw?.transcript) ?? stringField(raw?.text);
   if (text) return text;
   const fallback = stringField(event.message);
   if (!fallback || fallback === event.kind || fallback.includes("_audio_transcript")) return null;
@@ -104,6 +122,10 @@ function recordFromUnknown(value: unknown): Record<string, unknown> | null {
 
 function stringField(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function streamedString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function numberField(value: unknown): number | null {

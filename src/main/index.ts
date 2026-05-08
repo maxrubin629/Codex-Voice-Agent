@@ -10,6 +10,7 @@ import {
   previewRightPanelTarget,
   readGitChangeSummary,
 } from "./rightPanelData";
+import { cancelWebSearchForRealtime, searchWebForRealtime } from "./realtime";
 import { appendBufferedEvent } from "../shared/eventBuffer";
 import type {
   ApprovalDecision,
@@ -24,6 +25,7 @@ import type {
   RightPanelPreviewRequest,
   ToolQuestionAnswer,
   VoiceExecCommandArgs,
+  VoiceWebSearchArgs,
   VoiceWriteStdinArgs,
   WindowChromeState,
 } from "../shared/types";
@@ -381,6 +383,12 @@ function registerIpc(): void {
   registerIpcHandler("voiceTools:applyPatch", (_event, payload: { input: string }) =>
     requireOrchestrator().applyPatchForVoice(payload.input),
   );
+  registerIpcHandler("voiceTools:webSearch", (_event, payload: VoiceWebSearchArgs) =>
+    searchWebForRealtime(payload),
+  );
+  registerIpcHandler("voiceTools:cancelWebSearch", (_event, payload: { requestId: string }) => {
+    cancelWebSearchForRealtime(payload.requestId);
+  });
   registerIpcHandler("settings:saveOpenAiApiKey", (_event, payload: { apiKey: string }) => {
     saveOpenAiApiKey(payload.apiKey);
   });

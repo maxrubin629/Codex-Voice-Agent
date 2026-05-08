@@ -73,6 +73,7 @@ export function RightPanel({
   state,
   events,
   width,
+  activateTranscriptRequest,
   onWidthChange,
   onClose,
   onAction,
@@ -81,6 +82,7 @@ export function RightPanel({
   state: AppState;
   events: AppEvent[];
   width: number;
+  activateTranscriptRequest: number;
   onWidthChange: (width: number) => void;
   onClose: () => void;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
@@ -133,6 +135,16 @@ export function RightPanel({
   useEffect(() => {
     persistActiveTabId(activeTabId);
   }, [activeTabId]);
+
+  useEffect(() => {
+    if (!open || activateTranscriptRequest === 0) return;
+    const transcriptTab = builtInTabs.find((tab) => tab.id === "transcript");
+    if (!transcriptTab) return;
+    setTabs((current) =>
+      current.some((tab) => tab.id === "transcript") ? current : [...current, transcriptTab],
+    );
+    setActiveTabId("transcript");
+  }, [activateTranscriptRequest, open]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -431,7 +443,7 @@ export function RightPanel({
         </div>
 
         <section
-          className="voice-right-body"
+          className={`voice-right-body ${activeTab?.id === "transcript" ? "transcript-active" : ""}`}
           role="tabpanel"
           id={activeTab ? `voice-right-panel-${activeTab.id}` : undefined}
           aria-labelledby={activeTab ? `voice-right-tab-${activeTab.id}` : undefined}

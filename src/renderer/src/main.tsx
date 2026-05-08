@@ -188,25 +188,40 @@ type ArchivedChat = {
   chat: VoiceChat;
 };
 
+type VoiceEventContext = {
+  projectId: string;
+  chatId: string;
+  threadId?: string | null;
+};
+
 function appWindowKind(): AppWindowKind {
   const kind = new URLSearchParams(window.location.search).get("window");
   return kind === "debug" ? "debug" : "voice";
 }
 
-function eventWithActiveContext(event: AppEvent, state: AppState): AppEvent {
-  if (event.source !== "realtime") return event;
+function activeVoiceEventContext(state: AppState): VoiceEventContext | null {
   const project = state.activeProject;
-  if (!project) return event;
+  if (!project) return null;
   const chat = activeVoiceChatForState(state);
-  if (!chat) return event;
+  if (!chat) return null;
+  return {
+    projectId: project.id,
+    chatId: chat.id,
+    threadId: chat.codexThreadId,
+  };
+}
+
+function eventWithVoiceContext(event: AppEvent, context: VoiceEventContext | null): AppEvent {
+  if (event.source !== "realtime") return event;
+  if (!context) return event;
   const raw = event.raw && typeof event.raw === "object" && !Array.isArray(event.raw) ? event.raw : {};
   return {
     ...event,
     raw: {
       ...raw,
-      projectId: project.id,
-      chatId: chat.id,
-      threadId: chat.codexThreadId,
+      projectId: context.projectId,
+      chatId: context.chatId,
+      threadId: context.threadId,
     },
   };
 }
@@ -227,6 +242,55 @@ function activeVoiceChatForState(state: AppState): VoiceChat | null {
 async function activeTranscriptMessages(state: AppState) {
   const chat = activeVoiceChatForState(state);
   return chat ? window.codexVoice.getTranscriptMessages(chat.id) : [];
+}
+
+function shouldAutoOpenTranscriptForEvent(event: AppEvent): boolean {
+  if (event.source !== "realtime") return false;
+  const raw = recordFromUnknown(event.raw);
+  const rawType = stringFromUnknown(raw?.type);
+  return [
+    "userSpeechStarted",
+    "userTranscriptDelta",
+    "userTranscript",
+    "input_audio_buffer.speech_started",
+    "conversation.item.input_audio_transcription.delta",
+    "conversation.item.input_audio_transcription.completed",
+  ].includes(event.kind) || [
+    "input_audio_buffer.speech_started",
+    "conversation.item.input_audio_transcription.delta",
+    "conversation.item.input_audio_transcription.completed",
+  ].includes(rawType ?? "");
+}
+
+function eventMatchesActiveTranscriptContext(event: AppEvent, state: AppState): boolean {
+  const raw = recordFromUnknown(event.raw);
+  const chatId = stringFromUnknown(raw?.chatId);
+  const threadId = stringFromUnknown(raw?.threadId);
+  const activeChat = activeVoiceChatForState(state);
+  const activeChatId = state.runtime.activeChatId ?? activeChat?.id ?? null;
+  const activeThreadId = activeChat?.codexThreadId ?? state.activeProject?.codexThreadId ?? null;
+  if (chatId && activeChatId) return chatId === activeChatId;
+  if (threadId && activeThreadId) return threadId === activeThreadId;
+  return true;
+}
+
+function eventIdentity(event: AppEvent): string {
+  const raw = recordFromUnknown(event.raw);
+  const itemId = stringFromUnknown(raw?.item_id) ?? stringFromUnknown(raw?.itemId);
+  const responseId = stringFromUnknown(raw?.response_id) ?? stringFromUnknown(raw?.responseId);
+  const outputIndex = typeof raw?.output_index === "number" ? raw.output_index : "";
+  const contentIndex = typeof raw?.content_index === "number" ? raw.content_index : "";
+  return [event.at, event.source, event.kind, itemId, responseId, outputIndex, contentIndex, event.message.length]
+    .filter((value) => value !== null && value !== undefined && value !== "")
+    .join(":");
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function stringFromUnknown(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function isVoiceOrbPresetId(value: string | null): value is VoiceOrbPresetId {
@@ -460,6 +524,7 @@ function App(): React.ReactElement {
     if (voiceConnecting) return;
     await runAction(async () => {
       setVoiceConnecting(true);
+      const voiceEventContext = activeVoiceEventContext(stateRef.current);
       const client = new RealtimeVoiceClient({
         onConnectionChange: (connected, label) => {
           setVoiceConnected(connected);
@@ -471,10 +536,13 @@ function App(): React.ReactElement {
           setVoiceStatus(label);
         },
         onLog: (event) => {
-          void window.codexVoice.logEvent(eventWithActiveContext(event, stateRef.current));
+          void window.codexVoice.logEvent(eventWithVoiceContext(event, voiceEventContext));
         },
         onOutputLevel: updateVoiceOutputLevel,
-        getTranscriptMessages: () => activeTranscriptMessages(stateRef.current),
+        getTranscriptMessages: () =>
+          voiceEventContext
+            ? window.codexVoice.getTranscriptMessages(voiceEventContext.chatId)
+            : activeTranscriptMessages(stateRef.current),
       });
       voiceRef.current = client;
       try {
@@ -616,6 +684,7 @@ function VoiceHome({
 }): React.ReactElement {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [futureOpen, setFutureOpen] = useState(false);
+  const [transcriptActivationRequest, setTranscriptActivationRequest] = useState(0);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
   const [leftPaneWidth, setLeftPaneWidth] = useState(() => loadPaneWidth(leftPanelWidthStorageKey));
   const [rightPanelWidth, setRightPanelWidth] = useState(() => loadPaneWidth(rightPanelWidthStorageKey));
@@ -638,6 +707,8 @@ function VoiceHome({
   const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
   const paneTogglePointerActivationRef = useRef<PaneSide | null>(null);
+  const lastAutoTranscriptEventRef = useRef<string | null>(null);
+  const transcriptAutoActivatedRef = useRef(false);
   const paneReplacementTimeoutRef = useRef<number | null>(null);
   const paneResizeFrameRef = useRef<number | null>(null);
   const pendingPaneResizeRef = useRef<{ pane: PaneSide; width: number } | null>(null);
@@ -720,6 +791,31 @@ function VoiceHome({
     mediaQuery.addEventListener("change", updateCanShowBothPanes);
     return () => mediaQuery.removeEventListener("change", updateCanShowBothPanes);
   }, []);
+
+  useEffect(() => {
+    const latestEvent = events[0];
+    if (!latestEvent || !canShowBothPanes) return;
+    if (!shouldAutoOpenTranscriptForEvent(latestEvent)) return;
+    if (!eventMatchesActiveTranscriptContext(latestEvent, state)) return;
+    if (futureOpen && transcriptAutoActivatedRef.current) return;
+
+    const identity = eventIdentity(latestEvent);
+    if (lastAutoTranscriptEventRef.current === identity) return;
+    lastAutoTranscriptEventRef.current = identity;
+
+    clearPaneReplacementTimeout();
+    lastOpenedPaneRef.current = "future";
+    setFutureOpen(true);
+    setTranscriptActivationRequest((current) => current + 1);
+    transcriptAutoActivatedRef.current = true;
+  }, [canShowBothPanes, events, futureOpen, state]);
+
+  useEffect(() => {
+    if (!voiceConnected) {
+      transcriptAutoActivatedRef.current = false;
+      lastAutoTranscriptEventRef.current = null;
+    }
+  }, [voiceConnected]);
 
   useEffect(() => {
     return () => {
@@ -1413,6 +1509,7 @@ function VoiceHome({
           state={state}
           events={events}
           width={rightPanelWidth}
+          activateTranscriptRequest={transcriptActivationRequest}
           onWidthChange={setRightPanelWidth}
           onClose={() => setFutureOpen(false)}
           onAction={onAction}

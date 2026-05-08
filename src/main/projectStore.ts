@@ -294,7 +294,8 @@ export class ProjectStore {
       const filePath = this.transcriptPath(project, chat.id);
       const existingMessages = await this.readTranscriptMessagesFile(filePath, chat.id);
       const byId = new Map(existingMessages.map((existing) => [existing.id, existing]));
-      byId.set(normalized.id, normalized);
+      const existing = byId.get(normalized.id);
+      byId.set(normalized.id, mergeTranscriptMessage(existing, normalized));
       const messages = [...byId.values()]
         .sort(compareTranscriptMessages)
         .slice(-MAX_TRANSCRIPT_MESSAGES);
@@ -643,6 +644,29 @@ function normalizeTranscriptMessage(
     ...(responseId ? { responseId } : {}),
     ...(itemId ? { itemId } : {}),
     ...(metadata ? { metadata } : {}),
+  };
+}
+
+function mergeTranscriptMessage(
+  existing: VoiceTranscriptMessage | undefined,
+  incoming: VoiceTranscriptMessage,
+): VoiceTranscriptMessage {
+  if (!existing) return incoming;
+  if (incoming.status !== "streaming") {
+    return {
+      ...incoming,
+      createdAt: existing.createdAt,
+    };
+  }
+  if (existing.status !== "streaming") return existing;
+  return {
+    ...incoming,
+    text: `${existing.text}${incoming.text}`,
+    createdAt: existing.createdAt,
+    metadata: {
+      ...(existing.metadata ?? {}),
+      ...(incoming.metadata ?? {}),
+    },
   };
 }
 

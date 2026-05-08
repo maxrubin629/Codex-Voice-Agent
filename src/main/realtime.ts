@@ -13,11 +13,18 @@ import {
   type RealtimeModelId,
   type RealtimeReasoningEffort,
   type RealtimeVoiceId,
+  type VoiceWebSearchAction,
+  type VoiceWebSearchArgs,
+  type VoiceWebSearchResult,
+  type VoiceWebSearchSource,
 } from "../shared/types";
 import { getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
 
 const REALTIME_ENDPOINT = "https://api.openai.com/v1/realtime/client_secrets";
+const RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 const SETTINGS_FILE_NAME = "codex-voice-realtime-settings.json";
+const DEFAULT_REALTIME_WEB_SEARCH_MODEL = "gpt-5.4-mini";
+const webSearchControllers = new Map<string, AbortController>();
 
 type RealtimeSettingsFile = {
   version: 1;
@@ -169,6 +176,175 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
   };
 }
 
+export async function searchWebForRealtime(args: VoiceWebSearchArgs): Promise<VoiceWebSearchResult> {
+  const apiKey = getOpenAiApiKey();
+  if (!apiKey) {
+    throw new Error("Add an OpenAI API key to use web search.");
+  }
+
+  const query = requireSearchQuery(args?.query);
+  const context = optionalSearchContext(args?.context);
+  const model = realtimeWebSearchModel();
+  const requestId = optionalRequestId(args?.requestId);
+  const controller = requestId ? new AbortController() : null;
+  if (requestId && controller) {
+    webSearchControllers.set(requestId, controller);
+  }
+  const input = [
+    "Search the web for the voice assistant's user.",
+    "Return a concise, source-backed answer suitable for a spoken follow-up.",
+    "Do not include markdown footnote syntax; include source URLs in the answer when they are important.",
+    "",
+    `Query: ${query}`,
+    context ? `Conversation context: ${context}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  try {
+    const response = await fetch(RESPONSES_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      signal: controller?.signal,
+      body: JSON.stringify({
+        model,
+        tools: [{ type: "web_search" }],
+        input,
+        max_output_tokens: 900,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Web search failed: ${response.status} ${text}`);
+    }
+
+    const data = (await response.json()) as Record<string, unknown>;
+    const answer = responseOutputText(data) || "The web search completed, but no answer text was returned.";
+
+    return {
+      query,
+      answer,
+      sources: responseUrlCitations(data),
+      actions: responseWebSearchActions(data),
+      model,
+    };
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error("Web search canceled.");
+    }
+    throw error;
+  } finally {
+    if (requestId) {
+      webSearchControllers.delete(requestId);
+    }
+  }
+}
+
+export function cancelWebSearchForRealtime(requestId: string): void {
+  const controller = webSearchControllers.get(requestId);
+  if (!controller) return;
+  controller.abort();
+  webSearchControllers.delete(requestId);
+}
+
+function realtimeWebSearchModel(): string {
+  const configured = process.env.OPENAI_REALTIME_WEB_SEARCH_MODEL?.trim();
+  return configured || DEFAULT_REALTIME_WEB_SEARCH_MODEL;
+}
+
+function requireSearchQuery(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("web_search requires a non-empty query.");
+  }
+  return value.trim().slice(0, 1000);
+}
+
+function optionalSearchContext(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, 1600) : null;
+}
+
+function optionalRequestId(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, 120) : null;
+}
+
+function responseOutputText(data: Record<string, unknown>): string {
+  const direct = stringFromUnknown(data.output_text);
+  if (direct) return direct;
+
+  const chunks: string[] = [];
+  for (const item of arrayRecords(data.output)) {
+    if (stringFromUnknown(item.type) !== "message") continue;
+    for (const content of arrayRecords(item.content)) {
+      const text = stringFromUnknown(content.text);
+      if (text) chunks.push(text);
+    }
+  }
+  return chunks.join("\n\n").trim();
+}
+
+function responseUrlCitations(data: Record<string, unknown>): VoiceWebSearchSource[] {
+  const sources = new Map<string, VoiceWebSearchSource>();
+  for (const item of arrayRecords(data.output)) {
+    if (stringFromUnknown(item.type) !== "message") continue;
+    for (const content of arrayRecords(item.content)) {
+      for (const annotation of arrayRecords(content.annotations)) {
+        if (stringFromUnknown(annotation.type) !== "url_citation") continue;
+        const url = stringFromUnknown(annotation.url);
+        if (!url || sources.has(url)) continue;
+        sources.set(url, {
+          url,
+          title: stringFromUnknown(annotation.title),
+        });
+      }
+    }
+  }
+  return [...sources.values()].slice(0, 8);
+}
+
+function responseWebSearchActions(data: Record<string, unknown>): VoiceWebSearchAction[] {
+  const actions: VoiceWebSearchAction[] = [];
+  for (const item of arrayRecords(data.output)) {
+    if (stringFromUnknown(item.type) !== "web_search_call") continue;
+    const action = recordFromUnknown(item.action);
+    if (!action) continue;
+    const type = stringFromUnknown(action.type) ?? "search";
+    const query = stringFromUnknown(action.query);
+    const queries = arrayStrings(action.queries);
+    actions.push({
+      type,
+      ...(query ? { query } : {}),
+      ...(queries.length > 0 ? { queries } : {}),
+    });
+  }
+  return actions.slice(0, 12);
+}
+
+function arrayRecords(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    : [];
+}
+
+function arrayStrings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        .map((item) => item.trim())
+    : [];
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function stringFromUnknown(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
 function normalizeRealtimeModel(value: unknown): RealtimeModelId | null {
   if (typeof value !== "string") return null;
   const model = value.trim();
@@ -265,6 +441,7 @@ function realtimeInstructions(): string {
     "# Boundary",
     "- Codex is the primary computer-use agent. Use submit_to_codex for substantial, ambiguous, or multi-step coding work.",
     "- You may inspect/search files and run focused local commands with exec_command when that helps you answer or triage quickly.",
+    "- You have a web_search tool for current public web information. Use it when the user asks for latest/current facts or explicitly asks you to search the web.",
     "- You may edit files with apply_patch for small, clear, well-scoped changes. Larger changes should be handed to Codex.",
     "- Multi-file edits are not a separate tool. They are just repeated apply_patch calls, or one patch that contains several file sections.",
     "- Do not invent hard tool-side size, risk, or file-count limits. Use judgment in guidance: inspect first, edit deliberately, and delegate bigger work to Codex.",
@@ -303,6 +480,7 @@ function realtimeInstructions(): string {
     "# Tool Behavior",
     "- Use only tools explicitly provided in the current tool list.",
     "- Do not invent, rename, simulate, or claim to use unavailable tools.",
+    "- When web_search succeeds, ground your spoken answer in its result and mention source URLs only when they are useful to the user.",
     "- Only say Codex completed or changed something after the relevant tool result confirms it.",
     "- If a tool fails, explain the failure briefly in user-friendly language and offer the next useful step.",
     "",
@@ -402,6 +580,26 @@ function realtimeTools(): unknown[] {
       parameters: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      type: "function",
+      name: "web_search",
+      description:
+        "Search the live web for current public information, recent facts, news, pricing, docs, or anything the user explicitly asks to look up. Returns a concise answer and source URLs.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query or user question to answer from the web.",
+          },
+          context: {
+            type: "string",
+            description: "Optional short context from the current voice conversation that helps disambiguate the query.",
+          },
+        },
+        required: ["query"],
       },
     },
     {

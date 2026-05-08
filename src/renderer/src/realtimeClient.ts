@@ -36,6 +36,8 @@ type TrackedFunctionCall = {
   running: boolean;
   outputSent: boolean;
   stale: boolean;
+  cancel?: () => Promise<void>;
+  pendingOutput?: unknown;
 };
 
 type TrackedRealtimeResponse = {
@@ -295,7 +297,9 @@ export class RealtimeVoiceClient {
     }
 
     if (payload.type === "input_audio_buffer.speech_started") {
+      this.log("userSpeechStarted", "User speech started.", payload);
       this.invalidatePendingToolCalls("userSpeechStarted", payload);
+      return;
     }
 
     if (payload.type === "response.output_audio_transcript.delta" && payload.delta) {
@@ -466,6 +470,15 @@ export class RealtimeVoiceClient {
       for (const call of record.calls.values()) {
         if (!call.outputSent) {
           call.stale = true;
+          if (call.running && call.cancel) {
+            void call.cancel().catch((error) => {
+              this.log("toolCancelFailed", `${call.name} cancellation failed.`, {
+                responseId: record.responseId,
+                callId: call.callId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
           invalidated += 1;
         }
       }
@@ -506,24 +519,32 @@ export class RealtimeVoiceClient {
         continue;
       }
 
-      call.running = true;
-      const args = safeJson(call.arguments);
-      this.log("toolCall", `${call.name} ${JSON.stringify(args)}`, {
-        responseId: record.responseId,
-        callId: call.callId,
-        arguments: call.arguments,
-      });
-
       let output: unknown;
-      try {
-        output = await callVoiceTool(call.name, args);
-      } catch (error) {
-        output = {
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      } finally {
-        call.running = false;
+      const args = safeJson(call.arguments);
+      if ("pendingOutput" in call) {
+        output = call.pendingOutput;
+      } else {
+        call.running = true;
+        this.log("toolCall", `${call.name} ${JSON.stringify(args)}`, {
+          responseId: record.responseId,
+          callId: call.callId,
+          arguments: call.arguments,
+        });
+
+        try {
+          output = await callVoiceTool(call.name, args, (cancel) => {
+            call.cancel = cancel;
+          });
+        } catch (error) {
+          output = {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        } finally {
+          call.running = false;
+          call.cancel = undefined;
+        }
+        call.pendingOutput = output;
       }
 
       if (call.stale || record.epoch !== this.realtimeEpoch || !this.connected) {
@@ -544,7 +565,6 @@ export class RealtimeVoiceClient {
         return;
       }
 
-      call.outputSent = true;
       this.log("toolResult", `${call.name} completed.`, {
         responseId: record.responseId,
         name: call.name,
@@ -560,17 +580,39 @@ export class RealtimeVoiceClient {
       return;
     }
 
-    for (const { call, output } of outputs) {
-      this.send({
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: call.callId,
-          output: JSON.stringify(output),
-        },
+    try {
+      for (const { call, output } of outputs) {
+        this.send({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: call.callId,
+            output: JSON.stringify(output),
+          },
+        });
+      }
+      this.send({ type: "response.create" });
+    } catch (error) {
+      this.log("toolOutputSendFailed", "Could not send Realtime tool output.", {
+        responseId: record.responseId,
+        error: error instanceof Error ? error.message : String(error),
       });
+      if (this.connected && record.epoch === this.realtimeEpoch) {
+        window.setTimeout(() => {
+          if (this.trackedResponses.has(record.responseId)) {
+            void this.handleFunctionCalls(record);
+          }
+        }, 250);
+      } else {
+        this.cleanupTrackedResponse(record);
+      }
+      return;
     }
-    this.send({ type: "response.create" });
+
+    for (const { call } of outputs) {
+      call.outputSent = true;
+      call.pendingOutput = undefined;
+    }
     this.cleanupTrackedResponse(record);
   }
 
@@ -672,7 +714,11 @@ export class RealtimeVoiceClient {
   }
 }
 
-async function callVoiceTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+async function callVoiceTool(
+  name: string,
+  args: Record<string, unknown>,
+  registerCancel?: (cancel: () => Promise<void>) => void,
+): Promise<unknown> {
   if (name === "submit_to_codex") {
     const request = stringArg(args.request);
     const context = optionalString(args.context);
@@ -714,6 +760,17 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
       runtime: state.runtime,
       codexSettings: state.codexSettings,
     };
+  }
+
+  if (name === "web_search") {
+    const requestId = `web-search-${Date.now()}-${crypto.randomUUID()}`;
+    registerCancel?.(() => window.codexVoice.cancelWebSearch(requestId));
+    const result = await window.codexVoice.webSearch({
+      query: stringArg(args.query),
+      context: optionalString(args.context),
+      requestId,
+    });
+    return { ok: true, ...result };
   }
 
   if (name === "exec_command") {

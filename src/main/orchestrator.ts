@@ -155,7 +155,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private threadByTurn = new Map<string, string>();
   private tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
   private threadStatusByThread = new Map<string, string>();
-  private threadPermissionProfileByThread = new Map<string, unknown>();
   private voiceExecNextSessionId = 1;
   private voiceExecNextProcessId = 1;
   private voiceExecSessions = new Map<number, VoiceExecSession>();
@@ -1024,9 +1023,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           reasoningEffort: this.defaultReasoningEffort,
           permissionMode: this.defaultPermissionMode,
         };
-    const storedProfile = chat?.codexThreadId
-      ? this.threadPermissionProfileByThread.get(chat.codexThreadId) ?? null
-      : null;
     return {
       project,
       chat,
@@ -1034,7 +1030,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       permissionProfile: voicePermissionProfile(
         settings.permissionMode,
         project ? projectWorkspacePath(project) : null,
-        storedProfile,
       ),
     };
   }
@@ -1120,7 +1115,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const chatSettings = this.threadSettingsForChat(project, chat);
 
     try {
-      const resumeResult = await this.codex.request("thread/resume", {
+      await this.codex.request("thread/resume", {
         threadId: chat.codexThreadId,
         cwd: projectWorkspacePath(project),
         ...threadPermissionParams(chatSettings.permissionMode),
@@ -1130,7 +1125,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         ...(chatSettings.model ? { model: chatSettings.model } : {}),
         ...(chatSettings.serviceTier ? { serviceTier: chatSettings.serviceTier } : {}),
       });
-      this.recordThreadPermissionProfile(chat.codexThreadId, resumeResult);
       await this.syncThreadName(chat.codexThreadId, chat.displayName);
       return { project, chat };
     } catch (error) {
@@ -1149,7 +1143,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     const codexThreadId = result.thread?.id;
     if (!codexThreadId) throw new Error("Codex did not return a replacement thread id.");
-    this.recordThreadPermissionProfile(codexThreadId, result);
     await this.syncThreadName(codexThreadId, chat.displayName);
 
     const updatedProject = await this.store.updateChat(project.id, chat.id, {
@@ -1182,7 +1175,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     const codexThreadId = result.thread?.id;
     if (!codexThreadId) throw new Error("Codex did not return a thread id.");
-    this.recordThreadPermissionProfile(codexThreadId, result);
     await this.syncThreadName(codexThreadId, displayName);
 
     return this.store.addChat(project.id, displayName, codexThreadId, chatSettings);
@@ -1195,14 +1187,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       this.emitEvent("app", "threadNameSyncFailed", `Could not sync Codex thread name: ${error instanceof Error ? error.message : String(error)}`, {
         threadId,
       });
-    }
-  }
-
-  private recordThreadPermissionProfile(threadId: string, response: unknown): void {
-    const record = response as { permissionProfile?: unknown; permission_profile?: unknown } | null;
-    const profile = record?.permissionProfile ?? record?.permission_profile;
-    if (profile) {
-      this.threadPermissionProfileByThread.set(threadId, profile);
     }
   }
 
@@ -2848,9 +2832,8 @@ function resolveVoiceWorkdir(workdir: string | null | undefined, projectFolderPa
 function voicePermissionProfile(
   mode: CodexPermissionMode,
   projectFolderPath: string | null,
-  storedProfile: unknown | null,
 ): unknown | null {
-  if (mode === "custom-config") return storedProfile;
+  if (mode === "custom-config") return null;
   if (mode === "full-access") return { type: "disabled" };
 
   return workspaceWritePermissionProfile(projectFolderPath ?? process.cwd());

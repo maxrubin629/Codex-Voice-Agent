@@ -541,6 +541,31 @@ export type VoiceWriteStdinArgs = {
   max_output_tokens?: number | null;
 };
 
+export type VoiceWebSearchArgs = {
+  query: string;
+  context?: string | null;
+  requestId?: string | null;
+};
+
+export type VoiceWebSearchSource = {
+  title: string | null;
+  url: string;
+};
+
+export type VoiceWebSearchAction = {
+  type: string;
+  query?: string;
+  queries?: string[];
+};
+
+export type VoiceWebSearchResult = {
+  query: string;
+  answer: string;
+  sources: VoiceWebSearchSource[];
+  actions: VoiceWebSearchAction[];
+  model: string;
+};
+
 export type VoiceExecCommandResult = {
   chunk_id?: string;
   wall_time_seconds: number;
@@ -595,6 +620,8 @@ export type CodexVoiceApi = {
   writeStdin(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult>;
   terminateExecSession(sessionId: number): Promise<void>;
   applyPatch(input: string): Promise<VoiceExecCommandResult>;
+  webSearch(args: VoiceWebSearchArgs): Promise<VoiceWebSearchResult>;
+  cancelWebSearch(requestId: string): Promise<void>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;
