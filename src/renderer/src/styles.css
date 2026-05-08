@@ -2226,6 +2226,7 @@ code {
 
 .voice-right-body {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
@@ -2241,17 +2242,23 @@ code {
 
 .voice-right-transcript-tab {
   display: flex;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   min-height: 100%;
+  overflow: hidden;
 }
 
 .voice-right-transcript-tab .voice-transcript-list {
   flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
   gap: 14px;
   padding: 2px 2px 12px;
 }
 
 .voice-right-transcript-tab .voice-transcript-entry.user {
+  margin-left: auto;
   max-width: min(92%, 340px);
 }
 
@@ -2883,15 +2890,30 @@ code {
 
 .voice-home-header h1 {
   display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
   align-items: center;
   margin: 0;
+  overflow: hidden;
   color: rgba(255, 255, 255, 0.92);
   font-size: 19px;
   font-weight: 610;
   line-height: 1;
   letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   transform: translateX(-2px);
   -webkit-app-region: drag;
+}
+
+.voice-home.future-open .voice-home-header {
+  justify-content: flex-start;
+  padding-right: calc(var(--voice-titlebar-button-size) + 14px);
+  padding-left: calc(var(--voice-titlebar-button-left) + var(--voice-titlebar-button-size) + 14px);
+}
+
+.voice-home.future-open .voice-home-header h1 {
+  transform: none;
 }
 
 .voice-context-menu {
