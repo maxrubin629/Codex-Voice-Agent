@@ -2065,9 +2065,10 @@ code {
 
 .voice-right-tab-menu-wrap > button {
   width: var(--voice-titlebar-button-size);
-  min-height: var(--voice-titlebar-button-size);
+  height: var(--voice-titlebar-button-size);
+  min-height: 0;
   border-color: transparent;
-  border-radius: 12px;
+  border-radius: 14px;
   background: transparent;
   color: rgba(229, 236, 247, 0.6);
   padding: 0;
@@ -2093,11 +2094,11 @@ code {
 .voice-right-tabbar {
   position: relative;
   display: flex;
-  min-height: var(--voice-titlebar-drag-height);
+  min-height: calc(var(--voice-titlebar-button-size) + var(--voice-titlebar-button-top) * 2);
   align-items: flex-start;
   gap: 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.075);
-  padding: var(--voice-titlebar-button-top) 68px 8px 10px;
+  padding: var(--voice-titlebar-button-top) 68px var(--voice-titlebar-button-top) 10px;
   -webkit-app-region: no-drag;
 }
 
@@ -2108,9 +2109,11 @@ code {
 
 .voice-right-tabs {
   display: flex;
+  height: var(--voice-titlebar-button-size);
   min-width: 0;
   max-width: calc(100% - 42px);
   flex: 0 1 auto;
+  align-items: flex-start;
   gap: 6px;
   overflow-x: auto;
   overflow-y: hidden;
@@ -2124,10 +2127,12 @@ code {
 .voice-right-tab-shell {
   display: inline-grid;
   height: var(--voice-titlebar-button-size);
+  min-height: 0;
   min-width: 0;
   max-width: 184px;
   grid-template-columns: minmax(0, 1fr) 24px;
   align-items: center;
+  overflow: hidden;
   border: 1px solid transparent;
   border-radius: 14px;
   color: rgba(219, 228, 242, 0.68);
@@ -2142,8 +2147,9 @@ code {
 
 .voice-right-tab-shell button[role="tab"] {
   display: grid;
+  height: 100%;
   min-width: 0;
-  min-height: var(--voice-titlebar-button-size);
+  min-height: 0;
   grid-template-columns: 20px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
@@ -2153,6 +2159,7 @@ code {
   font-size: 14px;
   font-weight: 560;
   letter-spacing: 0;
+  line-height: 1;
   padding: 0 10px 0 12px;
   text-align: left;
 }
@@ -2165,10 +2172,10 @@ code {
 
 .voice-right-tab-close {
   display: inline-grid;
-  width: 23px;
-  height: 23px;
+  width: 24px;
+  height: 100%;
   place-items: center;
-  border-radius: 6px;
+  border-radius: 0 13px 13px 0;
   color: rgba(219, 228, 242, 0.52);
   padding: 0;
 }
@@ -2835,7 +2842,7 @@ code {
 
 @media (max-width: 719px) {
   .voice-right-tabbar {
-    padding-top: 12px;
+    padding-top: var(--voice-titlebar-button-top);
     padding-left: max(10px, var(--mac-titlebar-safe-left));
   }
 
