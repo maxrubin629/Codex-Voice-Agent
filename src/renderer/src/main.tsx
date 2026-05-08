@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   CODEX_PERMISSION_PROFILES,
@@ -6,7 +6,12 @@ import {
   DEFAULT_CODEX_PERMISSION_MODE,
   DEFAULT_CODEX_REASONING_EFFORT,
   DEFAULT_CODEX_SERVICE_TIER,
+  DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_REASONING_EFFORT,
   FAST_CODEX_SERVICE_TIER,
+  REALTIME_MODEL_OPTIONS,
+  REALTIME_REASONING_EFFORT_OPTIONS,
+  REALTIME_VOICE_OPTIONS,
   type AppEvent,
   type AppState,
   type CodexModelSummary,
@@ -17,11 +22,23 @@ import {
   type PendingCodexRequest,
   type PendingRequestQuestion,
   type ReasoningEffort,
+  type RealtimeModelId,
+  type RealtimeReasoningEffort,
+  type RealtimeUserInput,
+  type RealtimeVoiceId,
   type ToolQuestionAnswer,
   type VoiceChat,
   type VoiceProject,
+  type WindowChromeState,
 } from "../../shared/types";
+import { appendBufferedEvent } from "../../shared/eventBuffer";
 import { RealtimeVoiceClient } from "./realtimeClient";
+import { RightPanel, type RightPanelThreadOpenRequest } from "./rightPanel";
+import {
+  deriveRightPanelOpenIntents,
+  rightPanelIntentEventKey,
+  type RightPanelOpenIntent,
+} from "./rightPanelOpenIntents";
 import "./styles.css";
 
 const emptyState: AppState = {
@@ -39,6 +56,7 @@ const emptyState: AppState = {
     tokenUsage: null,
     pendingRequests: [],
     chats: [],
+    projectThreads: [],
     showProjectChats: false,
   },
   codexSettings: {
@@ -62,9 +80,16 @@ const emptyState: AppState = {
   },
   realtime: {
     available: false,
-    model: "gpt-realtime-2",
+    model: DEFAULT_REALTIME_MODEL,
     voice: "marin",
     reasoningEffort: "low",
+    reason: null,
+    apiKeySource: null,
+    apiKeyEncrypted: false,
+  },
+  webSearch: {
+    available: false,
+    provider: "exa",
     reason: null,
     apiKeySource: null,
     apiKeyEncrypted: false,
@@ -72,28 +97,96 @@ const emptyState: AppState = {
 };
 
 type AppWindowKind = "voice" | "debug";
+type ApiKeyDialogMode = "onboarding" | "settings";
+type OnboardingStep = "key" | "voice" | "orb" | "project";
+type PaneSide = "settings" | "future";
+type VoiceTone = "off" | "listening" | "working" | "connecting" | "paused" | "waiting";
+type VoiceSettingsTab = "projects" | "general" | "appearance" | "configuration";
+type VoiceOrbPresetId = "aurora" | "cloud" | "nocturne";
 
-type ContextMenuTarget =
-  | {
-      kind: "project";
-      projectId: string;
-      label: string;
-      x: number;
-      y: number;
-    }
-  | {
-      kind: "chat";
-      projectId: string;
-      chatId: string;
-      label: string;
-      x: number;
-      y: number;
-    };
+type VoiceOrbPreset = {
+  id: VoiceOrbPresetId;
+  name: string;
+  detail: string;
+  shape: "sphere" | "cloud";
+  previewLevel: number;
+};
 
-type ArchivedChat = {
+type VoiceOrbCustomization = {
+  accentColor: string;
+  glow: number;
+  reactivity: number;
+  waveHeight: number;
+};
+
+const voiceOrbStorageKey = "codexVoice.orbPreset";
+const leftPanelWidthStorageKey = "codexVoice.leftPanel.width";
+const rightPanelWidthStorageKey = "codexVoice.rightPanel.width";
+const voiceOrbCustomizationStorageKey = "codexVoice.orbCustomization";
+const voiceOnboardingSeenStorageKey = "codexVoice.onboardingSeen";
+const dualPaneLayoutMediaQuery = "(min-width: 1420px)";
+const paneReplacementDelayMs = 120;
+const minPaneWidth = 260;
+const paneDragCloseThreshold = 228;
+const maxPaneWidth = 720;
+const defaultPaneWidth = 420;
+const titleCollisionGapPx = 14;
+const macTrafficLightSafeWidthPx = 96;
+const secretRevealTimeoutMs = 60_000;
+const defaultVoiceOrbCustomization: VoiceOrbCustomization = {
+  accentColor: "#1d9bf0",
+  glow: 52,
+  reactivity: 56,
+  waveHeight: 50,
+};
+const voiceOrbColorOptions: Array<{ color: string; label: string }> = [
+  { color: "#1d9bf0", label: "Azure" },
+  { color: "#35d6ff", label: "Cyan" },
+  { color: "#6f8cff", label: "Indigo" },
+  { color: "#8ff5df", label: "Mint" },
+  { color: "#f4f0dd", label: "Pearl" },
+];
+const voiceOrbPresets: VoiceOrbPreset[] = [
+  {
+    id: "aurora",
+    name: "Aurora",
+    detail: "Round water",
+    shape: "sphere",
+    previewLevel: 0.32,
+  },
+  {
+    id: "cloud",
+    name: "Cloud",
+    detail: "App icon shape",
+    shape: "cloud",
+    previewLevel: 0.42,
+  },
+  {
+    id: "nocturne",
+    name: "Nocturne",
+    detail: "Night glass",
+    shape: "sphere",
+    previewLevel: 0.28,
+  },
+];
+
+// Traced from src/main/assets/app-icon.png so the Cloud preset keeps the app icon silhouette.
+const iconCloudPathData =
+  "M4572 8120 c-80 -11 -245 -54 -325 -84 -402 -151 -739 -499 -906 -933 -41 -105 -85 -150 -189 -193 -335 -140 -573 -332 -767 -620 -113 -169 -195 -368 -242 -589 -25 -115 -27 -145 -28 -351 0 -200 3 -237 23 -329 57 -255 141 -437 289 -628 100 -128 107 -158 84 -343 -19 -145 -9 -412 19 -545 39 -186 113 -373 213 -539 95 -157 273 -342 444 -461 91 -63 242 -146 293 -160 14 -4 39 -15 55 -25 17 -10 57 -23 90 -30 33 -7 83 -21 110 -31 76 -27 136 -32 435 -34 254 -1 279 -3 328 -22 29 -12 68 -32 85 -45 158 -117 424 -246 557 -268 36 -6 94 -20 130 -31 107 -33 360 -40 570 -15 52 6 192 51 330 104 365 142 667 458 826 865 45 118 88 167 167 193 29 9 59 22 67 29 8 7 49 29 90 49 123 61 237 144 355 261 121 119 174 185 250 310 108 179 187 380 232 594 24 111 27 148 27 311 0 153 -4 203 -23 290 -47 222 -147 450 -271 620 -38 52 -80 111 -94 130 -39 54 -48 122 -31 237 34 238 28 420 -21 639 -107 484 -430 897 -856 1098 -133 63 -207 88 -343 117 -130 28 -355 36 -496 18 -115 -14 -175 -14 -215 1 -15 6 -68 44 -118 84 -145 117 -315 213 -462 260 -180 58 -239 68 -434 71 -102 2 -213 0 -248 -5z";
+const iconCloudSourceBounds = {
+  x: 2110,
+  yBottom: 1840,
+  yTop: 8130,
+  width: 6070,
+  height: 6290,
+};
+const iconCloudRotationRadians = (-12 * Math.PI) / 180;
+let iconCloudPath: Path2D | null = null;
+
+type VoiceEventContext = {
   projectId: string;
-  projectName: string;
-  chat: VoiceChat;
+  chatId: string;
+  threadId?: string | null;
 };
 
 function appWindowKind(): AppWindowKind {
@@ -101,9 +194,250 @@ function appWindowKind(): AppWindowKind {
   return kind === "debug" ? "debug" : "voice";
 }
 
+function activeVoiceEventContext(state: AppState): VoiceEventContext | null {
+  const project = state.activeProject;
+  if (!project) return null;
+  const chat = activeVoiceChatForState(state);
+  if (!chat) return null;
+  return {
+    projectId: project.id,
+    chatId: chat.id,
+    threadId: chat.codexThreadId,
+  };
+}
+
+function eventWithVoiceContext(event: AppEvent, context: VoiceEventContext | null): AppEvent {
+  if (event.source !== "realtime") return event;
+  if (!context) return event;
+  const raw = event.raw && typeof event.raw === "object" && !Array.isArray(event.raw) ? event.raw : {};
+  return {
+    ...event,
+    raw: {
+      ...raw,
+      projectId: context.projectId,
+      chatId: context.chatId,
+      threadId: context.threadId,
+    },
+  };
+}
+
+function activeVoiceChatForState(state: AppState): VoiceChat | null {
+  const project = state.activeProject;
+  if (!project) return null;
+  const chats = project.chats.filter((chat) => !chat.archivedAt);
+  return (
+    chats.find((candidate) => candidate.id === state.runtime.activeChatId) ??
+    chats.find((candidate) => candidate.id === project.activeChatId) ??
+    chats.find((candidate) => candidate.codexThreadId === project.codexThreadId) ??
+    chats[0] ??
+    null
+  );
+}
+
+async function activeTranscriptMessages(state: AppState) {
+  const chat = activeVoiceChatForState(state);
+  return chat ? window.codexVoice.getTranscriptMessages(chat.id) : [];
+}
+
+function shouldAutoOpenTranscriptForEvent(event: AppEvent): boolean {
+  if (event.source !== "realtime") return false;
+  const raw = recordFromUnknown(event.raw);
+  const rawType = stringFromUnknown(raw?.type);
+  return [
+    "userSpeechStarted",
+    "userSpeechStopped",
+    "userTranscriptDelta",
+    "userTranscript",
+    "userTranscriptFailed",
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "conversation.item.input_audio_transcription.delta",
+    "conversation.item.input_audio_transcription.completed",
+    "conversation.item.input_audio_transcription.failed",
+  ].includes(event.kind) || [
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "conversation.item.input_audio_transcription.delta",
+    "conversation.item.input_audio_transcription.completed",
+    "conversation.item.input_audio_transcription.failed",
+  ].includes(rawType ?? "");
+}
+
+function eventMatchesActiveTranscriptContext(event: AppEvent, state: AppState): boolean {
+  const raw = recordFromUnknown(event.raw);
+  const chatId = stringFromUnknown(raw?.chatId);
+  const threadId = stringFromUnknown(raw?.threadId);
+  const activeChat = activeVoiceChatForState(state);
+  const activeChatId = state.runtime.activeChatId ?? activeChat?.id ?? null;
+  const activeThreadId = activeChat?.codexThreadId ?? state.activeProject?.codexThreadId ?? null;
+  if (chatId && activeChatId) return chatId === activeChatId;
+  if (threadId && activeThreadId) return threadId === activeThreadId;
+  return true;
+}
+
+function eventIdentity(event: AppEvent): string {
+  const raw = recordFromUnknown(event.raw);
+  const itemId = stringFromUnknown(raw?.item_id) ?? stringFromUnknown(raw?.itemId);
+  const responseId = stringFromUnknown(raw?.response_id) ?? stringFromUnknown(raw?.responseId);
+  const outputIndex = typeof raw?.output_index === "number" ? raw.output_index : "";
+  const contentIndex = typeof raw?.content_index === "number" ? raw.content_index : "";
+  return [event.at, event.source, event.kind, itemId, responseId, outputIndex, contentIndex, event.message.length]
+    .filter((value) => value !== null && value !== undefined && value !== "")
+    .join(":");
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function stringFromUnknown(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function isVoiceOrbPresetId(value: string | null): value is VoiceOrbPresetId {
+  return voiceOrbPresets.some((preset) => preset.id === value);
+}
+
+function loadVoiceOrbPresetId(): VoiceOrbPresetId {
+  try {
+    const stored = window.localStorage.getItem(voiceOrbStorageKey);
+    return isVoiceOrbPresetId(stored) ? stored : "aurora";
+  } catch {
+    return "aurora";
+  }
+}
+
+function saveVoiceOrbPresetId(presetId: VoiceOrbPresetId): void {
+  try {
+    window.localStorage.setItem(voiceOrbStorageKey, presetId);
+  } catch {
+    // Visual preferences should never block the voice UI.
+  }
+}
+
+function isHexColor(value: unknown): value is string {
+  return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
+}
+
+function clampControlValue(value: unknown, fallback: number): number {
+  return Math.min(100, Math.max(0, typeof value === "number" && Number.isFinite(value) ? value : fallback));
+}
+
+function normalizeVoiceOrbCustomization(value: Partial<VoiceOrbCustomization> | null): VoiceOrbCustomization {
+  return {
+    accentColor: isHexColor(value?.accentColor) ? value.accentColor : defaultVoiceOrbCustomization.accentColor,
+    glow: clampControlValue(value?.glow, defaultVoiceOrbCustomization.glow),
+    reactivity: clampControlValue(value?.reactivity, defaultVoiceOrbCustomization.reactivity),
+    waveHeight: clampControlValue(value?.waveHeight, defaultVoiceOrbCustomization.waveHeight),
+  };
+}
+
+function loadVoiceOrbCustomization(): VoiceOrbCustomization {
+  try {
+    const stored = window.localStorage.getItem(voiceOrbCustomizationStorageKey);
+    if (!stored) return defaultVoiceOrbCustomization;
+    return normalizeVoiceOrbCustomization(JSON.parse(stored) as Partial<VoiceOrbCustomization>);
+  } catch {
+    return defaultVoiceOrbCustomization;
+  }
+}
+
+function saveVoiceOrbCustomization(customization: VoiceOrbCustomization): void {
+  try {
+    window.localStorage.setItem(voiceOrbCustomizationStorageKey, JSON.stringify(customization));
+  } catch {
+    // Visual preferences should never block the voice UI.
+  }
+}
+
+function clampPaneWidth(width: number): number {
+  return Math.max(minPaneWidth, Math.min(maxPaneWidth, Math.round(width)));
+}
+
+function loadPaneWidth(storageKey: string): number {
+  try {
+    const value = Number(window.localStorage.getItem(storageKey));
+    return Number.isFinite(value) ? clampPaneWidth(value) : defaultPaneWidth;
+  } catch {
+    return defaultPaneWidth;
+  }
+}
+
+function savePaneWidth(storageKey: string, width: number): void {
+  try {
+    window.localStorage.setItem(storageKey, String(clampPaneWidth(width)));
+  } catch {
+    // Visual preferences should never block the voice UI.
+  }
+}
+
+function loadVoiceOnboardingSeen(): boolean {
+  try {
+    return window.localStorage.getItem(voiceOnboardingSeenStorageKey) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function saveVoiceOnboardingSeen(seen: boolean): void {
+  try {
+    window.localStorage.setItem(voiceOnboardingSeenStorageKey, seen ? "true" : "false");
+  } catch {
+    // Onboarding should stay usable even if localStorage is unavailable.
+  }
+}
+
+function supportsDualPaneLayout(): boolean {
+  return window.matchMedia(dualPaneLayoutMediaQuery).matches;
+}
+
+function voiceOrbPresetById(presetId: VoiceOrbPresetId): VoiceOrbPreset {
+  return voiceOrbPresets.find((preset) => preset.id === presetId) ?? voiceOrbPresets[0];
+}
+
+function voiceOrbPresetAtOffset(presetId: VoiceOrbPresetId, offset: number): VoiceOrbPresetId {
+  const currentIndex = Math.max(0, voiceOrbPresets.findIndex((preset) => preset.id === presetId));
+  const nextIndex = (currentIndex + offset + voiceOrbPresets.length) % voiceOrbPresets.length;
+  return voiceOrbPresets[nextIndex].id;
+}
+
+function waitForRealtimeClientOpen(client: RealtimeVoiceClient, timeoutMs = 10000): Promise<void> {
+  if (client.connected) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let pollTimeoutId: number | null = null;
+    const deadlineTimeoutId = window.setTimeout(() => {
+      settle(() => reject(new Error("Realtime data channel did not open.")));
+    }, timeoutMs);
+
+    function cleanup(): void {
+      window.clearTimeout(deadlineTimeoutId);
+      if (pollTimeoutId !== null) window.clearTimeout(pollTimeoutId);
+    }
+
+    function settle(callback: () => void): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    }
+
+    function poll(): void {
+      if (client.connected) {
+        settle(resolve);
+        return;
+      }
+      pollTimeoutId = window.setTimeout(poll, 50);
+    }
+
+    poll();
+  });
+}
+
 function App(): React.ReactElement {
   const [windowKind] = useState<AppWindowKind>(() => appWindowKind());
   const [state, setState] = useState<AppState>(emptyState);
+  const [stateLoaded, setStateLoaded] = useState(false);
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [projectName, setProjectName] = useState("");
   const [message, setMessage] = useState("");
@@ -113,7 +447,20 @@ function App(): React.ReactElement {
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceConnecting, setVoiceConnecting] = useState(false);
   const [voicePaused, setVoicePaused] = useState(false);
+  const [voiceOutputLevel, setVoiceOutputLevel] = useState(0);
+  const [realtimeIssue, setRealtimeIssue] = useState<string | null>(null);
+  const [onboardingRequestId, setOnboardingRequestId] = useState(0);
+  const [windowChromeState, setWindowChromeState] = useState<WindowChromeState>({ isFullScreen: false });
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
+  const voiceConnectPromiseRef = useRef<Promise<RealtimeVoiceClient> | null>(null);
+  const voiceLifecycleIdRef = useRef(0);
+  const stateRef = useRef<AppState>(emptyState);
+  const outputLevelUpdateRef = useRef(0);
+  const outputLevelValueRef = useRef(0);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   useEffect(() => {
     if (!error) return undefined;
@@ -125,10 +472,20 @@ function App(): React.ReactElement {
     document.title = windowKind === "debug" ? "Codex Voice Debug" : "Codex Voice";
     void refreshState();
     void refreshEvents();
-    const offState = window.codexVoice.onAppState(setState);
+    void window.codexVoice.getWindowChromeState().then(setWindowChromeState).catch(() => {
+      setWindowChromeState({ isFullScreen: false });
+    });
+    const offWindowChromeState = window.codexVoice.onWindowChromeState(setWindowChromeState);
+    const offState = window.codexVoice.onAppState((nextState) => {
+      stateRef.current = nextState;
+      setState(nextState);
+      setStateLoaded(true);
+    });
     const offEvent = window.codexVoice.onAppEvent((event) => {
-      setEvents((current) => [event, ...current].slice(0, 250));
-      if (event.source === "codex" && event.kind === "serverRequest") {
+      setEvents((current) => appendBufferedEvent(current, event));
+      if (event.source === "app" && event.kind === "debug/startOnboarding") {
+        setOnboardingRequestId((current) => current + 1);
+      } else if (event.source === "codex" && event.kind === "serverRequest") {
         voiceRef.current?.speakPendingRequest(event.raw as PendingCodexRequest);
       } else if (event.source === "codex" && event.kind === "turn/finalOutput") {
         voiceRef.current?.injectCodexTurnOutput(event.raw as CodexTurnOutput);
@@ -137,6 +494,7 @@ function App(): React.ReactElement {
       }
     });
     return () => {
+      offWindowChromeState();
       offState();
       offEvent();
       voiceRef.current?.disconnect();
@@ -145,6 +503,7 @@ function App(): React.ReactElement {
 
   async function refreshState(): Promise<void> {
     setState(await window.codexVoice.getState());
+    setStateLoaded(true);
   }
 
   async function refreshEvents(): Promise<void> {
@@ -166,47 +525,174 @@ function App(): React.ReactElement {
       await action();
       await refreshState();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(friendlyActionError(caught).message);
     }
   }
 
-  async function toggleVoice(): Promise<void> {
-    if (voiceRef.current?.connected || voiceConnected) {
-      voiceRef.current?.disconnect();
-      voiceRef.current = null;
-      setVoiceConnected(false);
-      setVoiceConnecting(false);
+  function updateVoiceOutputLevel(level: number): void {
+    const normalized = level < 0.006 ? 0 : Math.min(1, Math.max(0, level));
+    const now = performance.now();
+    if (normalized === 0 && outputLevelValueRef.current === 0) return;
+    if (normalized === 0 || now - outputLevelUpdateRef.current > 32) {
+      outputLevelUpdateRef.current = now;
+      outputLevelValueRef.current = normalized;
+      setVoiceOutputLevel(normalized);
+    }
+  }
+
+  function clearVoiceOutputLevel(): void {
+    outputLevelUpdateRef.current = 0;
+    outputLevelValueRef.current = 0;
+    setVoiceOutputLevel(0);
+  }
+
+  function isCurrentVoiceClient(client: RealtimeVoiceClient, lifecycleId: number): boolean {
+    return voiceLifecycleIdRef.current === lifecycleId && voiceRef.current === client;
+  }
+
+  function applyVoiceConnectionChange(
+    client: RealtimeVoiceClient,
+    lifecycleId: number,
+    connected: boolean,
+    label: string,
+  ): void {
+    if (!isCurrentVoiceClient(client, lifecycleId)) return;
+    const connecting = !connected && label === "Creating Realtime session.";
+    setVoiceConnected(connected);
+    setVoiceConnecting(connecting);
+    setVoiceStatus(label);
+    if (connected) {
+      setRealtimeIssue(null);
       setVoicePaused(false);
-      setVoiceStatus("Realtime disconnected.");
       return;
     }
-    if (voiceConnecting) return;
-    await runAction(async () => {
+    if (!connecting) {
+      setVoicePaused(false);
+      clearVoiceOutputLevel();
+    }
+  }
+
+  function disconnectVoice(): void {
+    voiceLifecycleIdRef.current += 1;
+    const client = voiceRef.current;
+    voiceRef.current = null;
+    voiceConnectPromiseRef.current = null;
+    client?.disconnect();
+    setVoiceConnected(false);
+    setVoiceConnecting(false);
+    setVoicePaused(false);
+    clearVoiceOutputLevel();
+    setVoiceStatus("Realtime disconnected.");
+  }
+
+  async function connectVoice(): Promise<RealtimeVoiceClient> {
+    const existingClient = voiceRef.current;
+    if (existingClient?.connected) return existingClient;
+    if (voiceConnectPromiseRef.current) return voiceConnectPromiseRef.current;
+
+    const realtime = stateRef.current.realtime;
+    if (!realtime.available) {
+      const issue = realtime.reason ?? "No OpenAI API key is configured.";
+      setRealtimeIssue(issue);
+      setError(issue);
+      throw new Error(issue);
+    }
+
+    const lifecycleId = voiceLifecycleIdRef.current + 1;
+    voiceLifecycleIdRef.current = lifecycleId;
+
+    const connectionPromise = (async () => {
+      setError(null);
+      setRealtimeIssue(null);
+      setVoiceConnected(false);
+      setVoicePaused(false);
+      clearVoiceOutputLevel();
       setVoiceConnecting(true);
+      const voiceEventContext = activeVoiceEventContext(stateRef.current);
       const client = new RealtimeVoiceClient({
         onConnectionChange: (connected, label) => {
-          setVoiceConnected(connected);
-          setVoiceConnecting(!connected && label !== "Realtime data channel closed.");
-          if (connected || label === "Realtime data channel closed." || label === "Realtime disconnected.") {
-            setVoicePaused(false);
-          }
-          setVoiceStatus(label);
+          applyVoiceConnectionChange(client, lifecycleId, connected, label);
         },
         onLog: (event) => {
-          void window.codexVoice.logEvent(event);
+          void window.codexVoice.logEvent(eventWithVoiceContext(event, voiceEventContext));
         },
+        onOutputLevel: updateVoiceOutputLevel,
+        getTranscriptMessages: () =>
+          voiceEventContext
+            ? window.codexVoice.getTranscriptMessages(voiceEventContext.chatId)
+            : activeTranscriptMessages(stateRef.current),
       });
       voiceRef.current = client;
       try {
         await client.connect();
+        if (!isCurrentVoiceClient(client, lifecycleId)) {
+          throw new Error("Realtime connection was cancelled.");
+        }
+        await waitForRealtimeClientOpen(client);
+        if (!isCurrentVoiceClient(client, lifecycleId)) {
+          throw new Error("Realtime connection was cancelled.");
+        }
+        return client;
       } catch (caught) {
-        if (voiceRef.current === client) voiceRef.current = null;
-        setVoicePaused(false);
-        throw caught;
+        if (isCurrentVoiceClient(client, lifecycleId)) {
+          voiceRef.current = null;
+          client.disconnect();
+          setVoiceConnected(false);
+          setVoiceConnecting(false);
+          setVoiceStatus("Realtime disconnected.");
+          setVoicePaused(false);
+          clearVoiceOutputLevel();
+          const error = friendlyActionError(caught);
+          setError(error.message);
+          setRealtimeIssue(error.message);
+        }
+        throw friendlyActionError(caught);
       } finally {
-        setVoiceConnecting(false);
+        if (voiceLifecycleIdRef.current === lifecycleId) {
+          setVoiceConnecting(false);
+        }
       }
-    });
+    })();
+
+    voiceConnectPromiseRef.current = connectionPromise;
+    try {
+      return await connectionPromise;
+    } finally {
+      if (voiceConnectPromiseRef.current === connectionPromise) {
+        voiceConnectPromiseRef.current = null;
+      }
+    }
+  }
+
+  async function toggleVoice(): Promise<void> {
+    if (voiceConnectPromiseRef.current) return;
+    if (voiceRef.current?.connected || voiceConnected) {
+      disconnectVoice();
+      return;
+    }
+    try {
+      await connectVoice();
+    } catch {
+      // connectVoice already surfaces the issue in the UI.
+    }
+  }
+
+  async function restartVoice(): Promise<void> {
+    if (!voiceRef.current?.connected && !voiceConnected) return;
+    disconnectVoice();
+    try {
+      await connectVoice();
+    } catch {
+      // connectVoice already surfaces the issue in the UI.
+    }
+  }
+
+  async function sendRealtimeUserInput(input: RealtimeUserInput): Promise<void> {
+    const client = voiceRef.current?.connected ? voiceRef.current : await connectVoice();
+    if (!client?.connected) {
+      throw new Error("Realtime is not connected.");
+    }
+    client.sendUserInput(input);
   }
 
   async function handleOrbAction(): Promise<void> {
@@ -221,6 +707,7 @@ function App(): React.ReactElement {
     if (voiceConnected) {
       setVoiceConnected(false);
       setVoicePaused(false);
+      clearVoiceOutputLevel();
       return;
     }
     await toggleVoice();
@@ -254,73 +741,110 @@ function App(): React.ReactElement {
   return (
     <VoiceHome
       state={state}
+      events={events}
+      windowChromeState={windowChromeState}
+      stateLoaded={stateLoaded}
+      voiceOutputLevel={voiceOutputLevel}
+      realtimeIssue={realtimeIssue}
       error={error}
       voiceConnected={voiceConnected}
       voiceConnecting={voiceConnecting}
       voicePaused={voicePaused}
+      onboardingRequestId={onboardingRequestId}
       onAction={runAction}
       onDismissError={() => setError(null)}
       onOrbAction={handleOrbAction}
       onRefresh={refreshState}
       onShowDebug={openDebugWindow}
       onToggleVoice={toggleVoice}
+      onRestartVoice={restartVoice}
+      onSendRealtimeInput={sendRealtimeUserInput}
+      onClearRealtimeIssue={() => setRealtimeIssue(null)}
     />
   );
 }
 
 function VoiceHome({
   state,
+  events,
+  windowChromeState,
+  stateLoaded,
+  voiceOutputLevel,
+  realtimeIssue,
   error,
   voiceConnected,
   voiceConnecting,
   voicePaused,
+  onboardingRequestId,
   onAction,
   onDismissError,
   onOrbAction,
   onRefresh,
   onShowDebug,
   onToggleVoice,
+  onRestartVoice,
+  onSendRealtimeInput,
+  onClearRealtimeIssue,
 }: {
   state: AppState;
+  events: AppEvent[];
+  windowChromeState: WindowChromeState;
+  stateLoaded: boolean;
+  voiceOutputLevel: number;
+  realtimeIssue: string | null;
   error: string | null;
   voiceConnected: boolean;
   voiceConnecting: boolean;
   voicePaused: boolean;
+  onboardingRequestId: number;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
   onDismissError: () => void;
   onOrbAction: () => Promise<void>;
   onRefresh: () => Promise<void>;
   onShowDebug: () => Promise<void>;
   onToggleVoice: () => Promise<void>;
+  onRestartVoice: () => Promise<void>;
+  onSendRealtimeInput: (input: RealtimeUserInput) => Promise<void>;
+  onClearRealtimeIssue: () => void;
 }): React.ReactElement {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [futureOpen, setFutureOpen] = useState(false);
+  const [transcriptActivationRequest, setTranscriptActivationRequest] = useState(0);
+  const [threadOpenRequest, setThreadOpenRequest] = useState<RightPanelThreadOpenRequest | null>(null);
+  const [rightPanelOpenIntent, setRightPanelOpenIntent] = useState<RightPanelOpenIntent | null>(null);
+  const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
+  const [leftPaneWidth, setLeftPaneWidth] = useState(() => loadPaneWidth(leftPanelWidthStorageKey));
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => loadPaneWidth(rightPanelWidthStorageKey));
+  const [resizingPane, setResizingPane] = useState<PaneSide | null>(null);
   const [newOpen, setNewOpen] = useState(false);
-  const [newChatOpen, setNewChatOpen] = useState(false);
-  const [switchChatOpen, setSwitchChatOpen] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
-  const [archivedOpen, setArchivedOpen] = useState(false);
-  const [chatsOpen, setChatsOpen] = useState(false);
-  const [modelOpen, setModelOpen] = useState(false);
   const [permissionsOpen, setPermissionsOpen] = useState(false);
-  const [apiKeyOpen, setApiKeyOpen] = useState(false);
-  const [contextMenu, setContextMenu] = useState<ContextMenuTarget | null>(null);
+  const [orbPresetId, setOrbPresetId] = useState<VoiceOrbPresetId>(() => loadVoiceOrbPresetId());
+  const [orbCustomization, setOrbCustomization] = useState<VoiceOrbCustomization>(() => loadVoiceOrbCustomization());
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [onboardingSeen, setOnboardingSeen] = useState(() => loadVoiceOnboardingSeen());
+  const [apiKeyDialogMode, setApiKeyDialogMode] = useState<ApiKeyDialogMode | null>(null);
   const [apiKey, setApiKey] = useState("");
+  const [exaApiKey, setExaApiKey] = useState("");
   const [newName, setNewName] = useState("");
-  const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
+  const paneTogglePointerActivationRef = useRef<PaneSide | null>(null);
+  const lastAutoTranscriptEventRef = useRef<string | null>(null);
+  const lastRightPanelOpenIntentEventRef = useRef<string | null>(null);
+  const transcriptAutoActivatedRef = useRef(false);
+  const paneReplacementTimeoutRef = useRef<number | null>(null);
+  const paneResizeFrameRef = useRef<number | null>(null);
+  const pendingPaneResizeRef = useRef<{ pane: PaneSide; width: number } | null>(null);
+  const paneResizeCleanupRef = useRef<(() => void) | null>(null);
+  const voiceHomeContentRef = useRef<HTMLDivElement | null>(null);
+  const lastOpenedPaneRef = useRef<PaneSide>("settings");
   const projects = state.projects;
-  const archivedProjects = state.archivedProjects;
   const activeProject = state.activeProject;
   const activeProjectId = state.runtime.activeProjectId;
-  const showProjectChats = state.runtime.showProjectChats;
-  const featuredProject = activeProject ?? projects[0] ?? null;
   const projectChats = useMemo(
     () => chatSummariesForProject(activeProject, state),
     [activeProject, state],
   );
-  const archivedChats = useMemo(() => archivedChatsForProjects(projects), [projects]);
-  const archivedCount = archivedProjects.length + archivedChats.length;
-  const recentProjects = projects.slice(0, 3);
   const modelScope = activeProject ? "chat" : "nextTurn";
   const effectiveModel =
     state.codexSettings.nextTurnModel ??
@@ -344,14 +868,13 @@ function VoiceHome({
     DEFAULT_CODEX_PERMISSION_MODE;
   const effectivePermission = permissionProfile(effectivePermissionMode);
   const modelOptions = modelsForValue(state.codexSettings.models, effectiveModel);
-  const modelSupportsFast = supportsFastMode(modelOptions.find((model) => model.model === effectiveModel) ?? null);
-  const fastModeOn = isFastServiceTier(effectiveServiceTier);
   const pendingRequests = state.runtime.pendingRequests;
   const primaryPendingRequest = pendingRequests[0] ?? null;
   const filteredProjects = projects.filter((project) => {
     const haystack = [
-      project.displayName,
+      projectDisplayName(project),
       project.folderPath,
+      project.workspacePath,
       project.lastStatus ?? "",
       project.lastSummary ?? "",
     ]
@@ -363,30 +886,178 @@ function VoiceHome({
   const voiceOrbLabel = voiceOrbAriaLabel(state, voiceConnected, voiceConnecting, voicePaused);
 
   useEffect(() => {
-    setChatsOpen(false);
-  }, [activeProject?.id]);
+    saveVoiceOrbPresetId(orbPresetId);
+  }, [orbPresetId]);
 
   useEffect(() => {
-    setChatsOpen(showProjectChats);
-  }, [showProjectChats]);
+    saveVoiceOrbCustomization(orbCustomization);
+  }, [orbCustomization]);
 
   useEffect(() => {
-    if (!contextMenu) return undefined;
-    const close = () => setContextMenu(null);
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
-    window.addEventListener("click", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("scroll", close, true);
-    window.addEventListener("keydown", closeOnEscape);
+    savePaneWidth(leftPanelWidthStorageKey, leftPaneWidth);
+  }, [leftPaneWidth]);
+
+  useEffect(() => {
+    savePaneWidth(rightPanelWidthStorageKey, rightPanelWidth);
+  }, [rightPanelWidth]);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(dualPaneLayoutMediaQuery);
+    const updateCanShowBothPanes = () => setCanShowBothPanes(mediaQuery.matches);
+
+    updateCanShowBothPanes();
+    mediaQuery.addEventListener("change", updateCanShowBothPanes);
+    return () => mediaQuery.removeEventListener("change", updateCanShowBothPanes);
+  }, []);
+
+  useEffect(() => {
+    const latestEvent = events[0];
+    if (!latestEvent || !canShowBothPanes) return;
+    if (!shouldAutoOpenTranscriptForEvent(latestEvent)) return;
+    if (!eventMatchesActiveTranscriptContext(latestEvent, state)) return;
+    if (futureOpen && transcriptAutoActivatedRef.current) return;
+
+    const identity = eventIdentity(latestEvent);
+    if (lastAutoTranscriptEventRef.current === identity) return;
+    lastAutoTranscriptEventRef.current = identity;
+
+    clearPaneReplacementTimeout();
+    lastOpenedPaneRef.current = "future";
+    setFutureOpen(true);
+    setTranscriptActivationRequest((current) => current + 1);
+    transcriptAutoActivatedRef.current = true;
+  }, [canShowBothPanes, events, futureOpen, state]);
+
+  useEffect(() => {
+    const latestEvent = events[0];
+    if (!latestEvent) return;
+    const eventKey = rightPanelIntentEventKey(latestEvent);
+    if (lastRightPanelOpenIntentEventRef.current === eventKey) return;
+
+    const [intent] = deriveRightPanelOpenIntents({ event: latestEvent, state, summary: null });
+    if (!intent) return;
+
+    lastRightPanelOpenIntentEventRef.current = eventKey;
+    setRightPanelOpenIntent(intent);
+    if (intent.priority === "foreground") {
+      openFuturePaneForIntent();
+    }
+  }, [canShowBothPanes, events, futureOpen, settingsOpen, state]);
+
+  useEffect(() => {
+    if (!voiceConnected) {
+      transcriptAutoActivatedRef.current = false;
+      lastAutoTranscriptEventRef.current = null;
+    }
+  }, [voiceConnected]);
+
+  useEffect(() => {
     return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("scroll", close, true);
-      window.removeEventListener("keydown", closeOnEscape);
+      if (paneReplacementTimeoutRef.current !== null) {
+        window.clearTimeout(paneReplacementTimeoutRef.current);
+      }
+      paneResizeCleanupRef.current?.();
+      if (paneResizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(paneResizeFrameRef.current);
+      }
     };
-  }, [contextMenu]);
+  }, []);
+
+  useEffect(() => {
+    if (canShowBothPanes || !settingsOpen || !futureOpen) return;
+
+    if (lastOpenedPaneRef.current === "future") {
+      setSettingsOpen(false);
+    } else {
+      setFutureOpen(false);
+    }
+  }, [canShowBothPanes, futureOpen, settingsOpen]);
+
+  useEffect(() => {
+    if (stateLoaded && projects.length > 0 && !onboardingSeen) {
+      saveVoiceOnboardingSeen(true);
+      setOnboardingSeen(true);
+      return;
+    }
+
+    if (stateLoaded && !onboardingSeen && !onboardingOpen && !apiKeyDialogMode && projects.length === 0) {
+      setOnboardingOpen(true);
+    }
+  }, [apiKeyDialogMode, onboardingOpen, onboardingSeen, projects.length, stateLoaded]);
+
+  useEffect(() => {
+    if (onboardingRequestId === 0) return;
+    saveVoiceOnboardingSeen(false);
+    setOnboardingSeen(false);
+    setApiKeyDialogMode(null);
+    setSettingsOpen(false);
+    setFutureOpen(false);
+    setOnboardingOpen(true);
+  }, [onboardingRequestId]);
+
+  useEffect(() => {
+    if (!apiKeyDialogMode && !settingsOpen && !onboardingOpen) return;
+    setApiKey("");
+  }, [apiKeyDialogMode, onboardingOpen, settingsOpen]);
+
+  useLayoutEffect(() => {
+    const content = voiceHomeContentRef.current;
+    if (!content) return undefined;
+
+    const root = content.closest(".voice-home");
+    const shell = root?.querySelector(".voice-shell");
+    let animationFrame = 0;
+    let transitionTimer = 0;
+
+    const updateTitleSafeWidth = () => {
+      const bounds = content.getBoundingClientRect();
+      const centerX = bounds.left + bounds.width / 2;
+      const leftToggle = root?.querySelector(".voice-pane-toggle.left")?.getBoundingClientRect();
+      const rightToggle = root?.querySelector(".voice-pane-toggle.right")?.getBoundingClientRect();
+      const leftSafeEdge = Math.max(
+        windowChromeState.isFullScreen ? 0 : macTrafficLightSafeWidthPx,
+        leftToggle?.right ?? 0,
+      ) + titleCollisionGapPx;
+      const rightSafeEdge = Math.min(
+        window.innerWidth - titleCollisionGapPx,
+        (rightToggle?.left ?? window.innerWidth) - titleCollisionGapPx,
+      );
+      const availableWidth = Math.max(
+        0,
+        Math.floor(Math.min(bounds.width, (centerX - leftSafeEdge) * 2, (rightSafeEdge - centerX) * 2)),
+      );
+      content.style.setProperty("--voice-title-safe-max", `${availableWidth}px`);
+    };
+
+    const scheduleTitleSafeWidthUpdate = () => {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      animationFrame = window.requestAnimationFrame(updateTitleSafeWidth);
+    };
+
+    const resizeObserver = new ResizeObserver(scheduleTitleSafeWidthUpdate);
+    resizeObserver.observe(content);
+    if (shell) resizeObserver.observe(shell);
+    window.addEventListener("resize", scheduleTitleSafeWidthUpdate);
+    shell?.addEventListener("transitionend", scheduleTitleSafeWidthUpdate);
+    updateTitleSafeWidth();
+    scheduleTitleSafeWidthUpdate();
+    transitionTimer = window.setTimeout(updateTitleSafeWidth, 460);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", scheduleTitleSafeWidthUpdate);
+      shell?.removeEventListener("transitionend", scheduleTitleSafeWidthUpdate);
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      if (transitionTimer) {
+        window.clearTimeout(transitionTimer);
+      }
+      content.style.removeProperty("--voice-title-safe-max");
+    };
+  }, [futureOpen, leftPaneWidth, rightPanelWidth, settingsOpen, windowChromeState.isFullScreen]);
 
   async function createNewProject(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -394,6 +1065,43 @@ function VoiceHome({
       await window.codexVoice.createProject(newName || undefined);
       setNewName("");
       setNewOpen(false);
+      await onRefresh();
+    });
+  }
+
+  async function startOnboardingProject(mode: "scratch" | "folder"): Promise<void> {
+    let created = false;
+    await onAction(async () => {
+      if (mode === "folder") {
+        const folder = await window.codexVoice.selectWorkspaceFolder();
+        if (!folder) return;
+        await window.codexVoice.createProject(folder.name, folder.path);
+      } else {
+        await window.codexVoice.createProject("Voice Project");
+      }
+      created = true;
+      await onRefresh();
+    });
+    if (created) {
+      completeOnboarding();
+    }
+  }
+
+  async function selectWorkspaceFolder(): Promise<void> {
+    await onAction(async () => {
+      const folder = await window.codexVoice.selectWorkspaceFolder();
+      if (!folder) return;
+      await window.codexVoice.setWorkspaceFolder(folder.path, folder.name);
+      await onRefresh();
+    });
+  }
+
+  async function createProjectFromFolder(): Promise<void> {
+    await onAction(async () => {
+      const folder = await window.codexVoice.selectWorkspaceFolder();
+      if (!folder) return;
+      await window.codexVoice.createProject(folder.name, folder.path);
+      await onRefresh();
     });
   }
 
@@ -402,78 +1110,14 @@ function VoiceHome({
     setBrowseOpen(false);
   }
 
-  async function createNewChat(event: React.FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    const name = newChatName.trim();
-    if (!name) return;
-    await onAction(async () => {
-      await window.codexVoice.createChat(name);
-      setNewChatName("");
-      setNewChatOpen(false);
-      setChatsOpen(true);
-    });
-  }
-
-  async function switchChat(chatId: string): Promise<void> {
-    await onAction(async () => {
-      await window.codexVoice.switchChat(chatId);
-      setSwitchChatOpen(false);
-      setChatsOpen(true);
-    });
-  }
-
-  function openProjectContextMenu(
-    event: React.MouseEvent<HTMLElement>,
-    project: VoiceProject,
-  ): void {
-    event.preventDefault();
-    setContextMenu({
-      kind: "project",
-      projectId: project.id,
-      label: project.displayName,
-      x: event.clientX,
-      y: event.clientY,
-    });
-  }
-
-  function openChatContextMenu(event: React.MouseEvent<HTMLElement>, chat: ChatSummary): void {
-    if (!activeProject) return;
-    event.preventDefault();
-    setContextMenu({
-      kind: "chat",
-      projectId: activeProject.id,
-      chatId: chat.id,
-      label: chat.title,
-      x: event.clientX,
-      y: event.clientY,
-    });
-  }
-
-  async function archiveContextTarget(): Promise<void> {
-    const target = contextMenu;
-    if (!target) return;
-    setContextMenu(null);
-    if (target.kind === "project") {
-      await onAction(() => window.codexVoice.archiveProject(target.projectId));
-      return;
-    }
-    await onAction(() => window.codexVoice.archiveChat(target.chatId, target.projectId));
-  }
-
-  async function restoreProject(projectId: string): Promise<void> {
-    await onAction(() => window.codexVoice.restoreProject(projectId));
-  }
-
-  async function restoreChat(projectId: string, chatId: string): Promise<void> {
-    await onAction(() => window.codexVoice.restoreChat(chatId, projectId));
-  }
-
   async function saveApiKey(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     await onAction(async () => {
       await window.codexVoice.saveOpenAiApiKey(apiKey);
       setApiKey("");
-      setApiKeyOpen(false);
+      setApiKeyDialogMode(null);
+      onClearRealtimeIssue();
+      await onRefresh();
     });
   }
 
@@ -481,303 +1125,568 @@ function VoiceHome({
     await onAction(async () => {
       await window.codexVoice.clearOpenAiApiKey();
       setApiKey("");
-      setApiKeyOpen(false);
+      onClearRealtimeIssue();
+      await onRefresh();
     });
   }
 
+  async function saveExaApiKey(event?: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    await onAction(async () => {
+      await window.codexVoice.saveExaApiKey(exaApiKey);
+      setExaApiKey("");
+      await onRefresh();
+    });
+  }
+
+  async function clearExaApiKey(): Promise<void> {
+    await onAction(async () => {
+      await window.codexVoice.clearExaApiKey();
+      setExaApiKey("");
+      await onRefresh();
+    });
+  }
+
+  async function revealOpenAiApiKey(): Promise<string> {
+    const secret = await window.codexVoice.revealOpenAiApiKey();
+    return secret.value;
+  }
+
+  async function copyOpenAiApiKey(value?: string): Promise<void> {
+    const entered = value?.trim();
+    if (entered) {
+      await navigator.clipboard.writeText(entered);
+      return;
+    }
+    await window.codexVoice.copyOpenAiApiKey();
+  }
+
+  async function revealExaApiKey(): Promise<string> {
+    const secret = await window.codexVoice.revealExaApiKey();
+    return secret.value;
+  }
+
+  async function copyExaApiKey(value?: string): Promise<void> {
+    const entered = value?.trim();
+    if (entered) {
+      await navigator.clipboard.writeText(entered);
+      return;
+    }
+    await window.codexVoice.copyExaApiKey();
+  }
+
+  async function saveOnboardingApiKey(): Promise<void> {
+    await onAction(async () => {
+      await window.codexVoice.saveOpenAiApiKey(apiKey);
+      setApiKey("");
+      onClearRealtimeIssue();
+      await onRefresh();
+    });
+  }
+
+  async function saveOnboardingExaApiKey(): Promise<void> {
+    await onAction(async () => {
+      await window.codexVoice.saveExaApiKey(exaApiKey);
+      setExaApiKey("");
+      await onRefresh();
+    });
+  }
+
+  async function changeRealtimeVoice(voice: RealtimeVoiceId): Promise<void> {
+    let updated = false;
+    await onAction(async () => {
+      await window.codexVoice.setRealtimeSettings({ voice });
+      updated = true;
+      await onRefresh();
+    });
+    if (updated && voiceConnected) await onRestartVoice();
+  }
+
+  function completeOnboarding(): void {
+    setApiKey("");
+    saveVoiceOnboardingSeen(true);
+    setOnboardingSeen(true);
+    setOnboardingOpen(false);
+  }
+
+  function closeApiKeyDialog(): void {
+    setApiKey("");
+    setApiKeyDialogMode(null);
+  }
+
+  function handleVoiceOrbClick(): void {
+    if (!state.realtime.available) {
+      setApiKeyDialogMode("onboarding");
+      return;
+    }
+    void onOrbAction();
+  }
+
+  function clearPaneReplacementTimeout(): void {
+    if (paneReplacementTimeoutRef.current === null) return;
+    window.clearTimeout(paneReplacementTimeoutRef.current);
+    paneReplacementTimeoutRef.current = null;
+  }
+
+  function openPaneAfterReplacement(pane: PaneSide): void {
+    paneReplacementTimeoutRef.current = window.setTimeout(() => {
+      if (pane === "settings") {
+        setSettingsOpen(true);
+      } else {
+        setFutureOpen(true);
+      }
+      paneReplacementTimeoutRef.current = null;
+    }, paneReplacementDelayMs);
+  }
+
+  function openFuturePaneForIntent(): void {
+    setPermissionsOpen(false);
+    clearPaneReplacementTimeout();
+    lastOpenedPaneRef.current = "future";
+    if (canShowBothPanes || !settingsOpen) {
+      setFutureOpen(true);
+      return;
+    }
+    setSettingsOpen(false);
+    openPaneAfterReplacement("future");
+  }
+
+  function toggleSettingsPane(): void {
+    setPermissionsOpen(false);
+    clearPaneReplacementTimeout();
+
+    if (settingsOpen) {
+      setSettingsOpen(false);
+      return;
+    }
+
+    lastOpenedPaneRef.current = "settings";
+    if (canShowBothPanes || !futureOpen) {
+      setSettingsOpen(true);
+      return;
+    }
+
+    setFutureOpen(false);
+    openPaneAfterReplacement("settings");
+  }
+
+  function toggleFuturePane(): void {
+    setPermissionsOpen(false);
+    clearPaneReplacementTimeout();
+
+    if (futureOpen) {
+      setFutureOpen(false);
+      return;
+    }
+
+    lastOpenedPaneRef.current = "future";
+    if (canShowBothPanes || !settingsOpen) {
+      setFutureOpen(true);
+      return;
+    }
+
+    setSettingsOpen(false);
+    openPaneAfterReplacement("future");
+  }
+
+  function openThreadInRightPanel(chat: ChatSummary): void {
+    setPermissionsOpen(false);
+    clearPaneReplacementTimeout();
+    lastOpenedPaneRef.current = "future";
+    setThreadOpenRequest({
+      requestId: Date.now(),
+      projectId: chat.projectId,
+      projectName: chat.projectTitle,
+      chatId: chat.id,
+      chatName: chat.title,
+      threadId: chat.threadId,
+      workspacePath: chat.workspacePath,
+    });
+
+    if (canShowBothPanes || !settingsOpen) {
+      setFutureOpen(true);
+      return;
+    }
+
+    setSettingsOpen(false);
+    openPaneAfterReplacement("future");
+  }
+
+  function activatePaneToggle(pane: PaneSide): void {
+    if (pane === "settings") {
+      toggleSettingsPane();
+      return;
+    }
+
+    toggleFuturePane();
+  }
+
+  function handlePaneTogglePointerDown(event: React.PointerEvent<HTMLButtonElement>): void {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function handlePaneTogglePointerUp(
+    event: React.PointerEvent<HTMLButtonElement>,
+    pane: PaneSide,
+  ): void {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    paneTogglePointerActivationRef.current = pane;
+    activatePaneToggle(pane);
+    window.setTimeout(() => {
+      if (paneTogglePointerActivationRef.current === pane) {
+        paneTogglePointerActivationRef.current = null;
+      }
+    }, 400);
+  }
+
+  function handlePaneToggleClick(
+    event: React.MouseEvent<HTMLButtonElement>,
+    pane: PaneSide,
+  ): void {
+    event.stopPropagation();
+    if (paneTogglePointerActivationRef.current === pane) {
+      paneTogglePointerActivationRef.current = null;
+      return;
+    }
+    activatePaneToggle(pane);
+  }
+
+  function paneWidth(pane: PaneSide): number {
+    return pane === "settings" ? leftPaneWidth : rightPanelWidth;
+  }
+
+  function setPaneWidth(pane: PaneSide, width: number): void {
+    if (pane === "settings") {
+      setLeftPaneWidth(clampPaneWidth(width));
+      return;
+    }
+    setRightPanelWidth(clampPaneWidth(width));
+  }
+
+  function maxPaneWidthForResize(pane: PaneSide): number {
+    const otherPaneWidth =
+      pane === "settings" && futureOpen ? rightPanelWidth : pane === "future" && settingsOpen ? leftPaneWidth : 0;
+    const centerMinWidth = window.innerWidth >= 1240 ? 500 : 340;
+    const availableWidth = window.innerWidth - otherPaneWidth - centerMinWidth;
+    return Math.max(minPaneWidth, Math.min(maxPaneWidth, availableWidth));
+  }
+
+  function clampPaneWidthForResize(pane: PaneSide, width: number): number {
+    return Math.max(minPaneWidth, Math.min(maxPaneWidthForResize(pane), Math.round(width)));
+  }
+
+  function flushPendingPaneResize(): void {
+    const pending = pendingPaneResizeRef.current;
+    if (!pending) return;
+    pendingPaneResizeRef.current = null;
+    paneResizeFrameRef.current = null;
+    setPaneWidth(pending.pane, pending.width);
+  }
+
+  function schedulePaneResize(pane: PaneSide, width: number): void {
+    pendingPaneResizeRef.current = { pane, width };
+    if (paneResizeFrameRef.current !== null) return;
+    paneResizeFrameRef.current = window.requestAnimationFrame(flushPendingPaneResize);
+  }
+
+  function finishPaneResize(pane: PaneSide): void {
+    const pending = pendingPaneResizeRef.current;
+    if (paneResizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(paneResizeFrameRef.current);
+      paneResizeFrameRef.current = null;
+    }
+    if (pending?.pane === pane) {
+      pendingPaneResizeRef.current = null;
+      setPaneWidth(pending.pane, pending.width);
+    }
+    setResizingPane(null);
+  }
+
+  function startPaneResize(event: React.PointerEvent<HTMLDivElement>, pane: PaneSide): void {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    paneResizeCleanupRef.current?.();
+
+    const target = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startWidth = paneWidth(pane);
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    let latestRawWidth = startWidth;
+
+    target.setPointerCapture(pointerId);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    setResizingPane(pane);
+
+    function onMove(moveEvent: PointerEvent): void {
+      const delta = moveEvent.clientX - startX;
+      const nextWidth = pane === "settings" ? startWidth + delta : startWidth - delta;
+      latestRawWidth = nextWidth;
+      schedulePaneResize(pane, clampPaneWidthForResize(pane, nextWidth));
+    }
+
+    function onEnd(): void {
+      cleanup();
+    }
+
+    function cleanup(): void {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      window.removeEventListener("blur", onEnd);
+      if (target.hasPointerCapture(pointerId)) {
+        target.releasePointerCapture(pointerId);
+      }
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      paneResizeCleanupRef.current = null;
+      finishPaneResize(pane);
+      if (latestRawWidth <= paneDragCloseThreshold) {
+        if (pane === "settings") {
+          setSettingsOpen(false);
+        } else {
+          setFutureOpen(false);
+        }
+      }
+    }
+
+    paneResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+    window.addEventListener("blur", onEnd);
+  }
+
+  function resizePaneWithKeyboard(event: React.KeyboardEvent<HTMLDivElement>, pane: PaneSide): void {
+    const direction = pane === "settings" ? 1 : -1;
+    const step = event.shiftKey ? 48 : 24;
+
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      setPaneWidth(pane, clampPaneWidthForResize(pane, paneWidth(pane) - step * direction));
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      setPaneWidth(pane, clampPaneWidthForResize(pane, paneWidth(pane) + step * direction));
+    }
+  }
+
+  function paneResizer(pane: PaneSide, open: boolean): React.ReactElement {
+    const label = pane === "settings" ? "left" : "right";
+    const maxWidth = maxPaneWidthForResize(pane);
+    const currentWidth = Math.min(paneWidth(pane), maxWidth);
+    return (
+      <div
+        className={`voice-pane-resizer ${label}${resizingPane === pane ? " resizing" : ""}`}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label={`Resize ${label} pane`}
+        aria-valuemin={minPaneWidth}
+        aria-valuemax={maxWidth}
+        aria-valuenow={currentWidth}
+        title={`Drag to resize ${label} pane. Pull past ${paneDragCloseThreshold}px to close.`}
+        tabIndex={open ? 0 : -1}
+        onPointerDown={(event) => startPaneResize(event, pane)}
+        onKeyDown={(event) => resizePaneWithKeyboard(event, pane)}
+      />
+    );
+  }
+
+  const effectiveLeftPaneWidth =
+    settingsOpen ? Math.min(leftPaneWidth, maxPaneWidthForResize("settings")) : leftPaneWidth;
+  const effectiveRightPaneWidth =
+    futureOpen ? Math.min(rightPanelWidth, maxPaneWidthForResize("future")) : rightPanelWidth;
+
   return (
-    <main className="voice-home">
-      <div className="voice-home-content">
-        <header className="voice-home-header">
-          <h1>
-            Codex Voice <span>BETA</span>
-          </h1>
-          <div className="voice-menu-wrap">
-            <button
-              className="voice-icon-button"
-              aria-label="Open menu"
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((current) => !current)}
-            >
-              <EllipsisIcon />
-            </button>
-            {menuOpen && (
-              <div className="voice-menu" role="menu">
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    void onShowDebug();
-                  }}
-                >
-                  Debug UI
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    void onRefresh();
-                  }}
-                >
-                  Refresh
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setArchivedOpen(true);
-                  }}
-                >
-                  Archived{archivedCount > 0 ? ` (${archivedCount})` : ""}
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setApiKeyOpen(true);
-                  }}
-                >
-                  OpenAI API key
-                </button>
-                {voiceConnected && (
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      void onToggleVoice();
-                    }}
-                  >
-                    Disconnect voice
-                  </button>
-                )}
+    <main
+      className={`voice-home ${settingsOpen ? "settings-open" : ""} ${futureOpen ? "future-open" : ""} ${
+        windowChromeState.isFullScreen ? "window-fullscreen" : ""
+      } ${
+        resizingPane ? `pane-resizing pane-resizing-${resizingPane}` : ""
+      }`}
+      style={{
+        ...voiceAccentStyle(orbCustomization),
+        "--settings-pane-resized-width": `${effectiveLeftPaneWidth}px`,
+        "--right-pane-width": `${effectiveRightPaneWidth}px`,
+      } as React.CSSProperties}
+    >
+      <button
+        className="voice-pane-toggle left"
+        type="button"
+        aria-label={settingsOpen ? "Close left pane" : "Open left pane"}
+        aria-expanded={settingsOpen}
+        onPointerDown={handlePaneTogglePointerDown}
+        onPointerUp={(event) => handlePaneTogglePointerUp(event, "settings")}
+        onClick={(event) => handlePaneToggleClick(event, "settings")}
+      >
+        <LeftPaneIcon />
+      </button>
+      <button
+        className="voice-pane-toggle right"
+        type="button"
+        aria-label={futureOpen ? "Close right pane" : "Open right pane"}
+        aria-expanded={futureOpen}
+        onPointerDown={handlePaneTogglePointerDown}
+        onPointerUp={(event) => handlePaneTogglePointerUp(event, "future")}
+        onClick={(event) => handlePaneToggleClick(event, "future")}
+      >
+        <RightPaneIcon />
+      </button>
+      <div className="voice-shell">
+        <VoiceSettingsPane
+          open={settingsOpen}
+          state={state}
+          realtimeIssue={realtimeIssue}
+          apiKey={apiKey}
+          exaApiKey={exaApiKey}
+          voiceConnected={voiceConnected}
+          modelScope={modelScope}
+          effectiveModel={effectiveModel}
+          effectiveEffort={effectiveEffort}
+          effectiveServiceTier={effectiveServiceTier}
+          effectivePermissionMode={effectivePermissionMode}
+          modelOptions={modelOptions}
+          projects={projects}
+          orbPresetId={orbPresetId}
+          orbCustomization={orbCustomization}
+          onOrbPresetChange={setOrbPresetId}
+          onOrbCustomizationChange={setOrbCustomization}
+          onCreateProject={() => setNewOpen(true)}
+          onCreateProjectFromFolder={createProjectFromFolder}
+          onBrowseProjects={() => setBrowseOpen(true)}
+          onResumeProject={resumeProject}
+          onOpenThread={openThreadInRightPanel}
+          onApiKeyChange={setApiKey}
+          onSaveApiKey={saveApiKey}
+          onClearApiKey={clearApiKey}
+          onRevealApiKey={revealOpenAiApiKey}
+          onCopyApiKey={copyOpenAiApiKey}
+          onExaApiKeyChange={setExaApiKey}
+          onSaveExaApiKey={saveExaApiKey}
+          onClearExaApiKey={clearExaApiKey}
+          onRevealExaApiKey={revealExaApiKey}
+          onCopyExaApiKey={copyExaApiKey}
+          onSelectWorkspace={selectWorkspaceFolder}
+          onAction={onAction}
+          onRefresh={onRefresh}
+          onShowDebug={onShowDebug}
+          onToggleVoice={onToggleVoice}
+          onRestartVoice={onRestartVoice}
+          resizer={paneResizer("settings", settingsOpen)}
+        />
+
+        <div className="voice-home-content" ref={voiceHomeContentRef}>
+          <header className="voice-home-header">
+            <h1>Codex Voice</h1>
+          </header>
+
+          <div className="voice-home-scroll">
+            <section className="voice-hero" aria-label="Voice status">
+              <button
+                className={`voice-orb ${voiceState.tone} ${orbPresetId}`}
+                aria-label={voiceOrbLabel}
+                onClick={handleVoiceOrbClick}
+              >
+                <VoiceOrbCanvas
+                  tone={voiceState.tone}
+                  outputLevel={voiceOutputLevel}
+                  presetId={orbPresetId}
+                  customization={orbCustomization}
+                />
+                <span className="voice-orb-shine" />
+              </button>
+              <div className={`voice-state-line ${voiceState.tone}`}>
+                <WaveformIcon />
+                <span>{voiceState.label}</span>
               </div>
+            </section>
+
+            {error && <ErrorOverlay message={error} onDismiss={onDismissError} />}
+
+            {primaryPendingRequest && (
+              <VoicePendingRequestPanel
+                request={primaryPendingRequest}
+                requestCount={pendingRequests.length}
+                onAction={onAction}
+              />
             )}
+
+            <section className="voice-project-region active-thread-region" aria-label="Codex chats">
+              <ProjectChatsPanel chats={activeProject ? projectChats : []} onOpenThread={openThreadInRightPanel} />
+            </section>
           </div>
-        </header>
 
-        <div className="voice-home-scroll">
-          <section className="voice-model-picker" aria-label="Model settings">
+          <footer className="voice-footer">
             <button
-              className="voice-model-trigger"
-              aria-expanded={modelOpen}
-              onClick={() => setModelOpen((current) => !current)}
+              className="voice-footer-settings"
+              aria-label="Open settings"
+              aria-expanded={settingsOpen}
+              title={state.runtime.ready ? "Codex app-server connected" : "Codex app-server starting"}
+              onClick={toggleSettingsPane}
             >
-              {fastModeOn && <LightningIcon />}
-              <span className="voice-model-trigger-name">{formatModelName(effectiveModel)}</span>
-              <span className="voice-model-trigger-separator" aria-hidden="true">·</span>
-              <span className="voice-model-trigger-effort">{formatEffort(effectiveEffort)}</span>
-              <DownIcon />
+              <ConfigIcon />
+              <span className="voice-footer-settings-label">Settings</span>
             </button>
+            <div className="voice-permission-wrap footer-permissions">
+              <button
+                className={`voice-permission-trigger ${effectivePermissionMode}`}
+                aria-expanded={permissionsOpen}
+                onClick={() => setPermissionsOpen((current) => !current)}
+              >
+                <PermissionIcon mode={effectivePermissionMode} />
+                <span>{effectivePermission.displayName}</span>
+                <DownIcon />
+              </button>
 
-            {modelOpen && (
-              <div className="voice-model-panel">
-                <label className="voice-model-field">
-                  Model
-                  <span className="voice-model-select-wrap">
-                    <select
-                      value={effectiveModel}
-                      onChange={(event) => {
-                        const model = event.target.value || null;
-                        const nextModel = modelOptions.find((candidate) => candidate.model === model) ?? null;
-                        const serviceTier =
-                          model && !supportsFastMode(nextModel) ? DEFAULT_CODEX_SERVICE_TIER : effectiveServiceTier;
-                        void onAction(() =>
-                          window.codexVoice.setCodexSettings({ model, serviceTier }, modelScope),
-                        );
-                      }}
-                    >
-                      {modelOptions.length === 0 && (
-                        <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
-                      )}
-                      {modelOptions.map((model) => (
-                        <option key={model.id} value={model.model}>
-                          {model.displayName || formatModelName(model.model)}
-                        </option>
-                      ))}
-                    </select>
-                    <DownIcon />
-                  </span>
-                </label>
-
-                <div className="voice-effort-list">
-                  <span>Reasoning effort</span>
-                  {(["low", "medium", "high", "xhigh"] as ReasoningEffort[]).map((effort) => (
+              {permissionsOpen && (
+                <div className="voice-permission-menu" role="menu">
+                  {CODEX_PERMISSION_PROFILES.map((profile) => (
                     <button
-                      key={effort}
-                      className={effort === effectiveEffort ? "selected" : ""}
+                      key={profile.mode}
+                      className={[profile.mode, profile.mode === effectivePermissionMode ? "selected" : ""]
+                        .filter(Boolean)
+                        .join(" ")}
+                      role="menuitemradio"
+                      aria-checked={profile.mode === effectivePermissionMode}
                       onClick={() =>
                         void onAction(() =>
-                          window.codexVoice.setCodexSettings({ reasoningEffort: effort }, modelScope),
+                          window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
                         )
                       }
                     >
-                      {formatEffort(effort)}
-                      {effort === effectiveEffort && <CheckIcon />}
+                      <PermissionIcon mode={profile.mode} />
+                      <span>{profile.displayName}</span>
+                      {profile.mode === effectivePermissionMode && <CheckIcon />}
                     </button>
                   ))}
                 </div>
-
-                <div className="voice-speed-list">
-                  <span>Speed</span>
-                  <button
-                    className={!fastModeOn ? "selected" : ""}
-                    onClick={() =>
-                      void onAction(() =>
-                        window.codexVoice.setCodexSettings({ serviceTier: DEFAULT_CODEX_SERVICE_TIER }, modelScope),
-                      )
-                    }
-                  >
-                    <span>
-                      Standard
-                      <small>Default speed, normal usage</small>
-                    </span>
-                    {!fastModeOn && <CheckIcon />}
-                  </button>
-                  <button
-                    className={fastModeOn ? "selected" : ""}
-                    disabled={!modelSupportsFast}
-                    onClick={() =>
-                      void onAction(() =>
-                        window.codexVoice.setCodexSettings({ serviceTier: FAST_CODEX_SERVICE_TIER }, modelScope),
-                      )
-                    }
-                  >
-                    <span>
-                      Fast
-                      <small>{modelSupportsFast ? "1.5x speed, increased usage" : "Not available for this model"}</small>
-                    </span>
-                    {fastModeOn && <CheckIcon />}
-                  </button>
-                </div>
-              </div>
-            )}
-
-          </section>
-
-          <section className="voice-hero" aria-label="Voice status">
-            <button
-              className={`voice-orb ${voiceState.tone}`}
-              aria-label={voiceOrbLabel}
-              onClick={() => void onOrbAction()}
-            >
-              <span className="voice-orb-shine" />
-            </button>
-            <div className="voice-state-line">
-              <WaveformIcon />
-              <span>{voiceState.label}</span>
+              )}
             </div>
-          </section>
-
-          {error && <ErrorOverlay message={error} onDismiss={onDismissError} />}
-
-          {primaryPendingRequest && (
-            <VoicePendingRequestPanel
-              request={primaryPendingRequest}
-              requestCount={pendingRequests.length}
-              onAction={onAction}
-            />
-          )}
-
-          <section className="voice-project-region" aria-label="Projects">
-            <FeaturedProjectCard
-              activeProjectId={activeProjectId}
-              project={featuredProject}
-              chatsOpen={chatsOpen}
-              onCreate={() => setNewOpen(true)}
-              onResume={resumeProject}
-              onOpenMenu={openProjectContextMenu}
-              onToggleChats={() => {
-                const next = !chatsOpen;
-                setChatsOpen(next);
-                void onAction(() => window.codexVoice.showProjectChats(next));
-              }}
-            />
-
-            {chatsOpen && activeProject ? (
-              <ProjectChatsPanel
-                chats={projectChats}
-                onNewChat={() => setNewChatOpen(true)}
-                onSwitchChat={() => setSwitchChatOpen(true)}
-                onSelectChat={switchChat}
-                onOpenChatMenu={openChatContextMenu}
-              />
-            ) : (
-              <div className="voice-actions">
-                <button className="voice-action-button" onClick={() => setNewOpen(true)}>
-                  <PlusIcon />
-                  <span>New project</span>
-                </button>
-                <button className="voice-action-button" onClick={() => setBrowseOpen(true)}>
-                  <FolderIcon />
-                  <span>Browse projects</span>
-                </button>
-              </div>
-            )}
-
-            {(!chatsOpen || !activeProject) && (
-              <div className="recent-block">
-                <h2>Recent Projects</h2>
-                <div className="recent-list">
-                  {recentProjects.map((project) => (
-                    <button
-                      key={project.id}
-                      className="recent-row"
-                      onClick={() => void resumeProject(project.id)}
-                      onContextMenu={(event) => openProjectContextMenu(event, project)}
-                    >
-                      <span>
-                        <strong>{project.displayName}</strong>
-                        <small>{formatProjectTime(project.updatedAt)}</small>
-                      </span>
-                      <ChevronIcon />
-                    </button>
-                  ))}
-                  {recentProjects.length === 0 && (
-                    <div className="recent-empty">Recent projects will appear here.</div>
-                  )}
-                </div>
-              </div>
-            )}
-          </section>
+          </footer>
         </div>
 
-        <footer className="voice-footer">
-          <span className={`voice-dot ${state.runtime.ready ? "ready" : ""}`} />
-          <span>{state.runtime.ready ? "Codex app-server connected" : "Codex app-server starting"}</span>
-          <div className="voice-permission-wrap footer-permissions">
-            <button
-              className={`voice-permission-trigger ${effectivePermissionMode}`}
-              aria-expanded={permissionsOpen}
-              onClick={() => setPermissionsOpen((current) => !current)}
-            >
-              <ShieldIcon />
-              <span>{effectivePermission.displayName}</span>
-              <DownIcon />
-            </button>
-
-            {permissionsOpen && (
-              <div className="voice-permission-menu" role="menu">
-                {CODEX_PERMISSION_PROFILES.map((profile) => (
-                  <button
-                    key={profile.mode}
-                    className={profile.mode === effectivePermissionMode ? "selected" : ""}
-                    role="menuitemradio"
-                    aria-checked={profile.mode === effectivePermissionMode}
-                    onClick={() =>
-                      void onAction(() =>
-                        window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
-                      )
-                    }
-                  >
-                    <ShieldIcon />
-                    <span>{profile.displayName}</span>
-                    {profile.mode === effectivePermissionMode && <CheckIcon />}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </footer>
+        <RightPanel
+          open={futureOpen}
+          state={state}
+          events={events}
+          activateTranscriptRequest={transcriptActivationRequest}
+          openThreadRequest={threadOpenRequest}
+          openIntent={rightPanelOpenIntent}
+          realtimeConnected={voiceConnected}
+          realtimeConnecting={voiceConnecting}
+          realtimePaused={voicePaused}
+          realtimeAvailable={state.realtime.available}
+          onClose={() => setFutureOpen(false)}
+          onAction={onAction}
+          onSendRealtimeInput={onSendRealtimeInput}
+          resizer={paneResizer("future", futureOpen)}
+        />
       </div>
 
       {newOpen && (
@@ -834,11 +1743,10 @@ function VoiceHome({
                   key={project.id}
                   className="browse-row"
                   onClick={() => void resumeProject(project.id)}
-                  onContextMenu={(event) => openProjectContextMenu(event, project)}
                 >
                   <FolderIcon />
                   <span>
-                    <strong>{project.displayName}</strong>
+                    <strong>{projectDisplayName(project)}</strong>
                     <small>{formatProjectTime(project.updatedAt)}</small>
                   </span>
                   <ChevronIcon />
@@ -850,368 +1758,2781 @@ function VoiceHome({
         </div>
       )}
 
-      {newChatOpen && (
-        <div className="voice-modal-backdrop" role="presentation">
-          <form className="voice-dialog" onSubmit={(event) => void createNewChat(event)}>
-            <div className="voice-dialog-header">
-              <h2>New chat</h2>
-              <button type="button" aria-label="Close" onClick={() => setNewChatOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <label className="voice-field">
-              Chat name
-              <input
-                autoFocus
-                value={newChatName}
-                onChange={(event) => setNewChatName(event.target.value)}
-                placeholder="Research thread"
-              />
-            </label>
-            <div className="voice-dialog-actions">
-              <button type="button" onClick={() => setNewChatOpen(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="voice-primary" disabled={!newChatName.trim()}>
-                Create
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {switchChatOpen && (
-        <div className="voice-modal-backdrop" role="presentation">
-          <section className="voice-dialog browse-dialog" aria-label="Switch chat">
-            <div className="voice-dialog-header">
-              <h2>Switch chat</h2>
-              <button type="button" aria-label="Close" onClick={() => setSwitchChatOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <div className="browse-list">
-              {projectChats.map((chat) => (
-                <button
-                  key={chat.id}
-                  className={`browse-row ${chat.active ? "selected-chat" : ""}`}
-                  onClick={() => void switchChat(chat.id)}
-                >
-                  <span className={`chat-status-dot ${chat.tone}`} />
-                  <span>
-                    <strong>{chat.title}</strong>
-                    <small>{chat.detail}</small>
-                  </span>
-                  <span className="browse-row-trailing">
-                    {chat.active && <span className="active-chat-pill">Active</span>}
-                    <ChevronIcon />
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
-        </div>
-      )}
-
-      {apiKeyOpen && (
-        <div className="voice-modal-backdrop" role="presentation">
-          <form className="voice-dialog api-key-dialog" onSubmit={(event) => void saveApiKey(event)}>
-            <div className="voice-dialog-header">
-              <h2>OpenAI API key</h2>
-              <button type="button" aria-label="Close" onClick={() => setApiKeyOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <p className="voice-dialog-note">
-              {state.realtime.available
-                ? `A key is configured from ${
-                    state.realtime.apiKeySource === "environment" ? "the environment" : "saved settings"
-                  }.`
-                : "Add a key to enable Realtime voice."}
-            </p>
-            <label className="voice-field">
-              API key
-              <input
-                autoFocus
-                type="password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder={state.realtime.available ? "Enter a new key to replace saved key" : "sk-..."}
-                autoComplete="off"
-                spellCheck={false}
-              />
-            </label>
-            <div className="voice-dialog-actions split-actions">
-              <button
-                type="button"
-                onClick={() => void clearApiKey()}
-              >
-                Clear saved key
-              </button>
-              <span />
-              <button type="button" onClick={() => setApiKeyOpen(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="voice-primary" disabled={!apiKey.trim()}>
-                Save
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {archivedOpen && (
-        <ArchivedDialog
-          projects={archivedProjects}
-          chats={archivedChats}
-          onClose={() => setArchivedOpen(false)}
-          onRestoreProject={restoreProject}
-          onRestoreChat={restoreChat}
+      {onboardingOpen && (
+        <OnboardingFlow
+          state={state}
+          realtimeIssue={realtimeIssue}
+          apiKey={apiKey}
+          exaApiKey={exaApiKey}
+          orbPresetId={orbPresetId}
+          orbCustomization={orbCustomization}
+          onApiKeyChange={setApiKey}
+          onExaApiKeyChange={setExaApiKey}
+          onSaveApiKey={saveOnboardingApiKey}
+          onSaveExaApiKey={saveOnboardingExaApiKey}
+          onRevealApiKey={revealOpenAiApiKey}
+          onCopyApiKey={copyOpenAiApiKey}
+          onRevealExaApiKey={revealExaApiKey}
+          onCopyExaApiKey={copyExaApiKey}
+          onVoiceChange={changeRealtimeVoice}
+          onOrbPresetChange={setOrbPresetId}
+          onOrbCustomizationChange={setOrbCustomization}
+          onStartProject={(mode) => void startOnboardingProject(mode)}
+          onAction={onAction}
+          onClose={completeOnboarding}
         />
       )}
 
-      {contextMenu && (
-        <ArchiveContextMenu
-          target={contextMenu}
-          onArchive={() => void archiveContextTarget()}
+      {apiKeyDialogMode && (
+        <ApiKeyDialog
+          mode={apiKeyDialogMode}
+          realtime={state.realtime}
+          realtimeIssue={realtimeIssue}
+          apiKey={apiKey}
+          onApiKeyChange={setApiKey}
+          onSubmit={saveApiKey}
+          onClose={closeApiKeyDialog}
         />
       )}
+
     </main>
   );
 }
 
-function FeaturedProjectCard({
-  activeProjectId,
-  chatsOpen,
-  project,
-  onCreate,
-  onResume,
-  onOpenMenu,
-  onToggleChats,
+function VoiceSettingsPane({
+  open,
+  state,
+  realtimeIssue,
+  apiKey,
+  exaApiKey,
+  voiceConnected,
+  modelScope,
+  effectiveModel,
+  effectiveEffort,
+  effectiveServiceTier,
+  effectivePermissionMode,
+  modelOptions,
+  projects,
+  orbPresetId,
+  orbCustomization,
+  onOrbPresetChange,
+  onOrbCustomizationChange,
+  onCreateProject,
+  onCreateProjectFromFolder,
+  onBrowseProjects,
+  onResumeProject,
+  onOpenThread,
+  onApiKeyChange,
+  onSaveApiKey,
+  onClearApiKey,
+  onRevealApiKey,
+  onCopyApiKey,
+  onExaApiKeyChange,
+  onSaveExaApiKey,
+  onClearExaApiKey,
+  onRevealExaApiKey,
+  onCopyExaApiKey,
+  onSelectWorkspace,
+  onAction,
+  onRefresh,
+  onShowDebug,
+  onToggleVoice,
+  onRestartVoice,
+  resizer,
 }: {
-  activeProjectId: string | null;
-  chatsOpen: boolean;
-  project: VoiceProject | null;
-  onCreate: () => void;
-  onResume: (projectId: string) => Promise<void>;
-  onOpenMenu: (event: React.MouseEvent<HTMLElement>, project: VoiceProject) => void;
-  onToggleChats: () => void;
+  open: boolean;
+  state: AppState;
+  realtimeIssue: string | null;
+  apiKey: string;
+  exaApiKey: string;
+  voiceConnected: boolean;
+  modelScope: "chat" | "nextTurn";
+  effectiveModel: string;
+  effectiveEffort: ReasoningEffort;
+  effectiveServiceTier: CodexServiceTier | null;
+  effectivePermissionMode: CodexPermissionMode;
+  modelOptions: CodexModelSummary[];
+  projects: VoiceProject[];
+  orbPresetId: VoiceOrbPresetId;
+  orbCustomization: VoiceOrbCustomization;
+  onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
+  onOrbCustomizationChange: (customization: VoiceOrbCustomization) => void;
+  onCreateProject: () => void;
+  onCreateProjectFromFolder: () => Promise<void>;
+  onBrowseProjects: () => void;
+  onResumeProject: (projectId: string) => Promise<void>;
+  onOpenThread: (chat: ChatSummary) => void;
+  onApiKeyChange: (value: string) => void;
+  onSaveApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+  onClearApiKey: () => Promise<void>;
+  onRevealApiKey: () => Promise<string>;
+  onCopyApiKey: (value?: string) => Promise<void>;
+  onExaApiKeyChange: (value: string) => void;
+  onSaveExaApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+  onClearExaApiKey: () => Promise<void>;
+  onRevealExaApiKey: () => Promise<string>;
+  onCopyExaApiKey: (value?: string) => Promise<void>;
+  onSelectWorkspace: () => Promise<void>;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onShowDebug: () => Promise<void>;
+  onToggleVoice: () => Promise<void>;
+  onRestartVoice: () => Promise<void>;
+  resizer?: React.ReactNode;
 }): React.ReactElement {
-  if (!project) {
-    return (
-      <button className="featured-project-card empty-feature" onClick={onCreate}>
-        <span className="voice-folder-tile">
-          <FolderIcon />
-        </span>
-        <span className="featured-copy">
-          <strong>No active project</strong>
-          <small>Create a project to begin</small>
-        </span>
-        <ChevronIcon />
-      </button>
-    );
+  const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("projects");
+  const [projectCreateMenuOpen, setProjectCreateMenuOpen] = useState(false);
+  const [projectCreateMenuAnchor, setProjectCreateMenuAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [projectsCollapsed, setProjectsCollapsed] = useState(false);
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(() => new Set());
+  const [renameTarget, setRenameTarget] = useState<ProjectTreeRenameTarget | null>(null);
+  const [treeMenuTarget, setTreeMenuTarget] = useState<ProjectTreeMenuTarget | null>(null);
+  const [openAiKeyVisible, setOpenAiKeyVisible] = useState(false);
+  const [openAiRevealedKey, setOpenAiRevealedKey] = useState<string | null>(null);
+  const [openAiSecretMessage, setOpenAiSecretMessage] = useState<string | null>(null);
+  const [exaKeyVisible, setExaKeyVisible] = useState(false);
+  const [exaRevealedKey, setExaRevealedKey] = useState<string | null>(null);
+  const [exaSecretMessage, setExaSecretMessage] = useState<string | null>(null);
+  const health = realtimeHealth(state.realtime, realtimeIssue);
+  const activeProject = state.activeProject;
+  const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
+  const hasApiKey = Boolean(apiKey.trim());
+  const hasExaApiKey = Boolean(exaApiKey.trim());
+  const apiKeySource = state.realtime.apiKeySource;
+  const apiKeyManagedByEnvironment = apiKeySource === "environment";
+  const canClearSavedApiKey = apiKeySource === "saved";
+  const exaApiKeySource = state.webSearch.apiKeySource;
+  const exaApiKeyManagedByEnvironment = exaApiKeySource === "environment";
+  const canClearSavedExaApiKey = exaApiKeySource === "saved";
+  const openAiStorageTitle = apiKeyStorageTitle(state.realtime);
+  const openAiStorageDetail = apiKeyStorageDetail(state.realtime);
+  const webSearchStorageTitleText = webSearchStorageTitle(state.webSearch);
+  const webSearchStorageDetailText = webSearchStorageDetail(state.webSearch);
+  const realtimeSupportsReasoning = state.realtime.model === "gpt-realtime-2";
+  const selectedRealtimeReasoningEffort =
+    state.realtime.reasoningEffort ?? DEFAULT_REALTIME_REASONING_EFFORT;
+  const selectedCodexModel = modelOptions.find((model) => model.model === effectiveModel) ?? null;
+  const modelSupportsFast = supportsFastMode(selectedCodexModel);
+  const fastModeOn = isFastServiceTier(effectiveServiceTier);
+  const canViewOpenAiKey = hasApiKey || state.realtime.available;
+  const canViewExaKey = hasExaApiKey || state.webSearch.available;
+  const openAiInputValue = openAiRevealedKey && openAiKeyVisible ? openAiRevealedKey : apiKey;
+  const exaInputValue = exaRevealedKey && exaKeyVisible ? exaRevealedKey : exaApiKey;
+
+  useEffect(() => {
+    setOpenAiKeyVisible(false);
+    setOpenAiRevealedKey(null);
+    setOpenAiSecretMessage(null);
+  }, [apiKeySource]);
+
+  useEffect(() => {
+    setExaKeyVisible(false);
+    setExaRevealedKey(null);
+    setExaSecretMessage(null);
+  }, [exaApiKeySource]);
+
+  useEffect(() => {
+    if (!openAiKeyVisible || !openAiRevealedKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setOpenAiKeyVisible(false);
+      setOpenAiRevealedKey(null);
+      setOpenAiSecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [openAiKeyVisible, openAiRevealedKey]);
+
+  useEffect(() => {
+    if (!exaKeyVisible || !exaRevealedKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setExaKeyVisible(false);
+      setExaRevealedKey(null);
+      setExaSecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [exaKeyVisible, exaRevealedKey]);
+
+  async function toggleOpenAiKeyVisible(): Promise<void> {
+    if (openAiKeyVisible) {
+      setOpenAiKeyVisible(false);
+      setOpenAiRevealedKey(null);
+      setOpenAiSecretMessage(null);
+      return;
+    }
+    if (hasApiKey) {
+      setOpenAiKeyVisible(true);
+      setOpenAiSecretMessage("Showing entered key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealApiKey();
+      setOpenAiRevealedKey(value);
+      setOpenAiKeyVisible(true);
+      setOpenAiSecretMessage("Showing active key.");
+    });
   }
 
-  const active = project.id === activeProjectId;
+  async function copyOpenAiKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyApiKey(hasApiKey ? apiKey : undefined);
+      setOpenAiSecretMessage(hasApiKey ? "Copied entered key." : "Copied active key.");
+    });
+  }
+
+  async function toggleExaKeyVisible(): Promise<void> {
+    if (exaKeyVisible) {
+      setExaKeyVisible(false);
+      setExaRevealedKey(null);
+      setExaSecretMessage(null);
+      return;
+    }
+    if (hasExaApiKey) {
+      setExaKeyVisible(true);
+      setExaSecretMessage("Showing entered Exa key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealExaApiKey();
+      setExaRevealedKey(value);
+      setExaKeyVisible(true);
+      setExaSecretMessage("Showing active Exa key.");
+    });
+  }
+
+  async function copyExaKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyExaApiKey(hasExaApiKey ? exaApiKey : undefined);
+      setExaSecretMessage(hasExaApiKey ? "Copied entered Exa key." : "Copied active Exa key.");
+    });
+  }
+  const tabs: Array<{ id: VoiceSettingsTab; label: string; icon: React.ReactElement }> = [
+    { id: "projects", label: "Projects", icon: <FolderIcon /> },
+    { id: "general", label: "General", icon: <ConfigIcon /> },
+    { id: "appearance", label: "Appearance", icon: <AppearanceIcon /> },
+    { id: "configuration", label: "Configuration", icon: <PermissionIcon mode={effectivePermissionMode} /> },
+  ];
+
+  async function changeRealtimeModel(model: RealtimeModelId): Promise<void> {
+    let updated = false;
+    await onAction(async () => {
+      try {
+        await window.codexVoice.setRealtimeSettings({ model });
+        updated = true;
+      } catch (caught) {
+        throw friendlyRealtimeSettingsError(caught);
+      }
+    });
+    if (updated && voiceConnected) await onRestartVoice();
+  }
+
+  async function changeRealtimeVoice(voice: RealtimeVoiceId): Promise<void> {
+    let updated = false;
+    await onAction(async () => {
+      try {
+        await window.codexVoice.setRealtimeSettings({ voice });
+        updated = true;
+      } catch (caught) {
+        throw friendlyRealtimeSettingsError(caught);
+      }
+    });
+    if (updated && voiceConnected) await onRestartVoice();
+  }
+
+	  async function changeRealtimeReasoningEffort(reasoningEffort: RealtimeReasoningEffort): Promise<void> {
+    let updated = false;
+    await onAction(async () => {
+      try {
+        await window.codexVoice.setRealtimeSettings({ reasoningEffort });
+        updated = true;
+      } catch (caught) {
+        throw friendlyRealtimeSettingsError(caught);
+      }
+    });
+	    if (updated && voiceConnected) await onRestartVoice();
+	  }
+
+  useEffect(() => {
+    if (!treeMenuTarget) return undefined;
+    const close = () => setTreeMenuTarget(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [treeMenuTarget]);
+
+  useEffect(() => {
+    if (!projectCreateMenuOpen) return undefined;
+    const close = () => {
+      setProjectCreateMenuOpen(false);
+      setProjectCreateMenuAnchor(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectCreateMenuOpen]);
+
+  function closeProjectCreateMenu(): void {
+    setProjectCreateMenuOpen(false);
+    setProjectCreateMenuAnchor(null);
+  }
+
+  function toggleProjectCreateMenu(event: React.MouseEvent<HTMLButtonElement>): void {
+    event.stopPropagation();
+    setTreeMenuTarget(null);
+    setRenameTarget(null);
+    if (projectCreateMenuOpen) {
+      closeProjectCreateMenu();
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 310;
+    const menuHeight = 116;
+    const gap = 10;
+    const rightSideLeft = bounds.right + gap;
+    const left =
+      rightSideLeft + menuWidth <= window.innerWidth - 8
+        ? rightSideLeft
+        : Math.max(8, bounds.left - menuWidth - gap);
+    const top = Math.max(8, Math.min(bounds.top - 8, window.innerHeight - menuHeight - 8));
+    setProjectCreateMenuAnchor({ left, top });
+    setProjectCreateMenuOpen(true);
+  }
+
+  function toggleProjectCollapsed(projectId: string): void {
+    setCollapsedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) {
+        next.delete(projectId);
+      } else {
+        next.add(projectId);
+      }
+      return next;
+    });
+  }
+
+	  function beginProjectRename(project: VoiceProject): void {
+	    closeProjectCreateMenu();
+    setTreeMenuTarget(null);
+	    setRenameTarget({
+      kind: "project",
+      projectId: project.id,
+      original: projectDisplayName(project),
+      value: projectDisplayName(project),
+    });
+  }
+
+	  function beginChatRename(projectId: string, chat: ChatSummary): void {
+	    closeProjectCreateMenu();
+    setTreeMenuTarget(null);
+	    setRenameTarget({
+      kind: "chat",
+      projectId,
+      chatId: chat.id,
+      original: chat.title,
+      value: chat.title,
+    });
+  }
+
+  function updateRenameValue(value: string): void {
+    setRenameTarget((current) => (current ? { ...current, value } : current));
+  }
+
+  async function submitRename(): Promise<void> {
+    const target = renameTarget;
+    if (!target) return;
+    const nextName = target.value.trim();
+    setRenameTarget(null);
+    if (!nextName || nextName === target.original) return;
+    await onAction(async () => {
+      if (target.kind === "project") {
+        await window.codexVoice.renameProject(target.projectId, nextName);
+        return;
+      }
+      await window.codexVoice.renameChat(target.chatId, nextName, target.projectId);
+    });
+  }
+
+  function openProjectTreeMenu(event: React.MouseEvent<HTMLButtonElement>, project: VoiceProject, label: string): void {
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    closeProjectCreateMenu();
+    setRenameTarget(null);
+    setTreeMenuTarget({
+      kind: "project",
+      projectId: project.id,
+      label,
+      x: bounds.right + 8,
+      y: bounds.top - 7,
+    });
+  }
+
+  function openChatTreeMenu(event: React.MouseEvent<HTMLButtonElement>, projectId: string, chat: ChatSummary): void {
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    closeProjectCreateMenu();
+    setRenameTarget(null);
+    setTreeMenuTarget({
+      kind: "chat",
+      projectId,
+      chatId: chat.id,
+      label: chat.title,
+      x: bounds.right + 8,
+      y: bounds.top - 7,
+    });
+  }
+
+  async function removeTreeMenuTarget(): Promise<void> {
+    const target = treeMenuTarget;
+    if (!target) return;
+    setTreeMenuTarget(null);
+    setRenameTarget(null);
+    await onAction(async () => {
+      if (target.kind === "project") {
+        await window.codexVoice.removeProject(target.projectId);
+        return;
+      }
+      await window.codexVoice.removeChat(target.chatId, target.projectId);
+    });
+  }
+
   return (
-    <button
-      className={`featured-project-card ${chatsOpen && active ? "expanded" : ""}`}
-      aria-expanded={active ? chatsOpen : undefined}
-      onContextMenu={(event) => onOpenMenu(event, project)}
-      onClick={() => {
-        if (active) {
-          onToggleChats();
-          return;
-        }
-        void onResume(project.id);
-      }}
-    >
-      <span className="voice-folder-tile">
-        <FolderIcon />
-      </span>
-      <span className="featured-copy">
-        <strong>{project.displayName}</strong>
-        <small>
-          {formatProjectTime(project.updatedAt)}
-          {active && (
+    <aside className="voice-settings-pane" aria-hidden={!open} inert={!open} aria-label="Settings">
+      {resizer}
+      <div className="voice-settings-inner no-title">
+        <nav className="voice-settings-nav" aria-label="Control sections" role="tablist">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={tab.id === activeTab ? "selected" : ""}
+              role="tab"
+              aria-selected={tab.id === activeTab}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.icon}
+              <span>{tab.label}</span>
+            </button>
+          ))}
+        </nav>
+
+        <div className="voice-settings-scroll" role="tabpanel">
+          {activeTab === "projects" && (
             <>
-              <span className="voice-meta-dot">.</span>
-              <span className="active-project-text">Active project</span>
+              <section className="voice-project-tree" aria-label="Projects">
+                <div className="voice-project-tree-header">
+                  <button
+                    type="button"
+                    className="voice-project-title-button"
+                    aria-expanded={!projectsCollapsed}
+                    onClick={() => {
+                      closeProjectCreateMenu();
+                      setProjectsCollapsed((current) => !current);
+                    }}
+                  >
+	                    <span>Projects</span>
+	                    <ChevronIcon className={!projectsCollapsed ? "open" : ""} />
+	                  </button>
+                  <div className="voice-project-tree-actions">
+                    <button
+                      type="button"
+                      aria-label="Browse projects"
+                      title="Browse projects"
+                      onClick={() => {
+                        closeProjectCreateMenu();
+                        onBrowseProjects();
+                      }}
+                    >
+                      <FilterIcon />
+                    </button>
+                    <div className="voice-project-create-wrap">
+                      <button
+                        type="button"
+                        aria-label="New project"
+                        title="New project"
+                        aria-expanded={projectCreateMenuOpen}
+                        onClick={toggleProjectCreateMenu}
+                      >
+                        <FolderPlusIcon />
+                      </button>
+                      {projectCreateMenuOpen && projectCreateMenuAnchor && (
+                        <div
+                          className="voice-project-create-menu"
+                          role="menu"
+                          style={{ left: projectCreateMenuAnchor.left, top: projectCreateMenuAnchor.top }}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              closeProjectCreateMenu();
+                              onCreateProject();
+                            }}
+                          >
+                            <FolderPlusIcon />
+                            <span>Start from scratch</span>
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              closeProjectCreateMenu();
+                              void onCreateProjectFromFolder();
+                            }}
+                          >
+                            <FolderIcon />
+                            <span>Use an existing folder</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className={`voice-project-tree-list ${projectsCollapsed ? "collapsed" : ""}`}>
+                    {projects.map((project) => {
+                      const chats = chatSummariesForProject(project, state);
+                      const projectLabel = projectDisplayName(project);
+	                      const projectCollapsed = collapsedProjectIds.has(project.id);
+	                      const projectRename =
+	                        renameTarget?.kind === "project" && renameTarget.projectId === project.id ? renameTarget : null;
+                      return (
+                        <div key={project.id} className="voice-project-tree-group">
+                          <div className="voice-project-tree-project-row">
+                            {projectRename ? (
+                              <ProjectTreeRenameForm
+                                ariaLabel="Rename project"
+	                                value={projectRename.value}
+	                                onChange={updateRenameValue}
+	                                onCancel={() => setRenameTarget(null)}
+	                                onSubmit={submitRename}
+	                              />
+	                            ) : (
+	                              <button
+                                type="button"
+                                className="voice-project-tree-project"
+                                title={project.workspacePath || project.folderPath}
+                                aria-expanded={!projectCollapsed}
+                                onClick={() => toggleProjectCollapsed(project.id)}
+                              >
+                                <FolderIcon />
+                                <span>{projectLabel}</span>
+	                              </button>
+	                            )}
+	                            {!projectRename && (
+	                              <button
+	                                type="button"
+	                                className="voice-tree-icon-button"
+	                                aria-label={`Open ${projectLabel} actions`}
+	                                aria-expanded={treeMenuTarget?.kind === "project" && treeMenuTarget.projectId === project.id}
+	                                title="Project actions"
+	                                onClick={(event) => openProjectTreeMenu(event, project, projectLabel)}
+	                              >
+	                                <EllipsisIcon />
+	                              </button>
+	                            )}
+	                          </div>
+                          <div className={`voice-project-tree-chats ${projectCollapsed ? "collapsed" : ""}`}>
+                              {chats.map((chat) => {
+                                const chatRename =
+                                  renameTarget?.kind === "chat" && renameTarget.chatId === chat.id ? renameTarget : null;
+	                                return (
+	                                  <div
+	                                    key={chat.id}
+	                                    className={`voice-project-tree-chat ${chat.working ? "working" : ""}`}
+	                                    title={chat.title}
+	                                  >
+	                                    {chatRename ? (
+	                                      <ProjectTreeRenameForm
+	                                        ariaLabel="Rename thread"
+	                                        value={chatRename.value}
+	                                        onChange={updateRenameValue}
+	                                        onCancel={() => setRenameTarget(null)}
+	                                        onSubmit={submitRename}
+	                                      />
+	                                    ) : (
+	                                      <button
+	                                        type="button"
+	                                        className="voice-project-tree-chat-button"
+	                                        onClick={() => onOpenThread(chat)}
+	                                      >
+	                                        <span>{chat.title}</span>
+	                                      </button>
+	                                    )}
+	                                    <span className="voice-tree-row-tools">
+	                                      {chat.working && (
+	                                        <span className="codex-thread-spinner" aria-label="Codex is working" />
+	                                      )}
+	                                      {!chatRename && (
+	                                        <button
+	                                          type="button"
+	                                          className="voice-tree-icon-button"
+	                                          aria-label={`Open ${chat.title} actions`}
+	                                          aria-expanded={treeMenuTarget?.kind === "chat" && treeMenuTarget.chatId === chat.id}
+	                                          title="Thread actions"
+	                                          onClick={(event) => openChatTreeMenu(event, project.id, chat)}
+	                                        >
+	                                          <EllipsisIcon />
+	                                        </button>
+	                                      )}
+	                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                        </div>
+                      );
+                    })}
+	                    {projects.length === 0 && (
+                      <div className="voice-left-empty">Projects will appear here.</div>
+                    )}
+                  </div>
+	                {treeMenuTarget && (
+	                  <ProjectTreeActionMenu
+	                    target={treeMenuTarget}
+	                    onRename={() => {
+	                      if (treeMenuTarget.kind === "project") {
+	                        const project = projects.find((candidate) => candidate.id === treeMenuTarget.projectId);
+	                        if (project) beginProjectRename(project);
+	                        return;
+	                      }
+	                      const project = projects.find((candidate) => candidate.id === treeMenuTarget.projectId) ?? null;
+	                      const chat = chatSummariesForProject(project, state).find(
+	                        (candidate) => candidate.id === treeMenuTarget.chatId,
+	                      );
+	                      if (chat) beginChatRename(treeMenuTarget.projectId, chat);
+	                    }}
+	                    onRemove={removeTreeMenuTarget}
+	                  />
+	                )}
+              </section>
             </>
           )}
-        </small>
+
+          {activeTab === "general" && (
+            <>
+              <section className="voice-settings-section">
+                <h3>System</h3>
+                <div className="voice-settings-card">
+                  <div className="voice-settings-row">
+                    <span>
+                      <strong>Codex app-server</strong>
+                      <small>{state.runtime.status}</small>
+                    </span>
+                    <StatusDot ready={state.runtime.ready} />
+                  </div>
+                  <div className="voice-settings-row">
+                    <span>
+                      <strong>Realtime voice</strong>
+                      <small>{health.message}</small>
+                    </span>
+                    <StatusDot ready={health.ok} />
+                  </div>
+                  <button
+                    type="button"
+                    className="voice-settings-row voice-settings-workspace-row"
+                    onClick={() => void onSelectWorkspace()}
+                    aria-label="Select workspace folder"
+                    title={workspace}
+                  >
+                    <span>
+                      <strong>Workspace</strong>
+                      <small>{workspace}</small>
+                    </span>
+                    <FolderIcon />
+                  </button>
+                </div>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>OpenAI API key</h3>
+                <form className="voice-settings-card voice-settings-api-key" onSubmit={(event) => void onSaveApiKey(event)}>
+                  {(openAiStorageTitle || openAiStorageDetail) && (
+                    <div className="voice-settings-secret-status">
+                      {openAiStorageTitle && <strong>{openAiStorageTitle}</strong>}
+                      {openAiStorageDetail && <small>{openAiStorageDetail}</small>}
+                    </div>
+                  )}
+                  <label className="voice-settings-field">
+                    {apiKeySource === "saved" ? "Replacement key" : "API key"}
+                    <input
+                      type={openAiKeyVisible ? "text" : "password"}
+                      value={openAiInputValue}
+                      onChange={(event) => {
+                        setOpenAiRevealedKey(null);
+                        setOpenAiSecretMessage(null);
+                        onApiKeyChange(event.target.value);
+                      }}
+                      placeholder={apiKeyInputPlaceholder(state.realtime)}
+                      disabled={apiKeyManagedByEnvironment}
+                      readOnly={Boolean(openAiRevealedKey)}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </label>
+                  {openAiSecretMessage && (
+                    <div className="voice-settings-secret-note" role="status">
+                      {openAiSecretMessage}
+                    </div>
+                  )}
+                  <div className="voice-settings-actions inline">
+                    <button type="button" onClick={() => void toggleOpenAiKeyVisible()} disabled={!canViewOpenAiKey}>
+                      {openAiKeyVisible ? "Hide" : "View"}
+                    </button>
+                    <button type="button" onClick={() => void copyOpenAiKey()} disabled={!canViewOpenAiKey}>
+                      Copy
+                    </button>
+                    <button type="button" onClick={() => void onClearApiKey()} disabled={!canClearSavedApiKey}>
+                      Clear
+                    </button>
+                    <button type="submit" className="primary" disabled={!hasApiKey || apiKeyManagedByEnvironment}>
+                      {apiKeySource === "saved" ? "Replace" : "Save"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Web search</h3>
+                <form className="voice-settings-card voice-settings-api-key" onSubmit={(event) => void onSaveExaApiKey(event)}>
+                  {(webSearchStorageTitleText || webSearchStorageDetailText) && (
+                    <div className="voice-settings-secret-heading">
+                      <div className="voice-settings-secret-status">
+                        {webSearchStorageTitleText && <strong>{webSearchStorageTitleText}</strong>}
+                        {webSearchStorageDetailText && <small>{webSearchStorageDetailText}</small>}
+                      </div>
+                      <button
+                        type="button"
+                        className="api-key-info-button"
+                        aria-label="Web search details"
+                        title="Web search details"
+                      >
+                        <InfoIcon />
+                        <span className="api-key-info-popover" role="status">
+                          Exa is used by main for voice web search. The key stays out of app state unless you choose View.
+                        </span>
+                      </button>
+                    </div>
+                  )}
+                  <label className="voice-settings-field">
+                    {exaApiKeySource === "saved" ? "Replacement Exa key" : "Exa API key"}
+                    <input
+                      type={exaKeyVisible ? "text" : "password"}
+                      value={exaInputValue}
+                      onChange={(event) => {
+                        setExaRevealedKey(null);
+                        setExaSecretMessage(null);
+                        onExaApiKeyChange(event.target.value);
+                      }}
+                      placeholder={exaApiKeyInputPlaceholder(state.webSearch)}
+                      disabled={exaApiKeyManagedByEnvironment}
+                      readOnly={Boolean(exaRevealedKey)}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </label>
+                  {exaSecretMessage && (
+                    <div className="voice-settings-secret-note" role="status">
+                      {exaSecretMessage}
+                    </div>
+                  )}
+                  <div className="voice-settings-actions inline">
+                    <button type="button" onClick={() => void toggleExaKeyVisible()} disabled={!canViewExaKey}>
+                      {exaKeyVisible ? "Hide" : "View"}
+                    </button>
+                    <button type="button" onClick={() => void copyExaKey()} disabled={!canViewExaKey}>
+                      Copy
+                    </button>
+                    <button type="button" onClick={() => void onClearExaApiKey()} disabled={!canClearSavedExaApiKey}>
+                      Clear
+                    </button>
+                    <button type="submit" className="primary" disabled={!hasExaApiKey || exaApiKeyManagedByEnvironment}>
+                      {exaApiKeySource === "saved" ? "Replace" : "Save"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Actions</h3>
+                <div className="voice-settings-card action-settings-card">
+                  <button type="button" className="voice-settings-action" onClick={() => void onRefresh()}>
+                    <RefreshIcon />
+                    <span>
+                      <strong>Refresh</strong>
+                      <small>Reload projects and runtime state</small>
+                    </span>
+                  </button>
+                  <button type="button" className="voice-settings-action" onClick={() => void onShowDebug()}>
+                    <DebugIcon />
+                    <span>
+                      <strong>Debug UI</strong>
+                      <small>Open the operator dashboard</small>
+                    </span>
+                  </button>
+                  {voiceConnected && (
+                    <button type="button" className="voice-settings-action" onClick={() => void onToggleVoice()}>
+                      <PowerIcon />
+                      <span>
+                        <strong>Disconnect voice</strong>
+                        <small>Stop the active Realtime session</small>
+                      </span>
+                    </button>
+                  )}
+                </div>
+              </section>
+            </>
+          )}
+
+          {activeTab === "appearance" && (
+            <section className="voice-settings-section">
+              <h3>Orb</h3>
+              <VoiceOrbPresetPicker
+                value={orbPresetId}
+                customization={orbCustomization}
+                onChange={onOrbPresetChange}
+                onCustomizationChange={onOrbCustomizationChange}
+              />
+            </section>
+          )}
+
+          {activeTab === "configuration" && (
+            <>
+              <section className="voice-settings-section">
+                <h3>Realtime voice</h3>
+                <div className="voice-settings-card">
+                  <label className="voice-settings-field">
+                    Model
+                    <span className="voice-settings-select-wrap">
+                      <select
+                        value={state.realtime.model}
+                        onChange={(event) => void changeRealtimeModel(event.target.value as RealtimeModelId)}
+                      >
+                        {REALTIME_MODEL_OPTIONS.map((model) => (
+                          <option key={model.model} value={model.model}>
+                            {model.displayName}
+                          </option>
+                        ))}
+                      </select>
+                      <DownIcon />
+                    </span>
+                  </label>
+
+                  <div className={`realtime-reasoning-panel ${realtimeSupportsReasoning ? "" : "disabled"}`}>
+                    <div className="realtime-reasoning-header">
+                      <span>
+                        <strong>Reasoning</strong>
+                        <small>
+                          {realtimeSupportsReasoning
+                            ? formatEffort(selectedRealtimeReasoningEffort)
+                            : "Off on Realtime 1.5"}
+                        </small>
+                      </span>
+                    </div>
+                    <div className="voice-settings-segmented realtime-reasoning" aria-label="Realtime reasoning effort">
+                      {REALTIME_REASONING_EFFORT_OPTIONS.map((effort) => (
+                        <button
+                          key={effort}
+                          type="button"
+                          className={
+                            realtimeSupportsReasoning && effort === selectedRealtimeReasoningEffort
+                              ? "selected"
+                              : ""
+                          }
+                          disabled={!realtimeSupportsReasoning}
+                          onClick={() => void changeRealtimeReasoningEffort(effort)}
+                        >
+                          {formatEffort(effort)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <label className="voice-settings-field">
+                    Voice
+                    <span className="voice-settings-select-wrap">
+                      <select
+                        value={state.realtime.voice}
+                        onChange={(event) => void changeRealtimeVoice(event.target.value as RealtimeVoiceId)}
+                      >
+                        {REALTIME_VOICE_OPTIONS.map((voice) => (
+                          <option key={voice.voice} value={voice.voice}>
+                            {voice.displayName}
+                          </option>
+                        ))}
+                      </select>
+                      <DownIcon />
+                    </span>
+                  </label>
+                </div>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Codex model</h3>
+                <div className="voice-settings-card">
+                  <label className="voice-settings-field">
+                    Model
+                    <span className="voice-settings-select-wrap">
+                      <select
+                        value={effectiveModel}
+                        onChange={(event) => {
+                          const model = event.target.value || null;
+                          const nextModel = modelOptions.find((candidate) => candidate.model === model) ?? null;
+                          const serviceTier =
+                            model && !supportsFastMode(nextModel) ? DEFAULT_CODEX_SERVICE_TIER : effectiveServiceTier;
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings({ model, serviceTier }, modelScope),
+                          );
+                        }}
+                      >
+                        {modelOptions.length === 0 && (
+                          <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
+                        )}
+                        {modelOptions.map((model) => (
+                          <option key={model.id} value={model.model}>
+                            {model.displayName || formatModelName(model.model)}
+                          </option>
+                        ))}
+                      </select>
+                      <DownIcon />
+                    </span>
+                  </label>
+
+                  <div className="voice-settings-segmented" aria-label="Reasoning effort">
+                    {(["low", "medium", "high", "xhigh"] as ReasoningEffort[]).map((effort) => (
+                      <button
+                        key={effort}
+                        type="button"
+                        className={effort === effectiveEffort ? "selected" : ""}
+                        onClick={() =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings({ reasoningEffort: effort }, modelScope),
+                          )
+                        }
+                      >
+                        {formatEffort(effort)}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="voice-settings-speed">
+                    <div className="voice-settings-speed-header">
+                      <span>
+                        <strong>Speed</strong>
+                        <small>{fastModeOn ? "Fast mode" : "Standard speed"}</small>
+                      </span>
+                    </div>
+                    <div className="voice-settings-segmented codex-speed" aria-label="Codex speed">
+                      <button
+                        type="button"
+                        className={!fastModeOn ? "selected" : ""}
+                        onClick={() =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings(
+                              { serviceTier: DEFAULT_CODEX_SERVICE_TIER },
+                              modelScope,
+                            ),
+                          )
+                        }
+                      >
+                        Standard
+                      </button>
+                      <button
+                        type="button"
+                        className={fastModeOn ? "selected" : ""}
+                        disabled={!modelSupportsFast}
+                        title={modelSupportsFast ? "Use Fast mode" : "Fast mode is not reported for this model"}
+                        onClick={() =>
+                          void onAction(() =>
+                            window.codexVoice.setCodexSettings(
+                              { serviceTier: FAST_CODEX_SERVICE_TIER },
+                              modelScope,
+                            ),
+                          )
+                        }
+                      >
+                        Fast
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Permissions</h3>
+                <div className="voice-settings-card permission-settings-card">
+                  <div className="voice-settings-permission-note">
+                    <strong>Direct voice tools run in this workspace</strong>
+                    <small>{workspace}</small>
+                  </div>
+                  {CODEX_PERMISSION_PROFILES.map((profile) => (
+                    <button
+                      key={profile.mode}
+                      type="button"
+                      className={`voice-settings-permission ${profile.mode === effectivePermissionMode ? "selected" : ""}`}
+                      onClick={() =>
+                        void onAction(() =>
+                          window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
+                        )
+                      }
+                    >
+                      <PermissionIcon mode={profile.mode} />
+                      <span>
+                        <strong>{profile.displayName}</strong>
+                        <small>{profile.description}</small>
+                      </span>
+                      {profile.mode === effectivePermissionMode && <CheckIcon />}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            </>
+          )}
+
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function VoiceOrbPresetPicker({
+  value,
+  customization,
+  onChange,
+  onCustomizationChange,
+  showCustomization = true,
+}: {
+  value: VoiceOrbPresetId;
+  customization: VoiceOrbCustomization;
+  onChange: (presetId: VoiceOrbPresetId) => void;
+  onCustomizationChange: (customization: VoiceOrbCustomization) => void;
+  showCustomization?: boolean;
+}): React.ReactElement {
+  const selectedPreset = voiceOrbPresetById(value);
+  const selectedIndex = Math.max(0, voiceOrbPresets.findIndex((preset) => preset.id === value));
+
+  function selectOffset(offset: number): void {
+    onChange(voiceOrbPresetAtOffset(value, offset));
+  }
+
+  function updateCustomization(patch: Partial<VoiceOrbCustomization>): void {
+    onCustomizationChange(normalizeVoiceOrbCustomization({ ...customization, ...patch }));
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>): void {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      selectOffset(-1);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      selectOffset(1);
+    }
+  }
+
+  function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
+    if (Math.abs(event.deltaX) < 12 && Math.abs(event.deltaY) < 18) return;
+    event.preventDefault();
+    selectOffset(event.deltaX + event.deltaY > 0 ? 1 : -1);
+  }
+
+  return (
+    <div className="voice-settings-card voice-orb-picker-card">
+      <div className="voice-orb-preset-tabs" role="tablist" aria-label="Orb presets">
+        {voiceOrbPresets.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            className={preset.id === value ? "selected" : ""}
+            role="tab"
+            aria-selected={preset.id === value}
+            onClick={() => onChange(preset.id)}
+          >
+            {preset.name}
+          </button>
+        ))}
+      </div>
+
+      <div
+        className="voice-orb-carousel"
+        tabIndex={0}
+        role="tabpanel"
+        aria-label={`${selectedPreset.name} orb preview, ${selectedIndex + 1} of ${voiceOrbPresets.length}`}
+        onKeyDown={handleKeyDown}
+        onWheel={handleWheel}
+      >
+        <div className="voice-orb-carousel-center">
+          <div className={`voice-orb-carousel-preview ${selectedPreset.id}`}>
+            <VoiceOrbCanvas
+              tone="listening"
+              outputLevel={selectedPreset.previewLevel}
+              presetId={selectedPreset.id}
+              customization={customization}
+              preview
+            />
+          </div>
+          <div className="voice-orb-carousel-label">
+            <strong>{selectedPreset.name}</strong>
+            <small>{selectedPreset.detail}</small>
+          </div>
+        </div>
+      </div>
+
+      {showCustomization && (
+        <div className="voice-orb-customizer" aria-label="Orb customization">
+          <div className="voice-orb-control-row">
+            <span className="voice-orb-control-label">Color</span>
+            <div className="voice-orb-color-controls">
+              <div className="voice-orb-swatches" aria-label="Orb colors">
+                {voiceOrbColorOptions.map((option) => (
+                  <button
+                    key={option.color}
+                    type="button"
+                    className={option.color.toLowerCase() === customization.accentColor.toLowerCase() ? "selected" : ""}
+                    style={{ backgroundColor: option.color }}
+                    aria-label={option.label}
+                    onClick={() => updateCustomization({ accentColor: option.color })}
+                  />
+                ))}
+              </div>
+              <label className="voice-orb-color-picker" aria-label="Custom orb color">
+                <input
+                  type="color"
+                  value={customization.accentColor}
+                  onChange={(event) => updateCustomization({ accentColor: event.target.value })}
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="voice-orb-slider-grid">
+            <VoiceOrbSlider
+              label="Glow"
+              value={customization.glow}
+              onChange={(glow) => updateCustomization({ glow })}
+            />
+            <VoiceOrbSlider
+              label="Reactivity"
+              value={customization.reactivity}
+              onChange={(reactivity) => updateCustomization({ reactivity })}
+            />
+            <VoiceOrbSlider
+              label="Wave height"
+              value={customization.waveHeight}
+              onChange={(waveHeight) => updateCustomization({ waveHeight })}
+            />
+          </div>
+
+          <button
+            type="button"
+            className="voice-orb-reset-button"
+            onClick={() => onCustomizationChange(defaultVoiceOrbCustomization)}
+          >
+            <RefreshIcon />
+            <span>Reset</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VoiceOrbSlider({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}): React.ReactElement {
+  return (
+    <label className="voice-orb-slider">
+      <span>{label}</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
+  );
+}
+
+const onboardingStepOrder: OnboardingStep[] = ["key", "voice", "orb", "project"];
+
+function OnboardingFlow({
+  state,
+  realtimeIssue,
+  apiKey,
+  exaApiKey,
+  orbPresetId,
+  orbCustomization,
+  onApiKeyChange,
+  onExaApiKeyChange,
+  onSaveApiKey,
+  onSaveExaApiKey,
+  onRevealApiKey,
+  onCopyApiKey,
+  onRevealExaApiKey,
+  onCopyExaApiKey,
+  onVoiceChange,
+  onOrbPresetChange,
+  onOrbCustomizationChange,
+  onStartProject,
+  onAction,
+  onClose,
+}: {
+  state: AppState;
+  realtimeIssue: string | null;
+  apiKey: string;
+  exaApiKey: string;
+  orbPresetId: VoiceOrbPresetId;
+  orbCustomization: VoiceOrbCustomization;
+  onApiKeyChange: (value: string) => void;
+  onExaApiKeyChange: (value: string) => void;
+  onSaveApiKey: () => Promise<void>;
+  onSaveExaApiKey: () => Promise<void>;
+  onRevealApiKey: () => Promise<string>;
+  onCopyApiKey: (value?: string) => Promise<void>;
+  onRevealExaApiKey: () => Promise<string>;
+  onCopyExaApiKey: (value?: string) => Promise<void>;
+  onVoiceChange: (voice: RealtimeVoiceId) => Promise<void>;
+  onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
+  onOrbCustomizationChange: (customization: VoiceOrbCustomization) => void;
+  onStartProject: (mode: "scratch" | "folder") => void;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
+  onClose: () => void;
+}): React.ReactElement {
+  const initialStep = state.realtime.available && state.webSearch.available ? "voice" : "key";
+  const [step, setStep] = useState<OnboardingStep>(initialStep);
+  const [revealed, setRevealed] = useState(false);
+  const [revealedApiKey, setRevealedApiKey] = useState<string | null>(null);
+  const [exaRevealed, setExaRevealed] = useState(false);
+  const [revealedExaApiKey, setRevealedExaApiKey] = useState<string | null>(null);
+  const [apiKeySecretMessage, setApiKeySecretMessage] = useState<string | null>(null);
+  const [exaSecretMessage, setExaSecretMessage] = useState<string | null>(null);
+  const [webSearchRequested, setWebSearchRequested] = useState(state.webSearch.available);
+  const health = realtimeHealth(state.realtime, realtimeIssue);
+  const hasApiKey = Boolean(apiKey.trim());
+  const hasExaApiKey = Boolean(exaApiKey.trim());
+  const apiKeyManagedByEnvironment = state.realtime.apiKeySource === "environment";
+  const exaApiKeyManagedByEnvironment = state.webSearch.apiKeySource === "environment";
+  const selectedVoice = realtimeVoiceOption(state.realtime.voice);
+  const selectedOrb = voiceOrbPresetById(orbPresetId);
+  const hasProject = state.projects.length > 0;
+  const stepIndex = onboardingStepOrder.indexOf(step);
+  const canGoBack = stepIndex > 0;
+  const isLastStep = step === "project";
+  const webSearchNeedsKey = webSearchRequested && !state.webSearch.available && !hasExaApiKey;
+  const canViewApiKey = hasApiKey || state.realtime.available;
+  const canViewExaApiKey = hasExaApiKey || state.webSearch.available;
+  const apiKeyInputValue = revealed && revealedApiKey ? revealedApiKey : apiKey;
+  const exaApiKeyInputValue = exaRevealed && revealedExaApiKey ? revealedExaApiKey : exaApiKey;
+
+  useEffect(() => {
+    if (state.webSearch.available) {
+      setWebSearchRequested(true);
+    }
+  }, [state.webSearch.available]);
+
+  useEffect(() => {
+    setRevealed(false);
+    setRevealedApiKey(null);
+    setApiKeySecretMessage(null);
+  }, [state.realtime.apiKeySource]);
+
+  useEffect(() => {
+    setExaRevealed(false);
+    setRevealedExaApiKey(null);
+    setExaSecretMessage(null);
+  }, [state.webSearch.apiKeySource]);
+
+  useEffect(() => {
+    if (!revealed || !revealedApiKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setRevealed(false);
+      setRevealedApiKey(null);
+      setApiKeySecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [revealed, revealedApiKey]);
+
+  useEffect(() => {
+    if (!exaRevealed || !revealedExaApiKey) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      setExaRevealed(false);
+      setRevealedExaApiKey(null);
+      setExaSecretMessage(null);
+    }, secretRevealTimeoutMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [exaRevealed, revealedExaApiKey]);
+
+  const stepMeta: Array<{
+    id: OnboardingStep;
+    label: string;
+    complete: boolean;
+  }> = [
+    { id: "key", label: "Key", complete: state.realtime.available },
+    { id: "voice", label: "Voice", complete: true },
+    { id: "orb", label: "Orb", complete: true },
+    { id: "project", label: "Project", complete: hasProject },
+  ];
+
+  async function saveKeyAndContinue(): Promise<void> {
+    if (hasApiKey) {
+      await onSaveApiKey();
+    }
+    if (webSearchRequested && hasExaApiKey) {
+      await onSaveExaApiKey();
+    }
+    if (webSearchNeedsKey) return;
+    if (state.realtime.available) {
+      setStep("voice");
+      return;
+    }
+    if (hasApiKey) {
+      setStep("voice");
+    }
+  }
+
+  async function goNext(): Promise<void> {
+    if (step === "key") {
+      await saveKeyAndContinue();
+      return;
+    }
+    if (isLastStep) {
+      onClose();
+      return;
+    }
+    setStep(onboardingStepOrder[Math.min(onboardingStepOrder.length - 1, stepIndex + 1)]);
+  }
+
+  function goBack(): void {
+    if (!canGoBack) return;
+    setStep(onboardingStepOrder[stepIndex - 1]);
+  }
+
+  function startProject(mode: "scratch" | "folder"): void {
+    onStartProject(mode);
+  }
+
+  async function toggleApiKeyReveal(): Promise<void> {
+    if (revealed) {
+      setRevealed(false);
+      setRevealedApiKey(null);
+      setApiKeySecretMessage(null);
+      return;
+    }
+    if (hasApiKey) {
+      setRevealed(true);
+      setApiKeySecretMessage("Showing entered key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealApiKey();
+      setRevealedApiKey(value);
+      setRevealed(true);
+      setApiKeySecretMessage("Showing active key.");
+    });
+  }
+
+  async function copyApiKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyApiKey(hasApiKey ? apiKey : undefined);
+      setApiKeySecretMessage(hasApiKey ? "Copied entered key." : "Copied active key.");
+    });
+  }
+
+  async function toggleExaApiKeyReveal(): Promise<void> {
+    if (exaRevealed) {
+      setExaRevealed(false);
+      setRevealedExaApiKey(null);
+      setExaSecretMessage(null);
+      return;
+    }
+    if (hasExaApiKey) {
+      setExaRevealed(true);
+      setExaSecretMessage("Showing entered Exa key.");
+      return;
+    }
+    await onAction(async () => {
+      const value = await onRevealExaApiKey();
+      setRevealedExaApiKey(value);
+      setExaRevealed(true);
+      setExaSecretMessage("Showing active Exa key.");
+    });
+  }
+
+  async function copyExaApiKey(): Promise<void> {
+    await onAction(async () => {
+      await onCopyExaApiKey(hasExaApiKey ? exaApiKey : undefined);
+      setExaSecretMessage(hasExaApiKey ? "Copied entered Exa key." : "Copied active Exa key.");
+    });
+  }
+
+  return (
+    <div className="voice-modal-backdrop api-key-backdrop onboarding-backdrop" role="presentation">
+      <section className="voice-dialog api-key-dialog onboarding-dialog" aria-label="Codex Voice onboarding">
+        <div className="api-key-visual onboarding-visual">
+          <div className="onboarding-progress">
+            {stepMeta.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={[
+                  item.id,
+                  item.id === step ? "selected" : "",
+                  item.complete ? "complete" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                aria-label={`Go to ${item.label}`}
+                aria-current={item.id === step ? "step" : undefined}
+                title={item.label}
+                onClick={() => setStep(item.id)}
+              >
+                <span className="onboarding-progress-mark" />
+              </button>
+            ))}
+          </div>
+          <div className={`onboarding-hero-icon ${step}`} aria-hidden="true">
+            <OnboardingStepIcon step={step} orbPresetId={orbPresetId} orbCustomization={orbCustomization} />
+          </div>
+        </div>
+
+        <div className="onboarding-track-window">
+          <div className="onboarding-track" style={{ transform: `translateX(-${stepIndex * 100}%)` }}>
+            <article className="onboarding-card">
+              <div className="onboarding-card-header">
+                <div className="api-key-title-row">
+                  <h2>OpenAI API key</h2>
+                  <span
+                    className={`api-key-status ${health.ok ? "ready" : "broken"}`}
+                    tabIndex={health.ok ? undefined : 0}
+                    aria-label={health.ok ? "Realtime API key is ready" : health.message}
+                    title={health.ok ? "Realtime API key is ready" : undefined}
+                  >
+                    {!health.ok && <span className="api-key-health-popover">{health.message}</span>}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="api-key-info-button"
+                  aria-label="API key storage details"
+                  title="Storage details"
+                >
+                  <InfoIcon />
+                  <span className="api-key-info-popover" role="status">
+                    Main stores keys outside app state and only reveals them after you choose View.
+                  </span>
+                </button>
+              </div>
+
+              <div className="voice-field api-key-field">
+                <div className="api-key-input-wrap">
+                  <input
+                    id="openai-api-key-onboarding-input"
+                    aria-label="OpenAI API key"
+                    autoFocus
+                    type={revealed ? "text" : "password"}
+                    value={apiKeyInputValue}
+                    onChange={(event) => {
+                      setRevealedApiKey(null);
+                      setApiKeySecretMessage(null);
+                      onApiKeyChange(event.target.value);
+                    }}
+                    placeholder={apiKeyInputPlaceholder(state.realtime)}
+                    disabled={apiKeyManagedByEnvironment}
+                    readOnly={Boolean(revealedApiKey)}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <div className="api-key-input-actions">
+                    <button
+                      type="button"
+                      aria-label={revealed ? "Hide API key" : "Reveal API key"}
+                      title={revealed ? "Hide key" : "Reveal key"}
+                      disabled={!canViewApiKey}
+                      onClick={() => void toggleApiKeyReveal()}
+                    >
+                      {revealed ? <EyeOffIcon /> : <EyeIcon />}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Copy OpenAI API key"
+                      title="Copy key"
+                      disabled={!canViewApiKey}
+                      onClick={() => void copyApiKey()}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+              </div>
+              {apiKeySecretMessage && (
+                <div className="voice-settings-secret-note onboarding-secret-note" role="status">
+                  {apiKeySecretMessage}
+                </div>
+              )}
+
+              <label className="onboarding-web-search-toggle">
+                <input
+                  type="checkbox"
+                  checked={webSearchRequested}
+                  onChange={(event) => setWebSearchRequested(event.target.checked)}
+                />
+                <span>
+                  <strong>Enable web search</strong>
+                  <small>{state.webSearch.available ? "Exa is ready." : "Add Exa so voice can search the live web."}</small>
+                </span>
+              </label>
+
+              {webSearchRequested && (
+                <div className="onboarding-web-search-panel">
+                  <div className="onboarding-web-search-heading">
+                    <span>
+                      <strong>Exa API key</strong>
+                      <small>Used only for the voice web search tool.</small>
+                    </span>
+                    <button
+                      type="button"
+                      className="api-key-info-button"
+                      aria-label="Why Exa is needed"
+                      title="Why Exa is needed"
+                    >
+                      <InfoIcon />
+                      <span className="api-key-info-popover" role="status">
+                        Exa is used by main for voice web search. The key stays out of app state unless you choose View.
+                      </span>
+                    </button>
+                  </div>
+                  <div className="voice-field api-key-field">
+                    <div className="api-key-input-wrap">
+                      <input
+                        id="exa-api-key-onboarding-input"
+                        aria-label="Exa API key"
+                        type={exaRevealed ? "text" : "password"}
+                        value={exaApiKeyInputValue}
+                        onChange={(event) => {
+                          setRevealedExaApiKey(null);
+                          setExaSecretMessage(null);
+                          onExaApiKeyChange(event.target.value);
+                        }}
+                        placeholder={exaApiKeyInputPlaceholder(state.webSearch)}
+                        disabled={exaApiKeyManagedByEnvironment}
+                        readOnly={Boolean(revealedExaApiKey)}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <div className="api-key-input-actions">
+                        <button
+                          type="button"
+                          aria-label={exaRevealed ? "Hide Exa API key" : "Reveal Exa API key"}
+                          title={exaRevealed ? "Hide key" : "Reveal key"}
+                          disabled={!canViewExaApiKey}
+                          onClick={() => void toggleExaApiKeyReveal()}
+                        >
+                          {exaRevealed ? <EyeOffIcon /> : <EyeIcon />}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Copy Exa API key"
+                          title="Copy Exa key"
+                          disabled={!canViewExaApiKey}
+                          onClick={() => void copyExaApiKey()}
+                        >
+                          Copy
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  {exaSecretMessage && (
+                    <div className="voice-settings-secret-note onboarding-secret-note" role="status">
+                      {exaSecretMessage}
+                    </div>
+                  )}
+                </div>
+              )}
+
+            </article>
+
+            <article className="onboarding-card">
+              <div className="onboarding-card-header">
+                <div>
+                  <h2>Choose a voice</h2>
+                  <p>{selectedVoice.displayName} is selected.</p>
+                </div>
+              </div>
+
+              <div className="onboarding-voice-grid" aria-label="Realtime voice">
+                {REALTIME_VOICE_OPTIONS.map((option) => (
+                  <button
+                    key={option.voice}
+                    type="button"
+                    className={option.voice === state.realtime.voice ? "selected" : ""}
+                    onClick={() => void onVoiceChange(option.voice)}
+                  >
+                    <strong>{option.displayName}</strong>
+                    <small>{option.description}</small>
+                  </button>
+                ))}
+              </div>
+            </article>
+
+            <article className="onboarding-card onboarding-orb-card">
+              <div className="onboarding-card-header">
+                <div>
+                  <h2>Pick an orb</h2>
+                  <p>{selectedOrb.name} is selected.</p>
+                </div>
+              </div>
+              <VoiceOrbPresetPicker
+                value={orbPresetId}
+                customization={orbCustomization}
+                onChange={onOrbPresetChange}
+                onCustomizationChange={onOrbCustomizationChange}
+                showCustomization={false}
+              />
+            </article>
+
+            <article className="onboarding-card onboarding-project-card">
+              <div className="onboarding-card-header">
+                <div>
+                  <h2>Start your first project</h2>
+                  <p>{hasProject ? "Project ready." : "Create a clean space or attach a folder."}</p>
+                </div>
+              </div>
+
+              <div className="onboarding-project-stage">
+                <div className="onboarding-project-menu-wrap">
+                  <div className="onboarding-project-menu" role="menu">
+                    <button type="button" role="menuitem" onClick={() => startProject("scratch")}>
+                      <PlusIcon />
+                      <span>Start from scratch</span>
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => startProject("folder")}>
+                      <FolderIcon />
+                      <span>Use an existing folder</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div className="onboarding-actions">
+          <button type="button" onClick={onClose}>
+            Later
+          </button>
+          <div>
+            <button type="button" disabled={!canGoBack} onClick={goBack}>
+              Back
+            </button>
+            <button
+              type="button"
+              className="voice-primary"
+              disabled={step === "key" && ((!state.realtime.available && !hasApiKey) || webSearchNeedsKey)}
+              onClick={() => void goNext()}
+            >
+              {isLastStep ? "Done" : "Next"}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function OnboardingStepIcon({
+  step,
+  orbPresetId,
+  orbCustomization,
+}: {
+  step: OnboardingStep;
+  orbPresetId: VoiceOrbPresetId;
+  orbCustomization: VoiceOrbCustomization;
+}): React.ReactElement {
+  if (step === "key") return <OnboardingKeyIcon />;
+  if (step === "voice") return <OnboardingVoiceIcon />;
+  if (step === "orb") {
+    return (
+      <span className="onboarding-mini-orb" aria-hidden="true">
+        <VoiceOrbCanvas
+          tone="listening"
+          outputLevel={0.42}
+          presetId={orbPresetId}
+          customization={orbCustomization}
+          preview
+        />
       </span>
-      <ChevronIcon className={chatsOpen && active ? "chevron-open" : ""} />
-    </button>
+    );
+  }
+  return <OnboardingFolderIcon />;
+}
+
+function OnboardingKeyIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="onboarding-key-icon">
+      <circle cx="8.1" cy="12" r="3.15" />
+      <path className="key-shaft" d="M11.25 12h8" />
+      <path className="key-tooth" d="M16.8 12v2.65M19.25 12v2.15" />
+    </svg>
+  );
+}
+
+function OnboardingVoiceIcon(): React.ReactElement {
+  return (
+    <span className="onboarding-wave-icon" aria-hidden="true">
+      <span />
+      <span />
+      <span />
+      <span />
+      <span />
+    </span>
+  );
+}
+
+function OnboardingFolderIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="onboarding-folder-icon">
+      <path className="folder-back" d="M3.75 8.1a2 2 0 0 1 2-2h4.08l1.78 1.95h6.64a2 2 0 0 1 2 2v7.1a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V8.1Z" />
+      <path className="folder-lid" d="M3.75 9.75h6.08l1.78-1.7h6.64a2 2 0 0 1 2 2v.9H3.75V9.75Z" />
+      <path className="folder-front" d="M3.75 10.85h16.5l-1.28 6.52a2 2 0 0 1-1.96 1.62H5.72a2 2 0 0 1-1.96-1.62L3.75 10.85Z" />
+    </svg>
+  );
+}
+
+function StatusDot({ ready }: { ready: boolean }): React.ReactElement {
+  return <span className={`settings-status-dot ${ready ? "ready" : ""}`} aria-hidden="true" />;
+}
+
+function VoiceOrbCanvas({
+  tone,
+  outputLevel,
+  presetId,
+  customization = defaultVoiceOrbCustomization,
+  preview = false,
+}: {
+  tone: VoiceTone;
+  outputLevel: number;
+  presetId: VoiceOrbPresetId;
+  customization?: VoiceOrbCustomization;
+  preview?: boolean;
+}): React.ReactElement {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const toneRef = useRef(tone);
+  const outputLevelRef = useRef(outputLevel);
+  const presetIdRef = useRef(presetId);
+  const customizationRef = useRef(customization);
+
+  useEffect(() => {
+    toneRef.current = tone;
+  }, [tone]);
+
+  useEffect(() => {
+    outputLevelRef.current = outputLevel;
+  }, [outputLevel]);
+
+  useEffect(() => {
+    presetIdRef.current = presetId;
+  }, [presetId]);
+
+  useEffect(() => {
+    customizationRef.current = customization;
+  }, [customization]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const context = canvas.getContext("2d");
+    if (!context) return undefined;
+
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let animationFrame = 0;
+    let lastTime = performance.now();
+    let renderedLevel = 0;
+    let wavePhase = 0;
+    let cloudPhase = 0;
+    let pressImpulse = 0;
+    let wasActive = false;
+
+    const draw = (now: number) => {
+      const { width, height } = resizeOrbCanvas(canvas, context);
+      const dt = Math.min(48, Math.max(8, now - lastTime));
+      lastTime = now;
+
+      if (width < 4 || height < 4) {
+        animationFrame = window.requestAnimationFrame(draw);
+        return;
+      }
+
+      const preset = voiceOrbPresetById(presetIdRef.current);
+      const orbCustomization = customizationRef.current;
+      const reactivityScale = 0.55 + orbCustomization.reactivity / 100;
+      const waveScale = 0.58 + orbCustomization.waveHeight / 100;
+      const orb = canvas.closest(preview ? ".voice-orb-carousel" : ".voice-orb") as HTMLElement | null;
+      const hovering = Boolean(orb?.matches(":hover, :focus-visible"));
+      const active = Boolean(orb?.matches(":active"));
+      if (active && !wasActive) pressImpulse = 1;
+      wasActive = active;
+
+      const reduced = reducedMotion.matches;
+      const toneEnergy = preview ? 0.16 : voiceToneBaseEnergy(toneRef.current);
+      const outputEnergy = Math.min(1, Math.max(0, outputLevelRef.current) * reactivityScale);
+      const interactionEnergy = reduced ? 0 : ((hovering ? 0.18 : 0) + pressImpulse * 0.42) * reactivityScale;
+      const targetLevel = Math.min(1, Math.max(toneEnergy, outputEnergy) + interactionEnergy);
+      const smoothing = targetLevel > renderedLevel ? 0.22 : 0.075;
+      renderedLevel += (targetLevel - renderedLevel) * smoothing;
+      pressImpulse *= Math.pow(0.0018, dt / 1000);
+
+      const motion = reduced ? 0.08 : 1;
+      wavePhase += dt * (0.001 + renderedLevel * 0.0033 * reactivityScale) * motion;
+      cloudPhase += dt * (0.0002 + renderedLevel * 0.00075 * reactivityScale) * motion;
+
+      context.clearRect(0, 0, width, height);
+      context.save();
+      clipOrbShapePath(context, width, height, preset.shape);
+
+      drawOrbPresetBase(context, width, height, preset.id, renderedLevel, cloudPhase);
+      drawOrbTint(context, width, height, orbCustomization.accentColor, renderedLevel);
+      drawOrbClouds(context, width, height, renderedLevel, cloudPhase, hovering, preset.id);
+      const palette = orbWavePalette(preset.id, orbCustomization.accentColor);
+
+      drawOrbWaveLayer(context, width, height, {
+        baseline: height * (0.72 - renderedLevel * 0.18),
+        amplitude: (7 + renderedLevel * 25) * waveScale,
+        phase: wavePhase * 2.1,
+        frequency: 0.92,
+        secondFrequency: 2.2,
+        blur: 8,
+        alpha: 0.46 + renderedLevel * 0.26,
+        stops: palette.deep,
+      });
+
+      drawOrbWaveLayer(context, width, height, {
+        baseline: height * (0.62 - renderedLevel * 0.16),
+        amplitude: (5 + renderedLevel * 19) * waveScale,
+        phase: -wavePhase * 2.7 + 0.8,
+        frequency: 1.26,
+        secondFrequency: 2.85,
+        blur: 6,
+        alpha: 0.38 + renderedLevel * 0.24,
+        stops: palette.mid,
+      });
+
+      drawOrbWaveLayer(context, width, height, {
+        baseline: height * (0.52 - renderedLevel * 0.13),
+        amplitude: (3 + renderedLevel * 13) * waveScale,
+        phase: wavePhase * 3.15 + 2.4,
+        frequency: 0.7,
+        secondFrequency: 1.8,
+        blur: 10,
+        alpha: 0.2 + renderedLevel * 0.18,
+        stops: palette.mist,
+      });
+
+      drawOrbCrestLine(context, width, height, {
+        baseline: height * (0.55 - renderedLevel * 0.15),
+        amplitude: (3 + renderedLevel * 15) * waveScale,
+        phase: wavePhase * 3.4 + 1.2,
+        alpha: 0.22 + renderedLevel * 0.36,
+        stops: palette.crest,
+      });
+
+      context.restore();
+      drawOrbPresetEdge(context, width, height, preset.shape, preset.id, renderedLevel, orbCustomization);
+      animationFrame = window.requestAnimationFrame(draw);
+    };
+
+    animationFrame = window.requestAnimationFrame(draw);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, []);
+
+  return <canvas ref={canvasRef} className="voice-orb-canvas" aria-hidden="true" />;
+}
+
+function voiceToneBaseEnergy(tone: VoiceTone): number {
+  if (tone === "connecting") return 0.33;
+  if (tone === "working") return 0.28;
+  if (tone === "listening") return 0.22;
+  if (tone === "waiting") return 0.2;
+  if (tone === "paused") return 0.04;
+  return 0.06;
+}
+
+function beginSphereShapePath(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): void {
+  context.beginPath();
+  context.arc(width / 2, height / 2, Math.min(width, height) / 2 - 1, 0, Math.PI * 2);
+}
+
+function getIconCloudPath(): Path2D {
+  iconCloudPath ??= new Path2D(iconCloudPathData);
+  return iconCloudPath;
+}
+
+function iconCloudFitRect(width: number, height: number): { x: number; y: number; width: number; height: number } {
+  const inset = Math.max(3, Math.min(width, height) * 0.04);
+  const availableWidth = Math.max(1, width - inset * 2);
+  const availableHeight = Math.max(1, height - inset * 2);
+  const sourceAspect = iconCloudSourceBounds.width / iconCloudSourceBounds.height;
+  let fittedWidth = availableWidth;
+  let fittedHeight = fittedWidth / sourceAspect;
+
+  if (fittedHeight > availableHeight) {
+    fittedHeight = availableHeight;
+    fittedWidth = fittedHeight * sourceAspect;
+  }
+
+  return {
+    x: (width - fittedWidth) / 2,
+    y: (height - fittedHeight) / 2,
+    width: fittedWidth,
+    height: fittedHeight,
+  };
+}
+
+function applyIconCloudPathTransform(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): number {
+  const rect = iconCloudFitRect(width, height);
+  const scaleX = rect.width / iconCloudSourceBounds.width;
+  const scaleY = rect.height / iconCloudSourceBounds.height;
+
+  context.translate(rect.x + rect.width / 2, rect.y + rect.height / 2);
+  context.rotate(iconCloudRotationRadians);
+  context.translate(-rect.width / 2, -rect.height / 2);
+  context.scale(scaleX, scaleY);
+  context.translate(-iconCloudSourceBounds.x, iconCloudSourceBounds.yTop);
+  context.scale(1, -1);
+
+  return (scaleX + scaleY) / 2;
+}
+
+function clipOrbShapePath(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  shape: VoiceOrbPreset["shape"],
+): void {
+  if (shape === "cloud") {
+    const transform = context.getTransform();
+    applyIconCloudPathTransform(context, width, height);
+    context.clip(getIconCloudPath());
+    context.setTransform(transform);
+    return;
+  }
+
+  beginSphereShapePath(context, width, height);
+  context.clip();
+}
+
+function strokeOrbShapePath(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  shape: VoiceOrbPreset["shape"],
+): void {
+  if (shape === "cloud") {
+    const lineWidth = context.lineWidth;
+    const scale = applyIconCloudPathTransform(context, width, height);
+    context.lineWidth = lineWidth / scale;
+    context.stroke(getIconCloudPath());
+    return;
+  }
+
+  beginSphereShapePath(context, width, height);
+  context.stroke();
+}
+
+function drawOrbPresetBase(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  presetId: VoiceOrbPresetId,
+  level: number,
+  phase: number,
+): void {
+  context.save();
+  if (presetId === "aurora") {
+    const base = context.createLinearGradient(0, height * 0.04, 0, height);
+    base.addColorStop(0, "rgba(255, 255, 250, 0.92)");
+    base.addColorStop(0.38, "rgba(225, 255, 255, 0.86)");
+    base.addColorStop(0.7, "rgba(68, 198, 255, 0.72)");
+    base.addColorStop(1, "rgba(0, 120, 255, 0.82)");
+    context.fillStyle = base;
+    context.fillRect(0, 0, width, height);
+    context.restore();
+    return;
+  }
+
+  if (presetId === "cloud") {
+    const base = context.createLinearGradient(0, height * 0.16, 0, height * 0.9);
+    base.addColorStop(0, "rgba(246, 252, 255, 0.96)");
+    base.addColorStop(0.28, "rgba(196, 239, 255, 0.92)");
+    base.addColorStop(0.62, "rgba(59, 154, 255, 0.92)");
+    base.addColorStop(1, "rgba(34, 50, 255, 0.96)");
+    context.fillStyle = base;
+    context.fillRect(0, 0, width, height);
+
+    context.globalCompositeOperation = "screen";
+    context.globalAlpha = 0.32 + level * 0.14;
+    context.fillStyle = "rgba(255, 255, 255, 0.75)";
+    context.beginPath();
+    context.ellipse(
+      width * (0.43 + Math.sin(phase) * 0.03),
+      height * 0.28,
+      width * 0.37,
+      height * 0.2,
+      -0.1,
+      0,
+      Math.PI * 2,
+    );
+    context.fill();
+    context.restore();
+    return;
+  }
+
+  const base = context.createRadialGradient(width * 0.47, height * 0.18, 0, width * 0.5, height * 0.52, width * 0.58);
+  base.addColorStop(0, "rgba(245, 252, 255, 0.72)");
+  base.addColorStop(0.36, "rgba(82, 128, 170, 0.48)");
+  base.addColorStop(0.7, "rgba(21, 30, 48, 0.9)");
+  base.addColorStop(1, "rgba(4, 7, 15, 0.98)");
+  context.fillStyle = base;
+  context.fillRect(0, 0, width, height);
+  context.restore();
+}
+
+function drawOrbPresetEdge(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  shape: VoiceOrbPreset["shape"],
+  presetId: VoiceOrbPresetId,
+  level: number,
+  customization: VoiceOrbCustomization,
+): void {
+  const accent = rgbaFromHex(customization.accentColor, presetId === "nocturne" ? 0.46 : 0.62);
+  const glowScale = 0.48 + customization.glow / 75;
+  context.save();
+  context.globalCompositeOperation = "screen";
+  context.shadowColor =
+    accent ??
+    (presetId === "cloud"
+      ? "rgba(101, 193, 255, 0.68)"
+      : presetId === "aurora"
+        ? "rgba(161, 232, 255, 0.42)"
+        : "rgba(154, 227, 255, 0.44)");
+  context.shadowBlur = (7 + level * 16) * glowScale;
+  context.strokeStyle =
+    rgbaFromHex(customization.accentColor, 0.42) ??
+    (presetId === "cloud"
+      ? "rgba(205, 241, 255, 0.72)"
+      : presetId === "aurora"
+        ? "rgba(238, 255, 255, 0.52)"
+        : "rgba(213, 245, 255, 0.46)");
+  context.lineWidth = presetId === "cloud" ? 2.2 : 1.4;
+  strokeOrbShapePath(context, width, height, shape);
+  context.restore();
+}
+
+function drawOrbTint(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  color: string,
+  level: number,
+): void {
+  const rgb = rgbFromHex(color);
+  if (!rgb) return;
+
+  context.save();
+  context.globalCompositeOperation = "soft-light";
+  context.globalAlpha = 0.32;
+  context.fillStyle = `rgb(${rgb.r} ${rgb.g} ${rgb.b})`;
+  context.fillRect(0, 0, width, height);
+
+  const band = context.createLinearGradient(0, height * 0.18, 0, height);
+  band.addColorStop(0, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0)`);
+  band.addColorStop(0.48, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.1)`);
+  band.addColorStop(0.82, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.24 + level * 0.14})`);
+  band.addColorStop(1, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.3 + level * 0.16})`);
+  context.globalCompositeOperation = "source-over";
+  context.globalAlpha = 1;
+  context.fillStyle = band;
+  context.fillRect(0, 0, width, height);
+
+  const glow = context.createRadialGradient(width * 0.55, height * 0.68, 0, width * 0.5, height * 0.58, width * 0.72);
+  glow.addColorStop(0, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.32 + level * 0.18})`);
+  glow.addColorStop(0.5, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.18 + level * 0.1})`);
+  glow.addColorStop(1, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0)`);
+  context.globalCompositeOperation = "screen";
+  context.globalAlpha = 1;
+  context.fillStyle = glow;
+  context.fillRect(0, 0, width, height);
+  context.restore();
+}
+
+function rgbFromHex(color: string): { r: number; g: number; b: number } | null {
+  if (!isHexColor(color)) return null;
+  return {
+    r: Number.parseInt(color.slice(1, 3), 16),
+    g: Number.parseInt(color.slice(3, 5), 16),
+    b: Number.parseInt(color.slice(5, 7), 16),
+  };
+}
+
+function rgbaFromHex(color: string, alpha: number): string | null {
+  const rgb = rgbFromHex(color);
+  return rgb ? `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})` : null;
+}
+
+function scaledGlowAlpha(alpha: number, glow: number): number {
+  const normalizedGlow = clampControlValue(glow, defaultVoiceOrbCustomization.glow);
+  const scale = normalizedGlow / defaultVoiceOrbCustomization.glow;
+  return Math.min(1, Math.max(0, Number((alpha * scale).toFixed(3))));
+}
+
+function glowColor(accent: string, alpha: number, glow: number, fallback: string): string {
+  return rgbaFromHex(accent, scaledGlowAlpha(alpha, glow)) ?? fallback;
+}
+
+function voiceAccentStyle(customization: VoiceOrbCustomization): React.CSSProperties {
+  const accent = isHexColor(customization.accentColor)
+    ? customization.accentColor
+    : defaultVoiceOrbCustomization.accentColor;
+  const glow = clampControlValue(customization.glow, defaultVoiceOrbCustomization.glow);
+  return {
+    "--voice-accent": accent,
+    "--voice-accent-soft": rgbaFromHex(accent, 0.22) ?? "rgba(29, 155, 240, 0.22)",
+    "--voice-accent-mid": rgbaFromHex(accent, 0.34) ?? "rgba(29, 155, 240, 0.34)",
+    "--voice-accent-strong": rgbaFromHex(accent, 0.58) ?? "rgba(29, 155, 240, 0.58)",
+    "--voice-glow-faint": glowColor(accent, 0.08, glow, "rgba(29, 155, 240, 0.08)"),
+    "--voice-glow-soft": glowColor(accent, 0.13, glow, "rgba(29, 155, 240, 0.13)"),
+    "--voice-glow-medium": glowColor(accent, 0.2, glow, "rgba(29, 155, 240, 0.2)"),
+    "--voice-glow-strong": glowColor(accent, 0.3, glow, "rgba(29, 155, 240, 0.3)"),
+    "--voice-glow-hot": glowColor(accent, 0.42, glow, "rgba(29, 155, 240, 0.42)"),
+    "--voice-glow-rim": glowColor(accent, 0.48, glow, "rgba(29, 155, 240, 0.48)"),
+  } as React.CSSProperties;
+}
+
+function mixRgb(
+  rgb: { r: number; g: number; b: number },
+  target: { r: number; g: number; b: number },
+  amount: number,
+): { r: number; g: number; b: number } {
+  return {
+    r: Math.round(rgb.r + (target.r - rgb.r) * amount),
+    g: Math.round(rgb.g + (target.g - rgb.g) * amount),
+    b: Math.round(rgb.b + (target.b - rgb.b) * amount),
+  };
+}
+
+function rgbaFromRgb(rgb: { r: number; g: number; b: number }, alpha: number): string {
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
+}
+
+function orbWavePalette(presetId: VoiceOrbPresetId, accentColor?: string): {
+  deep: Array<[number, string]>;
+  mid: Array<[number, string]>;
+  mist: Array<[number, string]>;
+  crest: Array<[number, string]>;
+} {
+  const accent = accentColor ? rgbFromHex(accentColor) : null;
+  if (accent) {
+    const light = mixRgb(accent, { r: 255, g: 255, b: 255 }, presetId === "nocturne" ? 0.34 : 0.5);
+    const mist = mixRgb(accent, { r: 236, g: 255, b: 255 }, 0.68);
+    const deep = mixRgb(accent, { r: 0, g: 24, b: 88 }, presetId === "nocturne" ? 0.58 : 0.34);
+    const lowAlpha = presetId === "nocturne" ? 0.1 : 0.16;
+    const midAlpha = presetId === "nocturne" ? 0.36 : 0.54;
+    const highAlpha = presetId === "nocturne" ? 0.62 : 0.78;
+
+    return {
+      deep: [
+        [0, rgbaFromRgb(mist, lowAlpha)],
+        [0.34, rgbaFromRgb(accent, midAlpha)],
+        [0.7, rgbaFromRgb(accent, highAlpha)],
+        [1, rgbaFromRgb(deep, presetId === "nocturne" ? 0.9 : 0.96)],
+      ],
+      mid: [
+        [0, "rgba(255, 255, 255, 0.2)"],
+        [0.35, rgbaFromRgb(light, presetId === "nocturne" ? 0.3 : 0.48)],
+        [0.72, rgbaFromRgb(accent, presetId === "nocturne" ? 0.42 : 0.58)],
+        [1, rgbaFromRgb(deep, presetId === "nocturne" ? 0.5 : 0.66)],
+      ],
+      mist: [
+        [0, "rgba(255, 255, 255, 0.42)"],
+        [0.48, rgbaFromRgb(mist, presetId === "nocturne" ? 0.18 : 0.28)],
+        [1, rgbaFromRgb(accent, presetId === "nocturne" ? 0.12 : 0.2)],
+      ],
+      crest: [
+        [0, "rgba(255, 255, 244, 0)"],
+        [0.25, rgbaFromRgb(light, presetId === "nocturne" ? 0.55 : 0.78)],
+        [0.58, rgbaFromRgb(mist, presetId === "nocturne" ? 0.46 : 0.68)],
+        [1, "rgba(255, 255, 244, 0)"],
+      ],
+    };
+  }
+
+  if (presetId === "cloud") {
+    return {
+      deep: [
+        [0, "rgba(180, 247, 255, 0.08)"],
+        [0.35, "rgba(79, 208, 255, 0.36)"],
+        [0.72, "rgba(34, 103, 255, 0.74)"],
+        [1, "rgba(24, 39, 255, 0.92)"],
+      ],
+      mid: [
+        [0, "rgba(252, 255, 255, 0.22)"],
+        [0.4, "rgba(176, 227, 255, 0.46)"],
+        [0.78, "rgba(86, 128, 255, 0.52)"],
+        [1, "rgba(56, 90, 255, 0.64)"],
+      ],
+      mist: [
+        [0, "rgba(255, 255, 255, 0.46)"],
+        [0.5, "rgba(232, 249, 255, 0.28)"],
+        [1, "rgba(163, 221, 255, 0.16)"],
+      ],
+      crest: [
+        [0, "rgba(255, 255, 244, 0)"],
+        [0.25, "rgba(255, 255, 255, 0.82)"],
+        [0.58, "rgba(201, 236, 255, 0.72)"],
+        [1, "rgba(255, 255, 244, 0)"],
+      ],
+    };
+  }
+
+  if (presetId === "nocturne") {
+    return {
+      deep: [
+        [0, "rgba(164, 231, 255, 0.04)"],
+        [0.3, "rgba(65, 165, 212, 0.2)"],
+        [0.66, "rgba(31, 78, 139, 0.52)"],
+        [1, "rgba(12, 31, 74, 0.82)"],
+      ],
+      mid: [
+        [0, "rgba(243, 255, 255, 0.12)"],
+        [0.36, "rgba(148, 227, 255, 0.24)"],
+        [0.72, "rgba(36, 142, 206, 0.32)"],
+        [1, "rgba(19, 88, 164, 0.42)"],
+      ],
+      mist: [
+        [0, "rgba(232, 255, 255, 0.24)"],
+        [0.5, "rgba(162, 231, 255, 0.14)"],
+        [1, "rgba(84, 164, 220, 0.08)"],
+      ],
+      crest: [
+        [0, "rgba(203, 246, 255, 0)"],
+        [0.28, "rgba(203, 246, 255, 0.46)"],
+        [0.6, "rgba(143, 221, 255, 0.4)"],
+        [1, "rgba(203, 246, 255, 0)"],
+      ],
+    };
+  }
+
+  return {
+    deep: [
+      [0, "rgba(180, 247, 255, 0.08)"],
+      [0.28, "rgba(85, 219, 255, 0.28)"],
+      [0.58, "rgba(0, 151, 255, 0.68)"],
+      [1, "rgba(0, 84, 255, 0.88)"],
+    ],
+    mid: [
+      [0, "rgba(247, 255, 247, 0.2)"],
+      [0.34, "rgba(190, 251, 255, 0.42)"],
+      [0.72, "rgba(34, 190, 255, 0.52)"],
+      [1, "rgba(0, 117, 255, 0.62)"],
+    ],
+    mist: [
+      [0, "rgba(255, 255, 238, 0.36)"],
+      [0.46, "rgba(236, 255, 249, 0.26)"],
+      [1, "rgba(127, 232, 255, 0.18)"],
+    ],
+    crest: [
+      [0, "rgba(255, 255, 244, 0)"],
+      [0.24, "rgba(255, 255, 244, 0.7)"],
+      [0.58, "rgba(210, 255, 255, 0.62)"],
+      [1, "rgba(255, 255, 244, 0)"],
+    ],
+  };
+}
+
+function resizeOrbCanvas(
+  canvas: HTMLCanvasElement,
+  context: CanvasRenderingContext2D,
+): { width: number; height: number } {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const pixelWidth = Math.max(1, Math.round(rect.width * dpr));
+  const pixelHeight = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { width: rect.width, height: rect.height };
+}
+
+function drawOrbClouds(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  level: number,
+  phase: number,
+  hovering: boolean,
+  presetId: VoiceOrbPresetId,
+): void {
+  const lift = level * height * 0.08;
+  const hoverLift = hovering ? height * 0.015 : 0;
+  const cloudAlpha = presetId === "nocturne" ? 0.2 : 0.42;
+  const cloudWhite = presetId === "nocturne" ? "rgba(210, 246, 255, 0.4)" : "rgba(255, 255, 246, 0.7)";
+
+  context.save();
+  context.globalCompositeOperation = "screen";
+  context.filter = `blur(${8 + level * 5}px)`;
+  context.globalAlpha = cloudAlpha + level * 0.26;
+
+  const topGradient = context.createRadialGradient(
+    width * (0.46 + Math.sin(phase * 0.9) * 0.05),
+    height * (0.2 + Math.cos(phase * 0.7) * 0.025),
+    0,
+    width * 0.5,
+    height * 0.22,
+    width * 0.58,
+  );
+  topGradient.addColorStop(0, cloudWhite);
+  topGradient.addColorStop(0.48, "rgba(220, 255, 252, 0.28)");
+  topGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+  context.fillStyle = topGradient;
+  context.beginPath();
+  context.ellipse(width * 0.5, height * 0.22, width * 0.5, height * 0.24, -0.05, 0, Math.PI * 2);
+  context.fill();
+
+  const cloudGradient = context.createRadialGradient(
+    width * (0.25 + Math.sin(phase * 1.5) * 0.055),
+    height * 0.5 - lift - hoverLift,
+    0,
+    width * 0.36,
+    height * 0.53 - lift,
+    width * 0.58,
+  );
+  cloudGradient.addColorStop(0, "rgba(255, 254, 230, 0.46)");
+  cloudGradient.addColorStop(0.35, "rgba(205, 252, 255, 0.3)");
+  cloudGradient.addColorStop(0.72, "rgba(88, 218, 255, 0.12)");
+  cloudGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+  context.fillStyle = cloudGradient;
+  context.beginPath();
+  context.ellipse(width * 0.38, height * 0.53 - lift, width * 0.48, height * 0.2, -0.2, 0, Math.PI * 2);
+  context.fill();
+
+  context.restore();
+}
+
+function drawOrbWaveLayer(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  options: {
+    baseline: number;
+    amplitude: number;
+    phase: number;
+    frequency: number;
+    secondFrequency: number;
+    blur: number;
+    alpha: number;
+    stops: Array<[number, string]>;
+  },
+): void {
+  context.save();
+  context.filter = `blur(${options.blur}px)`;
+  context.globalAlpha = options.alpha;
+  context.globalCompositeOperation = "source-over";
+  context.beginPath();
+  context.moveTo(-20, height + 20);
+
+  for (let x = -20; x <= width + 20; x += 3) {
+    const unit = x / width;
+    const y =
+      options.baseline +
+      Math.sin(unit * Math.PI * 2 * options.frequency + options.phase) * options.amplitude +
+      Math.sin(unit * Math.PI * 2 * options.secondFrequency - options.phase * 0.72) * options.amplitude * 0.38 +
+      Math.sin(unit * Math.PI * 2 * 0.5 + options.phase * 1.6) * options.amplitude * 0.16;
+    context.lineTo(x, y);
+  }
+
+  context.lineTo(width + 20, height + 20);
+  context.closePath();
+
+  const gradient = context.createLinearGradient(0, options.baseline - options.amplitude * 2, 0, height);
+  for (const [offset, color] of options.stops) {
+    gradient.addColorStop(offset, color);
+  }
+  context.fillStyle = gradient;
+  context.fill();
+  context.restore();
+}
+
+function drawOrbCrestLine(
+  context: CanvasRenderingContext2D,
+  width: number,
+  _height: number,
+  options: {
+    baseline: number;
+    amplitude: number;
+    phase: number;
+    alpha: number;
+    stops: Array<[number, string]>;
+  },
+): void {
+  context.save();
+  context.filter = "blur(3px)";
+  context.globalCompositeOperation = "screen";
+  context.globalAlpha = options.alpha;
+  context.beginPath();
+
+  for (let x = -8; x <= width + 8; x += 2) {
+    const unit = x / width;
+    const y =
+      options.baseline +
+      Math.sin(unit * Math.PI * 2 * 0.95 + options.phase) * options.amplitude +
+      Math.sin(unit * Math.PI * 2 * 2.4 - options.phase * 0.6) * options.amplitude * 0.28;
+    if (x === -8) {
+      context.moveTo(x, y);
+    } else {
+      context.lineTo(x, y);
+    }
+  }
+
+  const gradient = context.createLinearGradient(0, 0, width, 0);
+  for (const [offset, color] of options.stops) {
+    gradient.addColorStop(offset, color);
+  }
+  context.strokeStyle = gradient;
+  context.lineWidth = 3.2;
+  context.lineCap = "round";
+  context.stroke();
+  context.restore();
+}
+
+function ApiKeyDialog({
+  mode,
+  realtime,
+  realtimeIssue,
+  apiKey,
+  onApiKeyChange,
+  onSubmit,
+  onClose,
+}: {
+  mode: ApiKeyDialogMode;
+  realtime: AppState["realtime"];
+  realtimeIssue: string | null;
+  apiKey: string;
+  onApiKeyChange: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+  onClose: () => void;
+}): React.ReactElement {
+  const [revealed, setRevealed] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [waveDancing, setWaveDancing] = useState(false);
+  const waveDanceTimeoutRef = useRef<number | null>(null);
+  const title = mode === "onboarding" ? "Connect OpenAI" : "OpenAI API key";
+  const primaryLabel =
+    realtime.apiKeySource === "saved" ? "Replace" : mode === "onboarding" ? "Save key" : "Save";
+  const secondaryLabel = mode === "onboarding" ? "Later" : "Cancel";
+  const hasApiKey = Boolean(apiKey.trim());
+  const apiKeyManagedByEnvironment = realtime.apiKeySource === "environment";
+  const health = realtimeHealth(realtime, realtimeIssue);
+
+  useEffect(
+    () => () => {
+      if (waveDanceTimeoutRef.current !== null) {
+        window.clearTimeout(waveDanceTimeoutRef.current);
+      }
+    },
+    [],
+  );
+
+  function startWaveDance(): void {
+    if (waveDancing) return;
+    setWaveDancing(true);
+    if (waveDanceTimeoutRef.current !== null) {
+      window.clearTimeout(waveDanceTimeoutRef.current);
+    }
+    waveDanceTimeoutRef.current = window.setTimeout(() => {
+      setWaveDancing(false);
+      waveDanceTimeoutRef.current = null;
+    }, 1280);
+  }
+
+  return (
+    <div className="voice-modal-backdrop api-key-backdrop" role="presentation">
+      <form className="voice-dialog api-key-dialog" onSubmit={(event) => void onSubmit(event)}>
+        <div className="api-key-visual" aria-hidden="true">
+          <span
+            className={`api-key-meter ${waveDancing ? "dancing" : ""}`}
+            onPointerEnter={startWaveDance}
+            onFocus={startWaveDance}
+          >
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </span>
+        </div>
+
+        <div className="voice-dialog-header api-key-header">
+          <div>
+            <div className="api-key-title-row">
+              <h2>{title}</h2>
+              <span
+                className={`api-key-status ${health.ok ? "ready" : "broken"}`}
+                tabIndex={health.ok ? undefined : 0}
+                aria-label={health.ok ? "Realtime API key is ready" : health.message}
+                title={health.ok ? "Realtime API key is ready" : undefined}
+              >
+                {!health.ok && <span className="api-key-health-popover">{health.message}</span>}
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="api-key-info-button"
+            aria-label="API key storage details"
+            title="Storage details"
+            onClick={() => setInfoOpen((current) => !current)}
+          >
+            <InfoIcon />
+          </button>
+          {infoOpen && (
+            <div className="api-key-info-popover" role="status">
+              Main stores keys outside app state and only reveals them after you choose View.
+            </div>
+          )}
+        </div>
+
+        <div className="voice-field api-key-field">
+          <div className="api-key-input-wrap">
+            <input
+              id="openai-api-key-input"
+              aria-label="OpenAI API key"
+              autoFocus
+              type={revealed ? "text" : "password"}
+              value={apiKey}
+              onChange={(event) => onApiKeyChange(event.target.value)}
+              placeholder={apiKeyInputPlaceholder(realtime)}
+              disabled={apiKeyManagedByEnvironment}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <div className="api-key-input-actions">
+              <button
+                type="button"
+                aria-label={revealed ? "Hide API key" : "Reveal API key"}
+                title={revealed ? "Hide key" : "Reveal key"}
+                disabled={!hasApiKey}
+                onClick={() => setRevealed((current) => !current)}
+              >
+                {revealed ? <EyeOffIcon /> : <EyeIcon />}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="voice-dialog-actions api-key-actions">
+          <button type="button" onClick={onClose}>
+            {secondaryLabel}
+          </button>
+          <button type="submit" className="voice-primary" disabled={!hasApiKey || apiKeyManagedByEnvironment}>
+            {primaryLabel}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 
 type ChatSummary = {
   id: string;
+  projectId: string;
+  projectTitle: string;
+  workspacePath: string | null;
+  threadId: string | null;
   title: string;
-  detail: string;
   tone: "active" | "waiting" | "idle";
-  active: boolean;
+  working: boolean;
 };
 
-function ProjectChatsPanel({
-  chats,
-  onNewChat,
-  onSwitchChat,
-  onSelectChat,
-  onOpenChatMenu,
-}: {
-  chats: ChatSummary[];
-  onNewChat: () => void;
-  onSwitchChat: () => void;
-  onSelectChat: (chatId: string) => Promise<void>;
-  onOpenChatMenu: (event: React.MouseEvent<HTMLElement>, chat: ChatSummary) => void;
-}): React.ReactElement {
-  const activeChat = chats.find((chat) => chat.active) ?? null;
-  return (
-    <div className="project-chats-panel">
-      <div className="project-chats-header">
-        <div>
-          <h2>Chats in this project</h2>
-          {activeChat && (
-            <p>
-              Active chat: <strong>{activeChat.title}</strong>
-            </p>
-          )}
-        </div>
-        <span>{chats.length}</span>
-      </div>
-      <div className="project-chat-list">
-        {chats.map((chat) => (
-          <button
-            key={chat.id}
-            className={`project-chat-row ${chat.active ? "active" : ""}`}
-            onClick={() => void onSelectChat(chat.id)}
-            onContextMenu={(event) => onOpenChatMenu(event, chat)}
-          >
-            <span className={`chat-status-dot ${chat.tone}`} />
-            <span className="project-chat-copy">
-              <strong>{chat.title}</strong>
-              <small>{chat.detail}</small>
-            </span>
-            {chat.active && (
-              <span className="project-chat-trailing">
-                <span className="active-chat-pill">Active</span>
-              </span>
-            )}
-          </button>
-        ))}
-      </div>
-      <div className="voice-actions chat-actions">
-        <button className="voice-action-button" type="button" onClick={onNewChat}>
-          <PlusIcon />
-          <span>New chat</span>
-        </button>
-        <button className="voice-action-button" type="button" onClick={onSwitchChat}>
-          <SwitchIcon />
-          <span>Switch chat</span>
-        </button>
-      </div>
-    </div>
-  );
-}
+type ProjectTreeRenameTarget =
+  | {
+      kind: "project";
+      projectId: string;
+      original: string;
+      value: string;
+    }
+  | {
+      kind: "chat";
+      projectId: string;
+      chatId: string;
+      original: string;
+      value: string;
+    };
 
-function ArchiveContextMenu({
+type ProjectTreeMenuTarget =
+  | {
+      kind: "project";
+      projectId: string;
+      label: string;
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "chat";
+      projectId: string;
+      chatId: string;
+      label: string;
+      x: number;
+      y: number;
+    };
+
+function ProjectTreeActionMenu({
   target,
-  onArchive,
+  onRename,
+  onRemove,
 }: {
-  target: ContextMenuTarget;
-  onArchive: () => void;
+  target: ProjectTreeMenuTarget;
+  onRename: () => void;
+  onRemove: () => Promise<void>;
 }): React.ReactElement {
-  const left = Math.max(8, Math.min(target.x, window.innerWidth - 188));
-  const top = Math.max(8, Math.min(target.y, window.innerHeight - 54));
+  const width = 234;
+  const height = 104;
+  const left = Math.max(8, Math.min(target.x, window.innerWidth - width - 8));
+  const top = Math.max(8, Math.min(target.y, window.innerHeight - height - 8));
+
   return (
     <div
-      className="voice-context-menu"
+      className="voice-tree-action-menu"
       role="menu"
-      style={{ left, top }}
+      style={{ left, top, width }}
       onClick={(event) => event.stopPropagation()}
     >
-      <button role="menuitem" onClick={onArchive}>
-        {target.kind === "project" ? "Archive project" : "Archive chat"}
+      <button type="button" role="menuitem" onClick={onRename}>
+        <EditIcon />
+        <span>{target.kind === "project" ? "Rename project" : "Rename thread"}</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        className="danger"
+        onClick={() => {
+          void onRemove();
+        }}
+      >
+        <RemoveIcon />
+        <span>Remove</span>
       </button>
     </div>
   );
 }
 
-function ArchivedDialog({
-  projects,
-  chats,
-  onClose,
-  onRestoreProject,
-  onRestoreChat,
+function ProjectTreeRenameForm({
+  ariaLabel,
+  value,
+  onChange,
+  onCancel,
+  onSubmit,
 }: {
-  projects: VoiceProject[];
-  chats: ArchivedChat[];
-  onClose: () => void;
-  onRestoreProject: (projectId: string) => Promise<void>;
-  onRestoreChat: (projectId: string, chatId: string) => Promise<void>;
+  ariaLabel: string;
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onSubmit: () => Promise<void>;
 }): React.ReactElement {
-  const empty = projects.length === 0 && chats.length === 0;
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
   return (
-    <div className="voice-modal-backdrop" role="presentation">
-      <section className="voice-dialog archived-dialog" aria-label="Archived">
-        <div className="voice-dialog-header">
-          <h2>Archived</h2>
-          <button type="button" aria-label="Close" onClick={onClose}>
-            <CloseIcon />
+    <form
+      className="voice-tree-rename-form"
+      onClick={(event) => event.stopPropagation()}
+      onSubmit={(event) => {
+        event.preventDefault();
+        void onSubmit();
+      }}
+    >
+      <input
+        ref={inputRef}
+        aria-label={ariaLabel}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") onCancel();
+        }}
+      />
+      <button type="submit" aria-label="Save name" title="Save">
+        <CheckIcon />
+      </button>
+      <button type="button" aria-label="Cancel rename" title="Cancel" onClick={onCancel}>
+        <CloseIcon />
+      </button>
+    </form>
+  );
+}
+
+function ProjectChatsPanel({
+  chats,
+  onOpenThread,
+}: {
+  chats: ChatSummary[];
+  onOpenThread: (chat: ChatSummary) => void;
+}): React.ReactElement {
+  return (
+    <div className="project-chats-panel active-thread-stack">
+      <div className="project-chat-list">
+        {chats.map((chat) => (
+          <button
+            type="button"
+            key={chat.id}
+            className={`project-chat-row ${chat.working ? "working" : ""}`}
+            onClick={() => onOpenThread(chat)}
+          >
+            <span className={`chat-status-dot ${chat.tone}`} />
+            <span className="project-chat-copy">
+              <strong>{chat.title}</strong>
+            </span>
+            {chat.working && (
+              <span className="project-chat-trailing">
+                <span className="codex-thread-spinner" aria-label="Codex is working" />
+              </span>
+            )}
           </button>
-        </div>
-
-        {empty ? (
-          <p className="browse-empty">Archived chats and projects will appear here.</p>
-        ) : (
-          <div className="archived-sections">
-            {projects.length > 0 && (
-              <section className="archived-section">
-                <h3>Projects</h3>
-                <div className="archived-list">
-                  {projects.map((project) => (
-                    <article key={project.id} className="archived-row">
-                      <FolderIcon />
-                      <span>
-                        <strong>{project.displayName}</strong>
-                        <small>{project.archivedAt ? formatProjectTime(project.archivedAt) : "Archived"}</small>
-                      </span>
-                      <button type="button" onClick={() => void onRestoreProject(project.id)}>
-                        Restore
-                      </button>
-                    </article>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {chats.length > 0 && (
-              <section className="archived-section">
-                <h3>Chats</h3>
-                <div className="archived-list">
-                  {chats.map(({ projectId, projectName, chat }) => (
-                    <article key={chat.id} className="archived-row">
-                      <span className="chat-status-dot idle" />
-                      <span>
-                        <strong>{chat.displayName}</strong>
-                        <small>
-                          {projectName}
-                          <span className="voice-meta-dot">.</span>
-                          {chat.archivedAt ? formatProjectTime(chat.archivedAt) : "Archived"}
-                        </small>
-                      </span>
-                      <button type="button" onClick={() => void onRestoreChat(projectId, chat.id)}>
-                        Restore
-                      </button>
-                    </article>
-                  ))}
-                </div>
-              </section>
-            )}
-          </div>
-        )}
-      </section>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1267,7 +4588,7 @@ function DebugDashboard({
   const projects = state.projects;
   const activeProject = state.activeProject;
   const activeProjectId = state.runtime.activeProjectId;
-  const activeFolder = activeProject?.folderPath ?? "No active project.";
+  const activeFolder = activeProject?.workspacePath ?? "No active project.";
   const activeChatName =
     (activeProject?.chats ?? []).find((chat) => chat.id === state.runtime.activeChatId && !chat.archivedAt)
       ?.displayName ?? "none";
@@ -1304,7 +4625,7 @@ function DebugDashboard({
           <code>{state.baseFolder || "Loading..."}</code>
         </div>
         <div>
-          <span className="label">Active folder</span>
+          <span className="label">Workspace</span>
           <code>{activeFolder}</code>
         </div>
       </section>
@@ -1340,7 +4661,7 @@ function DebugDashboard({
                 className={`project-card ${project.id === activeProjectId ? "active" : ""}`}
                 onClick={() => void onAction(() => window.codexVoice.resumeProject(project.id))}
               >
-                <strong>{project.displayName}</strong>
+                <strong>{projectDisplayName(project)}</strong>
                 <span>{new Date(project.updatedAt).toLocaleString()}</span>
                 <small>{project.lastStatus ?? "No status yet."}</small>
               </button>
@@ -1355,7 +4676,7 @@ function DebugDashboard({
           </div>
           <p className="help">
             {state.realtime.available
-              ? `Realtime voice is controlled from the main Codex Voice window. Model: ${state.realtime.model}, voice: ${state.realtime.voice}, reasoning: ${state.realtime.reasoningEffort}.`
+              ? `Realtime voice is controlled from the main Codex Voice window. Model: ${state.realtime.model}, voice: ${state.realtime.voice}, reasoning: ${state.realtime.reasoningEffort ?? "none"}.`
               : state.realtime.reason}
           </p>
 
@@ -1394,6 +4715,21 @@ function DebugDashboard({
               }
             >
               Send
+            </button>
+            <button
+              onClick={() =>
+                void onAction(async () => {
+                  await window.codexVoice.openVoiceWindow();
+                  await onLogEvent({
+                    at: new Date().toISOString(),
+                    source: "app",
+                    kind: "debug/startOnboarding",
+                    message: "Show onboarding requested from Debug UI.",
+                  });
+                })
+              }
+            >
+              Show onboarding
             </button>
             <button
               onClick={() =>
@@ -1481,7 +4817,8 @@ function voiceStateLabel(
   voiceConnected: boolean,
   voiceConnecting: boolean,
   voicePaused: boolean,
-): { label: string; tone: "off" | "listening" | "working" | "connecting" | "paused" | "waiting" } {
+): { label: string; tone: VoiceTone } {
+  if (!state.realtime.available) return { label: "API key needed", tone: "off" };
   if (voiceConnecting) return { label: "Connecting", tone: "connecting" };
   if (state.runtime.pendingRequests.length > 0) return { label: "Needs input", tone: "waiting" };
   if (voiceConnected && voicePaused && state.runtime.activeTurnId) {
@@ -1499,6 +4836,7 @@ function voiceOrbAriaLabel(
   voiceConnecting: boolean,
   voicePaused: boolean,
 ): string {
+  if (!state.realtime.available) return "Set up OpenAI API key";
   if (voiceConnecting) return "Voice connecting";
   if (state.runtime.pendingRequests.length > 0) return "Respond to pending Codex request";
   if (voiceConnected && voicePaused && state.runtime.activeTurnId) {
@@ -1512,30 +4850,179 @@ function voiceOrbAriaLabel(
 
 function chatSummariesForProject(project: VoiceProject | null, state: AppState): ChatSummary[] {
   if (!project) return [];
+  const projectTitle = projectDisplayName(project);
   return (project.chats ?? []).filter((chat) => !chat.archivedAt).map((chat) => {
     const runtime = (state.runtime.chats ?? []).find((candidate) => candidate.chatId === chat.id);
     const waiting = Boolean(runtime?.pendingRequests.length);
     const working = Boolean(runtime?.activeTurnId);
     return {
       id: chat.id,
+      projectId: project.id,
+      projectTitle,
+      workspacePath: project.workspacePath ?? project.folderPath ?? null,
+      threadId: chat.codexThreadId,
       title: chat.displayName,
-      detail: runtime?.status ?? chat.lastStatus ?? "Idle",
       tone: waiting ? "waiting" : working ? "active" : "idle",
-      active: chat.id === state.runtime.activeChatId,
+      working,
     };
   });
 }
 
-function archivedChatsForProjects(projects: VoiceProject[]): ArchivedChat[] {
-  return projects.flatMap((project) =>
-    (project.chats ?? [])
-      .filter((chat) => chat.archivedAt)
-      .map((chat) => ({
-        projectId: project.id,
-        projectName: project.displayName,
-        chat,
-      })),
-  );
+function projectDisplayName(project: VoiceProject): string {
+  if (project.displayNameSource === "custom") return project.displayName || "Project";
+  const workspacePath = project.workspacePath?.trim();
+  if (workspacePath && !samePathText(workspacePath, project.folderPath)) {
+    return basenameFromPathText(workspacePath) || project.displayName || "Project";
+  }
+  return project.displayName || basenameFromPathText(project.folderPath) || "Project";
+}
+
+function basenameFromPathText(value: string | null | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return "";
+  const withoutTrailingSlash = trimmed.replace(/[\\/]+$/, "");
+  const parts = withoutTrailingSlash.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? withoutTrailingSlash;
+}
+
+function samePathText(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalize = (value: string | null | undefined) => value?.trim().replace(/[\\/]+$/, "") ?? "";
+  return normalize(left) === normalize(right);
+}
+
+function realtimeHealth(
+  realtime: AppState["realtime"],
+  realtimeIssue: string | null,
+): { ok: boolean; message: string } {
+  if (!realtime.available) {
+    return {
+      ok: false,
+      message: "No OpenAI API key is configured. Add a key here, then save it to enable voice.",
+    };
+  }
+  if (realtimeIssue) {
+    return {
+      ok: false,
+      message: friendlyRealtimeIssue(realtimeIssue),
+    };
+  }
+  return { ok: true, message: "Realtime API key is ready." };
+}
+
+function apiKeyInputPlaceholder(realtime: AppState["realtime"]): string {
+  if (realtime.apiKeySource === "environment") return "OPENAI_API_KEY is set";
+  if (realtime.apiKeySource === "saved") return "Paste a replacement key";
+  return "sk-...";
+}
+
+function apiKeyStorageTitle(realtime: AppState["realtime"]): string | null {
+  if (realtime.apiKeySource === "environment") return null;
+  if (realtime.apiKeySource === "saved") {
+    return realtime.apiKeyEncrypted ? "Saved key encrypted" : "Saved key active";
+  }
+  return "No key configured";
+}
+
+function apiKeyStorageDetail(realtime: AppState["realtime"]): string | null {
+  if (realtime.apiKeySource === "environment") {
+    return null;
+  }
+  if (realtime.apiKeySource === "saved") {
+    return realtime.apiKeyEncrypted
+      ? "Stored with Electron safeStorage. Use View or Copy when you need it."
+      : "Legacy local save without OS encryption. Replace it to re-encrypt when safeStorage is available.";
+  }
+  return "Paste a key once. Main stores it outside app state and only reveals it on request.";
+}
+
+function exaApiKeyInputPlaceholder(webSearch: AppState["webSearch"]): string {
+  if (webSearch.apiKeySource === "environment") return "EXA_API_KEY is set";
+  if (webSearch.apiKeySource === "saved") return "Paste a replacement Exa key";
+  return "Exa API key";
+}
+
+function webSearchStorageTitle(webSearch: AppState["webSearch"]): string | null {
+  if (webSearch.apiKeySource === "environment") return null;
+  if (webSearch.apiKeySource === "saved") {
+    return webSearch.apiKeyEncrypted ? "Saved Exa key encrypted" : "Saved Exa key active";
+  }
+  return null;
+}
+
+function webSearchStorageDetail(webSearch: AppState["webSearch"]): string | null {
+  if (webSearch.apiKeySource === "environment") {
+    return null;
+  }
+  if (webSearch.apiKeySource === "saved") {
+    return webSearch.apiKeyEncrypted
+      ? "Stored with Electron safeStorage. Use View or Copy when you need it."
+      : "Legacy local save without OS encryption. Replace it to re-encrypt when safeStorage is available.";
+  }
+  return null;
+}
+
+function friendlyRealtimeIssue(issue: string): string {
+  const message = openAiErrorMessage(issue);
+  const haystack = `${issue} ${message ?? ""}`.toLowerCase();
+
+  if (
+    haystack.includes("insufficient_quota") ||
+    haystack.includes("quota") ||
+    haystack.includes("billing") ||
+    haystack.includes("credits")
+  ) {
+    return "OpenAI rejected the Realtime session because the account is out of quota or billing is not active. Check credits or billing, then try again.";
+  }
+  if (haystack.includes("invalid_api_key") || haystack.includes("incorrect api key") || haystack.includes("401")) {
+    return "OpenAI rejected this API key. Check that it is copied correctly and still active.";
+  }
+  if (haystack.includes("permission") || haystack.includes("forbidden") || haystack.includes("403")) {
+    return "This key does not appear to have access to Realtime sessions. Check the project permissions or use another key.";
+  }
+  if (haystack.includes("network") || haystack.includes("failed to fetch") || haystack.includes("fetch failed")) {
+    return "Codex Voice could not reach OpenAI. Check the network connection, then try again.";
+  }
+  if (message) {
+    return `OpenAI reported: ${message}`;
+  }
+  return `Realtime voice could not start. ${shortenStatus(issue)}`;
+}
+
+function friendlyRealtimeSettingsError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("No handler registered") && message.includes("realtime:setSettings")) {
+    return new Error(
+      "Codex Voice main process is still running an older build. Restart Codex Voice, then choose the Realtime settings again.",
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
+function friendlyActionError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("No handler registered") && message.includes("settings:")) {
+    return new Error(
+      "Codex Voice main process is still running an older build. Restart Codex Voice, then try the API key action again.",
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
+function openAiErrorMessage(issue: string): string | null {
+  const jsonStart = issue.indexOf("{");
+  if (jsonStart < 0) return null;
+  try {
+    const parsed = JSON.parse(issue.slice(jsonStart)) as {
+      error?: { message?: unknown };
+    };
+    return typeof parsed.error?.message === "string" ? parsed.error.message : null;
+  } catch {
+    return null;
+  }
+}
+
+function shortenStatus(value: string): string {
+  return value.replace(/^Realtime session creation failed:\s*/i, "").slice(0, 220);
 }
 
 function formatProjectTime(iso: string): string {
@@ -1556,6 +5043,24 @@ function formatProjectTime(iso: string): string {
 function formatModelName(model: string | null): string {
   if (!model) return "Default";
   return model.replace(/^gpt-/i, "GPT-");
+}
+
+function realtimeModelOption(model: RealtimeModelId) {
+  return REALTIME_MODEL_OPTIONS.find((option) => option.model === model) ?? REALTIME_MODEL_OPTIONS[0];
+}
+
+function realtimeVoiceOption(voice: RealtimeVoiceId) {
+  return REALTIME_VOICE_OPTIONS.find((option) => option.voice === voice) ?? REALTIME_VOICE_OPTIONS[0];
+}
+
+function formatRealtimeModelName(model: RealtimeModelId): string {
+  return realtimeModelOption(model).displayName;
+}
+
+function realtimeModelDetail(realtime: AppState["realtime"]): string {
+  const option = realtimeModelOption(realtime.model);
+  if (!realtime.reasoningEffort) return option.description;
+  return `${option.description}; reasoning ${formatEffort(realtime.reasoningEffort)}`;
 }
 
 function modelsForValue(models: CodexModelSummary[], value: string | null): CodexModelSummary[] {
@@ -1611,6 +5116,26 @@ function FolderIcon(): React.ReactElement {
   );
 }
 
+function FolderPlusIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="folder-plus-icon">
+      <path d="M3.75 7.1a2 2 0 0 1 2-2h4.05a2 2 0 0 1 1.48.65l1.17 1.28h5.8a2 2 0 0 1 2 2v8.05a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V7.1Z" />
+      <path d="M12 10.75v5.5" />
+      <path d="M9.25 13.5h5.5" />
+    </svg>
+  );
+}
+
+function FilterIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 7h14" />
+      <path d="M7.75 12h8.5" />
+      <path d="M10.25 17h3.5" />
+    </svg>
+  );
+}
+
 function PlusIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1635,20 +5160,137 @@ function CheckIcon(): React.ReactElement {
   );
 }
 
-function LightningIcon(): React.ReactElement {
+function EditIcon(): React.ReactElement {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="lightning-icon">
-      <path d="M13.5 2.75 5.75 13.2h5.45l-.7 8.05 7.75-10.45H12.8l.7-8.05Z" />
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m5 16.85-.35 2.5 2.5-.35 10.2-10.2-2.15-2.15L5 16.85Z" />
+      <path d="m14.35 7.5 2.15 2.15" />
     </svg>
   );
 }
 
-function ShieldIcon(): React.ReactElement {
+function EllipsisIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="ellipsis-icon">
+      <path d="M6.5 12h.01" />
+      <path d="M12 12h.01" />
+      <path d="M17.5 12h.01" />
+    </svg>
+  );
+}
+
+function RemoveIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 3.5 18.5 6v5.4c0 4.25-2.6 7.15-6.5 9.1-3.9-1.95-6.5-4.85-6.5-9.1V6L12 3.5Z" />
-      <path d="M12 8.2v4.25" />
-      <path d="M12 15.8h.01" />
+      <path d="M6.25 6.25 17.75 17.75" />
+      <path d="M17.75 6.25 6.25 17.75" />
+    </svg>
+  );
+}
+
+function LeftPaneIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="4.6" y="4.4" width="14.8" height="15.2" rx="3" />
+      <path d="M9.6 7.2v9.6" />
+    </svg>
+  );
+}
+
+function RightPaneIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="4.6" y="4.4" width="14.8" height="15.2" rx="3" />
+      <path d="M14.4 7.2v9.6" />
+    </svg>
+  );
+}
+
+function RefreshIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M20 6v5h-5" />
+      <path d="M4 18v-5h5" />
+      <path d="M18.4 9A6.6 6.6 0 0 0 6.7 7.1L4 10" />
+      <path d="M5.6 15A6.6 6.6 0 0 0 17.3 16.9L20 14" />
+    </svg>
+  );
+}
+
+function DebugIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M7 8.75h10" />
+      <path d="M8.5 4.75h7" />
+      <path d="M5.75 11.5v2.25a6.25 6.25 0 0 0 12.5 0V11.5" />
+      <path d="M3.5 13h17" />
+      <path d="M6.25 18.25 4.75 20" />
+      <path d="m17.75 18.25 1.5 1.75" />
+    </svg>
+  );
+}
+
+function PowerIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3.75v8" />
+      <path d="M7.15 6.95A7.5 7.5 0 1 0 16.85 7" />
+    </svg>
+  );
+}
+
+function AppearanceIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3.9c1.85 2.5 3.95 3.92 7.1 4.25-2.5 1.85-3.92 3.95-4.25 7.1-1.85-2.5-3.95-3.92-7.1-4.25 2.5-1.85 3.92-3.95 4.25-7.1Z" />
+      <path d="M6.3 14.7c.76 1.03 1.63 1.62 2.95 1.76-1.03.76-1.62 1.63-1.76 2.95-.76-1.03-1.63-1.62-2.95-1.76 1.03-.76 1.62-1.63 1.76-2.95Z" />
+    </svg>
+  );
+}
+
+function PermissionIcon({ mode }: { mode: CodexPermissionMode }): React.ReactElement {
+  if (mode === "default") return <DefaultPermissionsIcon />;
+  if (mode === "auto-review") return <AutoReviewIcon />;
+  if (mode === "custom-config") return <ConfigIcon />;
+  return <FullAccessIcon />;
+}
+
+function DefaultPermissionsIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M7.85 11.75V7.05a1.34 1.34 0 0 1 2.68 0v4.25" />
+      <path d="M10.53 11.1V5.75a1.34 1.34 0 0 1 2.68 0v5.4" />
+      <path d="M13.21 11.35V6.55a1.34 1.34 0 0 1 2.68 0v5.25" />
+      <path d="M15.89 12.2V8.35a1.3 1.3 0 0 1 2.6 0v5.35c0 4.05-2.55 6.55-6.42 6.55h-.95c-2.38 0-4-.96-5.2-2.62l-1.96-2.78a1.34 1.34 0 0 1 2.18-1.55l1.8 2.15" />
+    </svg>
+  );
+}
+
+function AutoReviewIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M12 3.6 18.35 6v5.35c0 4.08-2.52 6.92-6.35 8.85-3.83-1.93-6.35-4.77-6.35-8.85V6L12 3.6Z" />
+      <path d="m9.45 10.25 1.9 1.75-1.9 1.75" />
+      <path d="M13.15 14h2.25" />
+    </svg>
+  );
+}
+
+function FullAccessIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M12 3.6 18.35 6v5.35c0 4.08-2.52 6.92-6.35 8.85-3.83-1.93-6.35-4.77-6.35-8.85V6L12 3.6Z" />
+      <path d="M12 8.35v4.3" />
+      <path d="M12 16.15h.01" />
+    </svg>
+  );
+}
+
+function ConfigIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="permission-mode-icon">
+      <path d="M12 9.25a2.75 2.75 0 1 1 0 5.5 2.75 2.75 0 0 1 0-5.5Z" />
+      <path d="M19.35 13.7a7.9 7.9 0 0 0 .05-3.4l2.05-1.5-2-3.45-2.52 1.04a7.85 7.85 0 0 0-2.9-1.67L13.65 2h-3.3l-.38 2.72a7.85 7.85 0 0 0-2.9 1.67L4.55 5.35l-2 3.45 2.05 1.5a7.9 7.9 0 0 0 .05 3.4L2.6 15.2l2 3.45 2.47-1.02a7.85 7.85 0 0 0 2.9 1.65l.38 2.72h3.3l.38-2.72a7.85 7.85 0 0 0 2.9-1.65l2.47 1.02 2-3.45-2.05-1.5Z" />
     </svg>
   );
 }
@@ -1681,20 +5323,40 @@ function WaveformIcon(): React.ReactElement {
   );
 }
 
-function EllipsisIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="ellipsis-icon">
-      <circle cx="6.5" cy="12" r="1.45" />
-      <circle cx="12" cy="12" r="1.45" />
-      <circle cx="17.5" cy="12" r="1.45" />
-    </svg>
-  );
-}
-
 function CloseIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m6.5 6.5 11 11M17.5 6.5l-11 11" />
+    </svg>
+  );
+}
+
+function InfoIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 10.75v5.5" />
+      <path d="M12 7.75h.01" />
+      <path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z" />
+    </svg>
+  );
+}
+
+function EyeIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3.5 12s3.15-5.5 8.5-5.5 8.5 5.5 8.5 5.5-3.15 5.5-8.5 5.5S3.5 12 3.5 12Z" />
+      <path d="M12 14.45a2.45 2.45 0 1 0 0-4.9 2.45 2.45 0 0 0 0 4.9Z" />
+    </svg>
+  );
+}
+
+function EyeOffIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m4 4 16 16" />
+      <path d="M9.2 6.95A8.88 8.88 0 0 1 12 6.5c5.35 0 8.5 5.5 8.5 5.5a14.7 14.7 0 0 1-2.7 3.24" />
+      <path d="M14.15 14.3a2.45 2.45 0 0 1-3.45-3.45" />
+      <path d="M6.2 8.7A14.7 14.7 0 0 0 3.5 12s3.15 5.5 8.5 5.5c1.02 0 1.96-.2 2.8-.54" />
     </svg>
   );
 }
