@@ -31,7 +31,7 @@ import {
   type WindowChromeState,
 } from "../../shared/types";
 import { appendBufferedEvent } from "../../shared/eventBuffer";
-import { RealtimeVoiceClient } from "./realtimeClient";
+import { RealtimeVoiceClient, type RealtimeChatContext } from "./realtimeClient";
 import { RightPanel } from "./rightPanel";
 import "./styles.css";
 
@@ -83,20 +83,9 @@ const emptyState: AppState = {
 };
 
 type AppWindowKind = "voice" | "debug";
-type ApiKeyDialogMode = "onboarding" | "settings";
-type OnboardingStep = "key" | "voice" | "orb" | "project";
-type PaneSide = "settings" | "future";
+type ApiKeyDialogMode = "connect" | "settings";
 type VoiceTone = "off" | "listening" | "working" | "connecting" | "paused" | "waiting";
 type VoiceSettingsTab = "general" | "appearance" | "configuration" | "archive";
-type VoiceOrbPresetId = "aurora" | "cloud" | "nocturne";
-
-type VoiceOrbPreset = {
-  id: VoiceOrbPresetId;
-  name: string;
-  detail: string;
-  shape: "sphere" | "cloud";
-  previewLevel: number;
-};
 
 type VoiceOrbCustomization = {
   accentColor: string;
@@ -105,21 +94,15 @@ type VoiceOrbCustomization = {
   waveHeight: number;
 };
 
-const voiceOrbStorageKey = "codexVoice.orbPreset";
-const leftPanelWidthStorageKey = "codexVoice.leftPanel.width";
-const rightPanelWidthStorageKey = "codexVoice.rightPanel.width";
 const voiceOrbCustomizationStorageKey = "codexVoice.orbCustomization";
-const voiceOnboardingSeenStorageKey = "codexVoice.onboardingSeen";
-const dualPaneLayoutMediaQuery = "(min-width: 1420px)";
-const paneReplacementDelayMs = 120;
-const minPaneWidth = 320;
-const maxPaneWidth = 720;
-const defaultPaneWidth = 420;
+const dualPaneLayoutMediaQuery = "(min-width: 780px)";
+const compactWindowWidth = 444;
+const rendererZoomFactor = 0.85;
 const defaultVoiceOrbCustomization: VoiceOrbCustomization = {
   accentColor: "#1d9bf0",
-  glow: 52,
-  reactivity: 56,
-  waveHeight: 50,
+  glow: 0,
+  reactivity: 12,
+  waveHeight: 100,
 };
 const voiceOrbColorOptions: Array<{ color: string; label: string }> = [
   { color: "#1d9bf0", label: "Azure" },
@@ -128,42 +111,6 @@ const voiceOrbColorOptions: Array<{ color: string; label: string }> = [
   { color: "#8ff5df", label: "Mint" },
   { color: "#f4f0dd", label: "Pearl" },
 ];
-const voiceOrbPresets: VoiceOrbPreset[] = [
-  {
-    id: "aurora",
-    name: "Aurora",
-    detail: "Round water",
-    shape: "sphere",
-    previewLevel: 0.32,
-  },
-  {
-    id: "cloud",
-    name: "Cloud",
-    detail: "App icon shape",
-    shape: "cloud",
-    previewLevel: 0.42,
-  },
-  {
-    id: "nocturne",
-    name: "Nocturne",
-    detail: "Night glass",
-    shape: "sphere",
-    previewLevel: 0.28,
-  },
-];
-
-// Traced from src/main/assets/app-icon.png so the Cloud preset keeps the app icon silhouette.
-const iconCloudPathData =
-  "M4572 8120 c-80 -11 -245 -54 -325 -84 -402 -151 -739 -499 -906 -933 -41 -105 -85 -150 -189 -193 -335 -140 -573 -332 -767 -620 -113 -169 -195 -368 -242 -589 -25 -115 -27 -145 -28 -351 0 -200 3 -237 23 -329 57 -255 141 -437 289 -628 100 -128 107 -158 84 -343 -19 -145 -9 -412 19 -545 39 -186 113 -373 213 -539 95 -157 273 -342 444 -461 91 -63 242 -146 293 -160 14 -4 39 -15 55 -25 17 -10 57 -23 90 -30 33 -7 83 -21 110 -31 76 -27 136 -32 435 -34 254 -1 279 -3 328 -22 29 -12 68 -32 85 -45 158 -117 424 -246 557 -268 36 -6 94 -20 130 -31 107 -33 360 -40 570 -15 52 6 192 51 330 104 365 142 667 458 826 865 45 118 88 167 167 193 29 9 59 22 67 29 8 7 49 29 90 49 123 61 237 144 355 261 121 119 174 185 250 310 108 179 187 380 232 594 24 111 27 148 27 311 0 153 -4 203 -23 290 -47 222 -147 450 -271 620 -38 52 -80 111 -94 130 -39 54 -48 122 -31 237 34 238 28 420 -21 639 -107 484 -430 897 -856 1098 -133 63 -207 88 -343 117 -130 28 -355 36 -496 18 -115 -14 -175 -14 -215 1 -15 6 -68 44 -118 84 -145 117 -315 213 -462 260 -180 58 -239 68 -434 71 -102 2 -213 0 -248 -5z";
-const iconCloudSourceBounds = {
-  x: 2110,
-  yBottom: 1840,
-  yTop: 8130,
-  width: 6070,
-  height: 6290,
-};
-const iconCloudRotationRadians = (-12 * Math.PI) / 180;
-let iconCloudPath: Path2D | null = null;
 
 type ContextMenuTarget =
   | {
@@ -211,19 +158,81 @@ function activeVoiceEventContext(state: AppState): VoiceEventContext | null {
   };
 }
 
+function activeRealtimeChatContext(state: AppState): RealtimeChatContext | null {
+  const project = state.activeProject;
+  if (!project) return null;
+  const chat = activeVoiceChatForState(state);
+  if (!chat) return null;
+  return {
+    projectId: project.id,
+    projectName: project.displayName,
+    chatId: chat.id,
+    chatName: chat.displayName,
+    threadId: chat.codexThreadId,
+  };
+}
+
 function eventWithVoiceContext(event: AppEvent, context: VoiceEventContext | null): AppEvent {
   if (event.source !== "realtime") return event;
-  if (!context) return event;
+  const resolvedContext = voiceEventContextFromEvent(event) ?? context;
+  if (!resolvedContext) return event;
   const raw = event.raw && typeof event.raw === "object" && !Array.isArray(event.raw) ? event.raw : {};
   return {
     ...event,
     raw: {
       ...raw,
-      projectId: context.projectId,
-      chatId: context.chatId,
-      threadId: context.threadId,
+      projectId: resolvedContext.projectId,
+      chatId: resolvedContext.chatId,
+      threadId: resolvedContext.threadId,
     },
   };
+}
+
+function voiceEventContextFromEvent(event: AppEvent): VoiceEventContext | null {
+  if (event.source !== "realtime") return null;
+  const raw = recordFromUnknown(event.raw);
+  const projectId = stringFromUnknown(raw?.projectId);
+  const chatId = stringFromUnknown(raw?.chatId);
+  if (projectId && chatId) {
+    return {
+      projectId,
+      chatId,
+      threadId: stringFromUnknown(raw?.threadId),
+    };
+  }
+
+  const output = recordFromUnknown(raw?.output);
+  const project = recordFromUnknown(output?.project);
+  const chat = recordFromUnknown(output?.chat);
+  const outputProjectId = stringFromUnknown(output?.projectId) ?? stringFromUnknown(project?.id);
+  const outputChatId = stringFromUnknown(output?.chatId) ?? stringFromUnknown(chat?.id);
+  if (!outputProjectId || !outputChatId) return null;
+  return {
+    projectId: outputProjectId,
+    chatId: outputChatId,
+    threadId:
+      stringFromUnknown(output?.threadId) ??
+      stringFromUnknown(chat?.codexThreadId) ??
+      stringFromUnknown(chat?.threadId),
+  };
+}
+
+function isRealtimeTranscriptEvent(event: AppEvent): boolean {
+  if (event.source !== "realtime") return false;
+  const raw = recordFromUnknown(event.raw);
+  const rawType = stringFromUnknown(raw?.type);
+  return [
+    "userTranscriptDelta",
+    "userTranscript",
+    "voiceDelta",
+    "assistantTranscriptDelta",
+    "assistantTranscript",
+  ].includes(event.kind) || [
+    "conversation.item.input_audio_transcription.delta",
+    "conversation.item.input_audio_transcription.completed",
+    "response.output_audio_transcript.delta",
+    "response.output_audio_transcript.done",
+  ].includes(rawType ?? "");
 }
 
 function activeVoiceChatForState(state: AppState): VoiceChat | null {
@@ -237,11 +246,6 @@ function activeVoiceChatForState(state: AppState): VoiceChat | null {
     chats[0] ??
     null
   );
-}
-
-async function activeTranscriptMessages(state: AppState) {
-  const chat = activeVoiceChatForState(state);
-  return chat ? window.codexVoice.getTranscriptMessages(chat.id) : [];
 }
 
 function shouldAutoOpenTranscriptForEvent(event: AppEvent): boolean {
@@ -293,27 +297,6 @@ function stringFromUnknown(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function isVoiceOrbPresetId(value: string | null): value is VoiceOrbPresetId {
-  return voiceOrbPresets.some((preset) => preset.id === value);
-}
-
-function loadVoiceOrbPresetId(): VoiceOrbPresetId {
-  try {
-    const stored = window.localStorage.getItem(voiceOrbStorageKey);
-    return isVoiceOrbPresetId(stored) ? stored : "aurora";
-  } catch {
-    return "aurora";
-  }
-}
-
-function saveVoiceOrbPresetId(presetId: VoiceOrbPresetId): void {
-  try {
-    window.localStorage.setItem(voiceOrbStorageKey, presetId);
-  } catch {
-    // Visual preferences should never block the voice UI.
-  }
-}
-
 function isHexColor(value: unknown): value is string {
   return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
 }
@@ -325,9 +308,9 @@ function clampControlValue(value: unknown, fallback: number): number {
 function normalizeVoiceOrbCustomization(value: Partial<VoiceOrbCustomization> | null): VoiceOrbCustomization {
   return {
     accentColor: isHexColor(value?.accentColor) ? value.accentColor : defaultVoiceOrbCustomization.accentColor,
-    glow: clampControlValue(value?.glow, defaultVoiceOrbCustomization.glow),
-    reactivity: clampControlValue(value?.reactivity, defaultVoiceOrbCustomization.reactivity),
-    waveHeight: clampControlValue(value?.waveHeight, defaultVoiceOrbCustomization.waveHeight),
+    glow: defaultVoiceOrbCustomization.glow,
+    reactivity: defaultVoiceOrbCustomization.reactivity,
+    waveHeight: defaultVoiceOrbCustomization.waveHeight,
   };
 }
 
@@ -349,61 +332,21 @@ function saveVoiceOrbCustomization(customization: VoiceOrbCustomization): void {
   }
 }
 
-function clampPaneWidth(width: number): number {
-  return Math.max(minPaneWidth, Math.min(maxPaneWidth, Math.round(width)));
-}
-
-function loadPaneWidth(storageKey: string): number {
-  try {
-    const value = Number(window.localStorage.getItem(storageKey));
-    return Number.isFinite(value) ? clampPaneWidth(value) : defaultPaneWidth;
-  } catch {
-    return defaultPaneWidth;
-  }
-}
-
-function savePaneWidth(storageKey: string, width: number): void {
-  try {
-    window.localStorage.setItem(storageKey, String(clampPaneWidth(width)));
-  } catch {
-    // Visual preferences should never block the voice UI.
-  }
-}
-
-function loadVoiceOnboardingSeen(): boolean {
-  try {
-    return window.localStorage.getItem(voiceOnboardingSeenStorageKey) === "true";
-  } catch {
-    return false;
-  }
-}
-
-function saveVoiceOnboardingSeen(seen: boolean): void {
-  try {
-    window.localStorage.setItem(voiceOnboardingSeenStorageKey, seen ? "true" : "false");
-  } catch {
-    // Onboarding should stay usable even if localStorage is unavailable.
-  }
-}
-
 function supportsDualPaneLayout(): boolean {
   return window.matchMedia(dualPaneLayoutMediaQuery).matches;
 }
 
-function voiceOrbPresetById(presetId: VoiceOrbPresetId): VoiceOrbPreset {
-  return voiceOrbPresets.find((preset) => preset.id === presetId) ?? voiceOrbPresets[0];
+function viewportWidth(): number {
+  return Math.max(0, window.innerWidth);
 }
 
-function voiceOrbPresetAtOffset(presetId: VoiceOrbPresetId, offset: number): VoiceOrbPresetId {
-  const currentIndex = Math.max(0, voiceOrbPresets.findIndex((preset) => preset.id === presetId));
-  const nextIndex = (currentIndex + offset + voiceOrbPresets.length) % voiceOrbPresets.length;
-  return voiceOrbPresets[nextIndex].id;
+function compactViewportWidth(): number {
+  return compactWindowWidth / rendererZoomFactor;
 }
 
 function App(): React.ReactElement {
   const [windowKind] = useState<AppWindowKind>(() => appWindowKind());
   const [state, setState] = useState<AppState>(emptyState);
-  const [stateLoaded, setStateLoaded] = useState(false);
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [projectName, setProjectName] = useState("");
   const [message, setMessage] = useState("");
@@ -415,10 +358,10 @@ function App(): React.ReactElement {
   const [voicePaused, setVoicePaused] = useState(false);
   const [voiceOutputLevel, setVoiceOutputLevel] = useState(0);
   const [realtimeIssue, setRealtimeIssue] = useState<string | null>(null);
-  const [onboardingRequestId, setOnboardingRequestId] = useState(0);
   const [windowChromeState, setWindowChromeState] = useState<WindowChromeState>({ isFullScreen: false });
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
   const stateRef = useRef<AppState>(emptyState);
+  const pendingRealtimeTranscriptEventsRef = useRef<AppEvent[]>([]);
   const outputLevelUpdateRef = useRef(0);
   const outputLevelValueRef = useRef(0);
 
@@ -442,17 +385,20 @@ function App(): React.ReactElement {
     const offWindowChromeState = window.codexVoice.onWindowChromeState(setWindowChromeState);
     const offState = window.codexVoice.onAppState((nextState) => {
       stateRef.current = nextState;
+      flushPendingRealtimeTranscriptEvents(activeVoiceEventContext(nextState));
+      voiceRef.current?.setActiveChatContext(activeRealtimeChatContext(nextState));
       setState(nextState);
-      setStateLoaded(true);
     });
     const offEvent = window.codexVoice.onAppEvent((event) => {
       setEvents((current) => appendBufferedEvent(current, event));
-      if (event.source === "app" && event.kind === "debug/startOnboarding") {
-        setOnboardingRequestId((current) => current + 1);
-      } else if (event.source === "codex" && event.kind === "serverRequest") {
+      if (event.source === "codex" && event.kind === "serverRequest") {
         voiceRef.current?.speakPendingRequest(event.raw as PendingCodexRequest);
       } else if (event.source === "codex" && event.kind === "turn/finalOutput") {
         voiceRef.current?.injectCodexTurnOutput(event.raw as CodexTurnOutput);
+      } else if (event.source === "app" && event.kind === "queuedTurnStarted") {
+        voiceRef.current?.speakQueuedCodexTransition(event.raw);
+      } else if (event.source === "app" && event.kind === "queuedTurnFailed") {
+        voiceRef.current?.speakStatus(event.message);
       } else if (event.source === "codex" && event.kind === "error") {
         voiceRef.current?.speakStatus(event.message);
       }
@@ -467,7 +413,6 @@ function App(): React.ReactElement {
 
   async function refreshState(): Promise<void> {
     setState(await window.codexVoice.getState());
-    setStateLoaded(true);
   }
 
   async function refreshEvents(): Promise<void> {
@@ -510,7 +455,32 @@ function App(): React.ReactElement {
     setVoiceOutputLevel(0);
   }
 
+  function flushPendingRealtimeTranscriptEvents(context = activeVoiceEventContext(stateRef.current)): void {
+    if (!context || pendingRealtimeTranscriptEventsRef.current.length === 0) return;
+    const pendingEvents = [...pendingRealtimeTranscriptEventsRef.current].reverse();
+    pendingRealtimeTranscriptEventsRef.current = [];
+    for (const event of pendingEvents) {
+      void window.codexVoice.logEvent(eventWithVoiceContext(event, context));
+    }
+  }
+
+  function logRealtimeEvent(event: AppEvent): void {
+    const context = voiceEventContextFromEvent(event) ?? activeVoiceEventContext(stateRef.current);
+    if (!context && isRealtimeTranscriptEvent(event)) {
+      pendingRealtimeTranscriptEventsRef.current = appendBufferedEvent(
+        pendingRealtimeTranscriptEventsRef.current,
+        event,
+        128,
+      );
+      return;
+    }
+    flushPendingRealtimeTranscriptEvents(context);
+    void window.codexVoice.logEvent(eventWithVoiceContext(event, context));
+  }
+
   function disconnectVoice(): void {
+    flushPendingRealtimeTranscriptEvents();
+    pendingRealtimeTranscriptEventsRef.current = [];
     voiceRef.current?.disconnect();
     voiceRef.current = null;
     setVoiceConnected(false);
@@ -524,7 +494,6 @@ function App(): React.ReactElement {
     if (voiceConnecting) return;
     await runAction(async () => {
       setVoiceConnecting(true);
-      const voiceEventContext = activeVoiceEventContext(stateRef.current);
       const client = new RealtimeVoiceClient({
         onConnectionChange: (connected, label) => {
           setVoiceConnected(connected);
@@ -536,14 +505,12 @@ function App(): React.ReactElement {
           setVoiceStatus(label);
         },
         onLog: (event) => {
-          void window.codexVoice.logEvent(eventWithVoiceContext(event, voiceEventContext));
+          logRealtimeEvent(event);
         },
         onOutputLevel: updateVoiceOutputLevel,
-        getTranscriptMessages: () =>
-          voiceEventContext
-            ? window.codexVoice.getTranscriptMessages(voiceEventContext.chatId)
-            : activeTranscriptMessages(stateRef.current),
+        getTranscriptMessages: (chatId) => window.codexVoice.getTranscriptMessages(chatId),
       });
+      client.setActiveChatContext(activeRealtimeChatContext(stateRef.current));
       voiceRef.current = client;
       try {
         await client.connect();
@@ -621,14 +588,12 @@ function App(): React.ReactElement {
       state={state}
       events={events}
       windowChromeState={windowChromeState}
-      stateLoaded={stateLoaded}
       voiceOutputLevel={voiceOutputLevel}
       realtimeIssue={realtimeIssue}
       error={error}
       voiceConnected={voiceConnected}
       voiceConnecting={voiceConnecting}
       voicePaused={voicePaused}
-      onboardingRequestId={onboardingRequestId}
       onAction={runAction}
       onDismissError={() => setError(null)}
       onOrbAction={handleOrbAction}
@@ -645,14 +610,12 @@ function VoiceHome({
   state,
   events,
   windowChromeState,
-  stateLoaded,
   voiceOutputLevel,
   realtimeIssue,
   error,
   voiceConnected,
   voiceConnecting,
   voicePaused,
-  onboardingRequestId,
   onAction,
   onDismissError,
   onOrbAction,
@@ -665,14 +628,12 @@ function VoiceHome({
   state: AppState;
   events: AppEvent[];
   windowChromeState: WindowChromeState;
-  stateLoaded: boolean;
   voiceOutputLevel: number;
   realtimeIssue: string | null;
   error: string | null;
   voiceConnected: boolean;
   voiceConnecting: boolean;
   voicePaused: boolean;
-  onboardingRequestId: number;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
   onDismissError: () => void;
   onOrbAction: () => Promise<void>;
@@ -683,12 +644,11 @@ function VoiceHome({
   onClearRealtimeIssue: () => void;
 }): React.ReactElement {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [futureOpen, setFutureOpen] = useState(false);
+  const [futureOpen, setFutureOpenState] = useState(false);
+  const [futureVisible, setFutureVisible] = useState(false);
+  const [rightPaneRevealWidth, setRightPaneRevealWidth] = useState(0);
   const [transcriptActivationRequest, setTranscriptActivationRequest] = useState(0);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
-  const [leftPaneWidth, setLeftPaneWidth] = useState(() => loadPaneWidth(leftPanelWidthStorageKey));
-  const [rightPanelWidth, setRightPanelWidth] = useState(() => loadPaneWidth(rightPanelWidthStorageKey));
-  const [resizingPane, setResizingPane] = useState<PaneSide | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [switchChatOpen, setSwitchChatOpen] = useState(false);
@@ -696,24 +656,24 @@ function VoiceHome({
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [chatsOpen, setChatsOpen] = useState(false);
   const [permissionsOpen, setPermissionsOpen] = useState(false);
-  const [orbPresetId, setOrbPresetId] = useState<VoiceOrbPresetId>(() => loadVoiceOrbPresetId());
+  const [modelOpen, setModelOpen] = useState(false);
   const [orbCustomization, setOrbCustomization] = useState<VoiceOrbCustomization>(() => loadVoiceOrbCustomization());
-  const [onboardingOpen, setOnboardingOpen] = useState(false);
-  const [onboardingSeen, setOnboardingSeen] = useState(() => loadVoiceOnboardingSeen());
   const [apiKeyDialogMode, setApiKeyDialogMode] = useState<ApiKeyDialogMode | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuTarget | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [newName, setNewName] = useState("");
   const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
-  const paneTogglePointerActivationRef = useRef<PaneSide | null>(null);
+  const paneTogglePointerActivationRef = useRef(false);
+  const futureOpenRef = useRef(false);
+  const futureVisibleRef = useRef(false);
+  const rightPaneRevealWidthRef = useRef(0);
+  const rightPaneSyncFrameRef = useRef<number | null>(null);
+  const rightPaneLastViewportWidthRef = useRef(viewportWidth());
+  const rightPaneStableFrameCountRef = useRef(0);
+  const canShowBothPanesRef = useRef(canShowBothPanes);
   const lastAutoTranscriptEventRef = useRef<string | null>(null);
   const transcriptAutoActivatedRef = useRef(false);
-  const paneReplacementTimeoutRef = useRef<number | null>(null);
-  const paneResizeFrameRef = useRef<number | null>(null);
-  const pendingPaneResizeRef = useRef<{ pane: PaneSide; width: number } | null>(null);
-  const paneResizeCleanupRef = useRef<(() => void) | null>(null);
-  const lastOpenedPaneRef = useRef<PaneSide>("settings");
   const projects = state.projects;
   const archivedProjects = state.archivedProjects;
   const activeProject = state.activeProject;
@@ -750,6 +710,9 @@ function VoiceHome({
     DEFAULT_CODEX_PERMISSION_MODE;
   const effectivePermission = permissionProfile(effectivePermissionMode);
   const modelOptions = modelsForValue(state.codexSettings.models, effectiveModel);
+  const selectedCodexModel = modelOptions.find((model) => model.model === effectiveModel) ?? null;
+  const modelSupportsFast = supportsFastMode(selectedCodexModel);
+  const fastModeOn = isFastServiceTier(effectiveServiceTier);
   const pendingRequests = state.runtime.pendingRequests;
   const primaryPendingRequest = pendingRequests[0] ?? null;
   const filteredProjects = projects.filter((project) => {
@@ -768,24 +731,38 @@ function VoiceHome({
   const voiceOrbLabel = voiceOrbAriaLabel(state, voiceConnected, voiceConnecting, voicePaused);
 
   useEffect(() => {
-    saveVoiceOrbPresetId(orbPresetId);
-  }, [orbPresetId]);
-
-  useEffect(() => {
     saveVoiceOrbCustomization(orbCustomization);
   }, [orbCustomization]);
 
   useEffect(() => {
-    savePaneWidth(leftPanelWidthStorageKey, leftPaneWidth);
-  }, [leftPaneWidth]);
+    const handleResize = () => {
+      if (!futureVisibleRef.current && !futureOpenRef.current) {
+        setRightPaneReveal(0);
+        return;
+      }
 
-  useEffect(() => {
-    savePaneWidth(rightPanelWidthStorageKey, rightPanelWidth);
-  }, [rightPanelWidth]);
+      const revealWidth = syncRightPaneRevealWidth();
+      finishRightPaneCloseIfCollapsed(revealWidth);
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      stopRightPaneSyncLoop();
+    };
+  }, []);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia(dualPaneLayoutMediaQuery);
-    const updateCanShowBothPanes = () => setCanShowBothPanes(mediaQuery.matches);
+    const updateCanShowBothPanes = () => {
+      const nextCanShowBothPanes = mediaQuery.matches;
+      const wasShowingBothPanes = canShowBothPanesRef.current;
+      canShowBothPanesRef.current = nextCanShowBothPanes;
+      setCanShowBothPanes(nextCanShowBothPanes);
+      if (wasShowingBothPanes && !nextCanShowBothPanes && futureOpenRef.current) {
+        closeFuturePane();
+      }
+    };
 
     updateCanShowBothPanes();
     mediaQuery.addEventListener("change", updateCanShowBothPanes);
@@ -803,9 +780,7 @@ function VoiceHome({
     if (lastAutoTranscriptEventRef.current === identity) return;
     lastAutoTranscriptEventRef.current = identity;
 
-    clearPaneReplacementTimeout();
-    lastOpenedPaneRef.current = "future";
-    setFutureOpen(true);
+    openFuturePane();
     setTranscriptActivationRequest((current) => current + 1);
     transcriptAutoActivatedRef.current = true;
   }, [canShowBothPanes, events, futureOpen, state]);
@@ -818,28 +793,6 @@ function VoiceHome({
   }, [voiceConnected]);
 
   useEffect(() => {
-    return () => {
-      if (paneReplacementTimeoutRef.current !== null) {
-        window.clearTimeout(paneReplacementTimeoutRef.current);
-      }
-      paneResizeCleanupRef.current?.();
-      if (paneResizeFrameRef.current !== null) {
-        window.cancelAnimationFrame(paneResizeFrameRef.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (canShowBothPanes || !settingsOpen || !futureOpen) return;
-
-    if (lastOpenedPaneRef.current === "future") {
-      setSettingsOpen(false);
-    } else {
-      setFutureOpen(false);
-    }
-  }, [canShowBothPanes, futureOpen, settingsOpen]);
-
-  useEffect(() => {
     setChatsOpen(false);
   }, [activeProject?.id]);
 
@@ -848,31 +801,9 @@ function VoiceHome({
   }, [showProjectChats]);
 
   useEffect(() => {
-    if (stateLoaded && projects.length > 0 && !onboardingSeen) {
-      saveVoiceOnboardingSeen(true);
-      setOnboardingSeen(true);
-      return;
-    }
-
-    if (stateLoaded && !onboardingSeen && !onboardingOpen && !apiKeyDialogMode && projects.length === 0) {
-      setOnboardingOpen(true);
-    }
-  }, [apiKeyDialogMode, onboardingOpen, onboardingSeen, projects.length, stateLoaded]);
-
-  useEffect(() => {
-    if (onboardingRequestId === 0) return;
-    saveVoiceOnboardingSeen(false);
-    setOnboardingSeen(false);
-    setApiKeyDialogMode(null);
-    setSettingsOpen(false);
-    setFutureOpen(false);
-    setOnboardingOpen(true);
-  }, [onboardingRequestId]);
-
-  useEffect(() => {
-    if (!apiKeyDialogMode && !settingsOpen && !onboardingOpen) return;
+    if (!apiKeyDialogMode && !settingsOpen) return;
     setApiKey("");
-  }, [apiKeyDialogMode, onboardingOpen, settingsOpen]);
+  }, [apiKeyDialogMode, settingsOpen]);
 
   useEffect(() => {
     if (!contextMenu) return undefined;
@@ -900,24 +831,6 @@ function VoiceHome({
       setNewOpen(false);
       await onRefresh();
     });
-  }
-
-  async function startOnboardingProject(mode: "scratch" | "folder"): Promise<void> {
-    let created = false;
-    await onAction(async () => {
-      if (mode === "folder") {
-        const folder = await window.codexVoice.selectWorkspaceFolder();
-        if (!folder) return;
-        await window.codexVoice.createProject(folder.name, folder.path);
-      } else {
-        await window.codexVoice.createProject("Voice Project");
-      }
-      created = true;
-      await onRefresh();
-    });
-    if (created) {
-      completeOnboarding();
-    }
   }
 
   async function selectWorkspaceFolder(): Promise<void> {
@@ -1020,32 +933,6 @@ function VoiceHome({
     });
   }
 
-  async function saveOnboardingApiKey(): Promise<void> {
-    await onAction(async () => {
-      await window.codexVoice.saveOpenAiApiKey(apiKey);
-      setApiKey("");
-      onClearRealtimeIssue();
-      await onRefresh();
-    });
-  }
-
-  async function changeRealtimeVoice(voice: RealtimeVoiceId): Promise<void> {
-    let updated = false;
-    await onAction(async () => {
-      await window.codexVoice.setRealtimeSettings({ voice });
-      updated = true;
-      await onRefresh();
-    });
-    if (updated && voiceConnected) await onRestartVoice();
-  }
-
-  function completeOnboarding(): void {
-    setApiKey("");
-    saveVoiceOnboardingSeen(true);
-    setOnboardingSeen(true);
-    setOnboardingOpen(false);
-  }
-
   function closeApiKeyDialog(): void {
     setApiKey("");
     setApiKeyDialogMode(null);
@@ -1053,74 +940,118 @@ function VoiceHome({
 
   function handleVoiceOrbClick(): void {
     if (!state.realtime.available) {
-      setApiKeyDialogMode("onboarding");
+      setApiKeyDialogMode("connect");
       return;
     }
     void onOrbAction();
   }
 
-  function clearPaneReplacementTimeout(): void {
-    if (paneReplacementTimeoutRef.current === null) return;
-    window.clearTimeout(paneReplacementTimeoutRef.current);
-    paneReplacementTimeoutRef.current = null;
-  }
-
-  function openPaneAfterReplacement(pane: PaneSide): void {
-    paneReplacementTimeoutRef.current = window.setTimeout(() => {
-      if (pane === "settings") {
-        setSettingsOpen(true);
-      } else {
-        setFutureOpen(true);
-      }
-      paneReplacementTimeoutRef.current = null;
-    }, paneReplacementDelayMs);
-  }
-
   function toggleSettingsPane(): void {
     setPermissionsOpen(false);
-    clearPaneReplacementTimeout();
-
-    if (settingsOpen) {
-      setSettingsOpen(false);
-      return;
-    }
-
-    lastOpenedPaneRef.current = "settings";
-    if (canShowBothPanes || !futureOpen) {
-      setSettingsOpen(true);
-      return;
-    }
-
-    setFutureOpen(false);
-    openPaneAfterReplacement("settings");
+    setModelOpen(false);
+    setSettingsOpen((current) => !current);
   }
 
   function toggleFuturePane(): void {
     setPermissionsOpen(false);
-    clearPaneReplacementTimeout();
-
-    if (futureOpen) {
-      setFutureOpen(false);
-      return;
+    if (futureOpenRef.current) {
+      closeFuturePane();
+    } else {
+      openFuturePane();
     }
-
-    lastOpenedPaneRef.current = "future";
-    if (canShowBothPanes || !settingsOpen) {
-      setFutureOpen(true);
-      return;
-    }
-
-    setSettingsOpen(false);
-    openPaneAfterReplacement("future");
   }
 
-  function activatePaneToggle(pane: PaneSide): void {
-    if (pane === "settings") {
-      toggleSettingsPane();
-      return;
-    }
+  function openFuturePane(): void {
+    futureOpenRef.current = true;
+    futureVisibleRef.current = true;
+    setFutureOpenState(true);
+    setFutureVisible(true);
+    syncRightPaneRevealWidth();
+    startRightPaneSyncLoop();
+    void window.codexVoice
+      .expandVoiceWindowForRightPane()
+      .then(() => {
+        if (futureOpenRef.current) syncRightPaneRevealWidth();
+      })
+      .catch(() => {
+        if (futureOpenRef.current) syncRightPaneRevealWidth();
+      });
+  }
 
-    toggleFuturePane();
+  function closeFuturePane(): void {
+    futureOpenRef.current = false;
+    setFutureOpenState(false);
+    syncRightPaneRevealWidth();
+    startRightPaneSyncLoop();
+    void window.codexVoice
+      .collapseVoiceWindowFromRightPane()
+      .then(() => {
+        window.requestAnimationFrame(() => {
+          if (!futureOpenRef.current) finishRightPaneClose();
+        });
+      })
+      .catch(() => {
+        if (!futureOpenRef.current) finishRightPaneClose();
+      });
+  }
+
+  function setRightPaneReveal(width: number): void {
+    const roundedWidth = Math.max(0, Math.round(width));
+    rightPaneRevealWidthRef.current = roundedWidth;
+    setRightPaneRevealWidth(roundedWidth);
+  }
+
+  function syncRightPaneRevealWidth(): number {
+    const revealWidth = Math.max(0, viewportWidth() - compactViewportWidth());
+    setRightPaneReveal(revealWidth);
+    return revealWidth;
+  }
+
+  function finishRightPaneCloseIfCollapsed(revealWidth: number): void {
+    if (futureOpenRef.current || revealWidth > 1) return;
+    finishRightPaneClose();
+  }
+
+  function finishRightPaneClose(): void {
+    futureVisibleRef.current = false;
+    setFutureVisible(false);
+    setRightPaneReveal(0);
+    stopRightPaneSyncLoop();
+  }
+
+  function startRightPaneSyncLoop(): void {
+    stopRightPaneSyncLoop();
+    rightPaneLastViewportWidthRef.current = -1;
+    rightPaneStableFrameCountRef.current = 0;
+
+    const syncFrame = () => {
+      const currentViewportWidth = viewportWidth();
+      const revealWidth = syncRightPaneRevealWidth();
+      finishRightPaneCloseIfCollapsed(revealWidth);
+
+      if (currentViewportWidth === rightPaneLastViewportWidthRef.current) {
+        rightPaneStableFrameCountRef.current += 1;
+      } else {
+        rightPaneStableFrameCountRef.current = 0;
+        rightPaneLastViewportWidthRef.current = currentViewportWidth;
+      }
+
+      if (!futureVisibleRef.current || rightPaneStableFrameCountRef.current >= 8) {
+        if (!futureOpenRef.current) finishRightPaneClose();
+        rightPaneSyncFrameRef.current = null;
+        return;
+      }
+
+      rightPaneSyncFrameRef.current = window.requestAnimationFrame(syncFrame);
+    };
+
+    rightPaneSyncFrameRef.current = window.requestAnimationFrame(syncFrame);
+  }
+
+  function stopRightPaneSyncLoop(): void {
+    if (rightPaneSyncFrameRef.current === null) return;
+    window.cancelAnimationFrame(rightPaneSyncFrameRef.current);
+    rightPaneSyncFrameRef.current = null;
   }
 
   function handlePaneTogglePointerDown(event: React.PointerEvent<HTMLButtonElement>): void {
@@ -1128,250 +1059,162 @@ function VoiceHome({
     event.stopPropagation();
   }
 
-  function handlePaneTogglePointerUp(
-    event: React.PointerEvent<HTMLButtonElement>,
-    pane: PaneSide,
-  ): void {
+  function handlePaneTogglePointerUp(event: React.PointerEvent<HTMLButtonElement>): void {
     if (event.pointerType === "mouse" && event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    paneTogglePointerActivationRef.current = pane;
-    activatePaneToggle(pane);
+    paneTogglePointerActivationRef.current = true;
+    toggleFuturePane();
     window.setTimeout(() => {
-      if (paneTogglePointerActivationRef.current === pane) {
-        paneTogglePointerActivationRef.current = null;
-      }
+      paneTogglePointerActivationRef.current = false;
     }, 400);
   }
 
-  function handlePaneToggleClick(
-    event: React.MouseEvent<HTMLButtonElement>,
-    pane: PaneSide,
-  ): void {
+  function handlePaneToggleClick(event: React.MouseEvent<HTMLButtonElement>): void {
     event.stopPropagation();
-    if (paneTogglePointerActivationRef.current === pane) {
-      paneTogglePointerActivationRef.current = null;
+    if (paneTogglePointerActivationRef.current) {
+      paneTogglePointerActivationRef.current = false;
       return;
     }
-    activatePaneToggle(pane);
-  }
-
-  function paneWidth(pane: PaneSide): number {
-    return pane === "settings" ? leftPaneWidth : rightPanelWidth;
-  }
-
-  function setPaneWidth(pane: PaneSide, width: number): void {
-    if (pane === "settings") {
-      setLeftPaneWidth(clampPaneWidth(width));
-      return;
-    }
-    setRightPanelWidth(clampPaneWidth(width));
-  }
-
-  function maxPaneWidthForResize(pane: PaneSide): number {
-    const otherPaneWidth =
-      pane === "settings" && futureOpen ? rightPanelWidth : pane === "future" && settingsOpen ? leftPaneWidth : 0;
-    const centerMinWidth = window.innerWidth >= 1240 ? 500 : 340;
-    const availableWidth = window.innerWidth - otherPaneWidth - centerMinWidth;
-    return Math.max(minPaneWidth, Math.min(maxPaneWidth, availableWidth));
-  }
-
-  function clampPaneWidthForResize(pane: PaneSide, width: number): number {
-    return Math.max(minPaneWidth, Math.min(maxPaneWidthForResize(pane), Math.round(width)));
-  }
-
-  function flushPendingPaneResize(): void {
-    const pending = pendingPaneResizeRef.current;
-    if (!pending) return;
-    pendingPaneResizeRef.current = null;
-    paneResizeFrameRef.current = null;
-    setPaneWidth(pending.pane, pending.width);
-  }
-
-  function schedulePaneResize(pane: PaneSide, width: number): void {
-    pendingPaneResizeRef.current = { pane, width };
-    if (paneResizeFrameRef.current !== null) return;
-    paneResizeFrameRef.current = window.requestAnimationFrame(flushPendingPaneResize);
-  }
-
-  function finishPaneResize(pane: PaneSide): void {
-    const pending = pendingPaneResizeRef.current;
-    if (paneResizeFrameRef.current !== null) {
-      window.cancelAnimationFrame(paneResizeFrameRef.current);
-      paneResizeFrameRef.current = null;
-    }
-    if (pending?.pane === pane) {
-      pendingPaneResizeRef.current = null;
-      setPaneWidth(pending.pane, pending.width);
-    }
-    setResizingPane(null);
-  }
-
-  function startPaneResize(event: React.PointerEvent<HTMLDivElement>, pane: PaneSide): void {
-    if (event.pointerType === "mouse" && event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-
-    paneResizeCleanupRef.current?.();
-
-    const target = event.currentTarget;
-    const pointerId = event.pointerId;
-    const startX = event.clientX;
-    const startWidth = paneWidth(pane);
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-
-    target.setPointerCapture(pointerId);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    setResizingPane(pane);
-
-    function onMove(moveEvent: PointerEvent): void {
-      const delta = moveEvent.clientX - startX;
-      const nextWidth = pane === "settings" ? startWidth + delta : startWidth - delta;
-      schedulePaneResize(pane, clampPaneWidthForResize(pane, nextWidth));
-    }
-
-    function onEnd(): void {
-      cleanup();
-    }
-
-    function cleanup(): void {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onEnd);
-      window.removeEventListener("pointercancel", onEnd);
-      window.removeEventListener("blur", onEnd);
-      if (target.hasPointerCapture(pointerId)) {
-        target.releasePointerCapture(pointerId);
-      }
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      paneResizeCleanupRef.current = null;
-      finishPaneResize(pane);
-    }
-
-    paneResizeCleanupRef.current = cleanup;
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onEnd);
-    window.addEventListener("pointercancel", onEnd);
-    window.addEventListener("blur", onEnd);
-  }
-
-  function resizePaneWithKeyboard(event: React.KeyboardEvent<HTMLDivElement>, pane: PaneSide): void {
-    const direction = pane === "settings" ? 1 : -1;
-    const step = event.shiftKey ? 48 : 24;
-
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      setPaneWidth(pane, clampPaneWidthForResize(pane, paneWidth(pane) - step * direction));
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      setPaneWidth(pane, clampPaneWidthForResize(pane, paneWidth(pane) + step * direction));
-    }
-  }
-
-  function paneResizer(pane: PaneSide, open: boolean): React.ReactElement {
-    const label = pane === "settings" ? "left" : "right";
-    const maxWidth = maxPaneWidthForResize(pane);
-    const currentWidth = Math.min(paneWidth(pane), maxWidth);
-    return (
-      <div
-        className={`voice-pane-resizer ${label}${resizingPane === pane ? " resizing" : ""}`}
-        role="separator"
-        aria-orientation="vertical"
-        aria-label={`Resize ${label} pane`}
-        aria-valuemin={minPaneWidth}
-        aria-valuemax={maxWidth}
-        aria-valuenow={currentWidth}
-        tabIndex={open ? 0 : -1}
-        onPointerDown={(event) => startPaneResize(event, pane)}
-        onKeyDown={(event) => resizePaneWithKeyboard(event, pane)}
-      />
-    );
+    toggleFuturePane();
   }
 
   return (
     <main
-      className={`voice-home ${settingsOpen ? "settings-open" : ""} ${futureOpen ? "future-open" : ""} ${
+      className={`voice-home ${futureVisible ? "future-open" : ""} ${
         windowChromeState.isFullScreen ? "window-fullscreen" : ""
-      } ${
-        resizingPane ? `pane-resizing pane-resizing-${resizingPane}` : ""
       }`}
       style={{
         ...voiceAccentStyle(orbCustomization),
-        "--settings-pane-resized-width": `${leftPaneWidth}px`,
-        "--right-pane-width": `${rightPanelWidth}px`,
+        "--voice-home-compact-width": `${compactViewportWidth()}px`,
+        "--right-pane-window-delta": `${rightPaneRevealWidth}px`,
       } as React.CSSProperties}
     >
-      <button
-        className="voice-pane-toggle left"
-        type="button"
-        aria-label={settingsOpen ? "Close left pane" : "Open left pane"}
-        aria-expanded={settingsOpen}
-        onPointerDown={handlePaneTogglePointerDown}
-        onPointerUp={(event) => handlePaneTogglePointerUp(event, "settings")}
-        onClick={(event) => handlePaneToggleClick(event, "settings")}
-      >
-        <LeftPaneIcon />
-      </button>
+      <div className="voice-window-drag-region" aria-hidden="true" />
       <button
         className="voice-pane-toggle right"
         type="button"
         aria-label={futureOpen ? "Close right pane" : "Open right pane"}
         aria-expanded={futureOpen}
         onPointerDown={handlePaneTogglePointerDown}
-        onPointerUp={(event) => handlePaneTogglePointerUp(event, "future")}
-        onClick={(event) => handlePaneToggleClick(event, "future")}
+        onPointerUp={handlePaneTogglePointerUp}
+        onClick={handlePaneToggleClick}
       >
         <RightPaneIcon />
       </button>
       <div className="voice-shell">
-        <VoiceSettingsPane
-          open={settingsOpen}
-          state={state}
-          realtimeIssue={realtimeIssue}
-          apiKey={apiKey}
-          archivedCount={archivedCount}
-          voiceConnected={voiceConnected}
-          modelScope={modelScope}
-          effectiveModel={effectiveModel}
-          effectiveEffort={effectiveEffort}
-          effectiveServiceTier={effectiveServiceTier}
-          effectivePermissionMode={effectivePermissionMode}
-          modelOptions={modelOptions}
-          orbPresetId={orbPresetId}
-          orbCustomization={orbCustomization}
-          onOrbPresetChange={setOrbPresetId}
-          onOrbCustomizationChange={setOrbCustomization}
-          onApiKeyChange={setApiKey}
-          onSaveApiKey={saveApiKey}
-          onClearApiKey={clearApiKey}
-          onSelectWorkspace={selectWorkspaceFolder}
-          onAction={onAction}
-          onRefresh={onRefresh}
-          onShowDebug={onShowDebug}
-          onOpenArchived={() => setArchivedOpen(true)}
-          onToggleVoice={onToggleVoice}
-          onRestartVoice={onRestartVoice}
-          resizer={paneResizer("settings", settingsOpen)}
-        />
-
         <div className="voice-home-content">
         <header className="voice-home-header">
           <h1>Codex Voice</h1>
         </header>
 
         <div className="voice-home-scroll">
+          <section className="voice-model-picker" aria-label="Model settings">
+            <button
+              className="voice-model-trigger"
+              aria-expanded={modelOpen}
+              onClick={() => setModelOpen((current) => !current)}
+            >
+              {fastModeOn && <LightningIcon />}
+              <span className="voice-model-trigger-name">{formatModelName(effectiveModel)}</span>
+              <span className="voice-model-trigger-separator" aria-hidden="true">·</span>
+              <span className="voice-model-trigger-effort">{formatEffort(effectiveEffort)}</span>
+              <DownIcon />
+            </button>
+
+            {modelOpen && (
+              <div className="voice-model-panel">
+                <label className="voice-model-field">
+                  Model
+                  <span className="voice-model-select-wrap">
+                    <select
+                      value={effectiveModel}
+                      onChange={(event) => {
+                        const model = event.target.value || null;
+                        const nextModel = modelOptions.find((candidate) => candidate.model === model) ?? null;
+                        const serviceTier =
+                          model && !supportsFastMode(nextModel) ? DEFAULT_CODEX_SERVICE_TIER : effectiveServiceTier;
+                        void onAction(() =>
+                          window.codexVoice.setCodexSettings({ model, serviceTier }, modelScope),
+                        );
+                      }}
+                    >
+                      {modelOptions.length === 0 && (
+                        <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
+                      )}
+                      {modelOptions.map((model) => (
+                        <option key={model.id} value={model.model}>
+                          {model.displayName || formatModelName(model.model)}
+                        </option>
+                      ))}
+                    </select>
+                    <DownIcon />
+                  </span>
+                </label>
+
+                <div className="voice-effort-list">
+                  <span>Reasoning effort</span>
+                  {(["low", "medium", "high", "xhigh"] as ReasoningEffort[]).map((effort) => (
+                    <button
+                      key={effort}
+                      className={effort === effectiveEffort ? "selected" : ""}
+                      onClick={() =>
+                        void onAction(() =>
+                          window.codexVoice.setCodexSettings({ reasoningEffort: effort }, modelScope),
+                        )
+                      }
+                    >
+                      {formatEffort(effort)}
+                      {effort === effectiveEffort && <CheckIcon />}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="voice-speed-list">
+                  <span>Speed</span>
+                  <button
+                    className={!fastModeOn ? "selected" : ""}
+                    onClick={() =>
+                      void onAction(() =>
+                        window.codexVoice.setCodexSettings({ serviceTier: DEFAULT_CODEX_SERVICE_TIER }, modelScope),
+                      )
+                    }
+                  >
+                    <span>
+                      Standard
+                      <small>Default speed, normal usage</small>
+                    </span>
+                    {!fastModeOn && <CheckIcon />}
+                  </button>
+                  <button
+                    className={fastModeOn ? "selected" : ""}
+                    disabled={!modelSupportsFast}
+                    onClick={() =>
+                      void onAction(() =>
+                        window.codexVoice.setCodexSettings({ serviceTier: FAST_CODEX_SERVICE_TIER }, modelScope),
+                      )
+                    }
+                  >
+                    <span>
+                      Fast
+                      <small>{modelSupportsFast ? "1.5x speed, increased usage" : "Not available for this model"}</small>
+                    </span>
+                    {fastModeOn && <CheckIcon />}
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+
           <section className="voice-hero" aria-label="Voice status">
             <button
-              className={`voice-orb ${voiceState.tone} ${orbPresetId}`}
+              className={`voice-orb ${voiceState.tone}`}
               aria-label={voiceOrbLabel}
               onClick={handleVoiceOrbClick}
             >
               <VoiceOrbCanvas
                 tone={voiceState.tone}
                 outputLevel={voiceOutputLevel}
-                presetId={orbPresetId}
                 customization={orbCustomization}
               />
               <span className="voice-orb-shine" />
@@ -1505,16 +1348,36 @@ function VoiceHome({
         </div>
 
         <RightPanel
-          open={futureOpen}
+          open={futureVisible}
           state={state}
           events={events}
-          width={rightPanelWidth}
           activateTranscriptRequest={transcriptActivationRequest}
-          onWidthChange={setRightPanelWidth}
-          onClose={() => setFutureOpen(false)}
+          onClose={closeFuturePane}
           onAction={onAction}
         />
       </div>
+
+      <VoiceSettingsPane
+        open={settingsOpen}
+        state={state}
+        realtimeIssue={realtimeIssue}
+        apiKey={apiKey}
+        archivedCount={archivedCount}
+        voiceConnected={voiceConnected}
+        orbCustomization={orbCustomization}
+        onOrbCustomizationChange={setOrbCustomization}
+        onApiKeyChange={setApiKey}
+        onSaveApiKey={saveApiKey}
+        onClearApiKey={clearApiKey}
+        onSelectWorkspace={selectWorkspaceFolder}
+        onAction={onAction}
+        onRefresh={onRefresh}
+        onShowDebug={onShowDebug}
+        onOpenArchived={() => setArchivedOpen(true)}
+        onToggleVoice={onToggleVoice}
+        onRestartVoice={onRestartVoice}
+        onClose={() => setSettingsOpen(false)}
+      />
 
       {newOpen && (
         <div className="voice-modal-backdrop" role="presentation">
@@ -1648,23 +1511,6 @@ function VoiceHome({
         </div>
       )}
 
-      {onboardingOpen && (
-        <OnboardingFlow
-          state={state}
-          realtimeIssue={realtimeIssue}
-          apiKey={apiKey}
-          orbPresetId={orbPresetId}
-          orbCustomization={orbCustomization}
-          onApiKeyChange={setApiKey}
-          onSaveApiKey={saveOnboardingApiKey}
-          onVoiceChange={changeRealtimeVoice}
-          onOrbPresetChange={setOrbPresetId}
-          onOrbCustomizationChange={setOrbCustomization}
-          onStartProject={(mode) => void startOnboardingProject(mode)}
-          onClose={completeOnboarding}
-        />
-      )}
-
       {apiKeyDialogMode && (
         <ApiKeyDialog
           mode={apiKeyDialogMode}
@@ -1704,15 +1550,7 @@ function VoiceSettingsPane({
   apiKey,
   archivedCount,
   voiceConnected,
-  modelScope,
-  effectiveModel,
-  effectiveEffort,
-  effectiveServiceTier,
-  effectivePermissionMode,
-  modelOptions,
-  orbPresetId,
   orbCustomization,
-  onOrbPresetChange,
   onOrbCustomizationChange,
   onApiKeyChange,
   onSaveApiKey,
@@ -1724,7 +1562,7 @@ function VoiceSettingsPane({
   onOpenArchived,
   onToggleVoice,
   onRestartVoice,
-  resizer,
+  onClose,
 }: {
   open: boolean;
   state: AppState;
@@ -1732,15 +1570,7 @@ function VoiceSettingsPane({
   apiKey: string;
   archivedCount: number;
   voiceConnected: boolean;
-  modelScope: "chat" | "nextTurn";
-  effectiveModel: string;
-  effectiveEffort: ReasoningEffort;
-  effectiveServiceTier: CodexServiceTier | null;
-  effectivePermissionMode: CodexPermissionMode;
-  modelOptions: CodexModelSummary[];
-  orbPresetId: VoiceOrbPresetId;
   orbCustomization: VoiceOrbCustomization;
-  onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
   onOrbCustomizationChange: (customization: VoiceOrbCustomization) => void;
   onApiKeyChange: (value: string) => void;
   onSaveApiKey: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
@@ -1752,9 +1582,9 @@ function VoiceSettingsPane({
   onOpenArchived: () => void;
   onToggleVoice: () => Promise<void>;
   onRestartVoice: () => Promise<void>;
-  resizer?: React.ReactNode;
+  onClose: () => void;
 }): React.ReactElement {
-  const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("appearance");
+  const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("general");
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const activeProject = state.activeProject;
   const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
@@ -1765,15 +1595,16 @@ function VoiceSettingsPane({
   const realtimeSupportsReasoning = state.realtime.model === "gpt-realtime-2";
   const selectedRealtimeReasoningEffort =
     state.realtime.reasoningEffort ?? DEFAULT_REALTIME_REASONING_EFFORT;
-  const selectedCodexModel = modelOptions.find((model) => model.model === effectiveModel) ?? null;
-  const modelSupportsFast = supportsFastMode(selectedCodexModel);
-  const fastModeOn = isFastServiceTier(effectiveServiceTier);
   const tabs: Array<{ id: VoiceSettingsTab; label: string; icon: React.ReactElement }> = [
     { id: "general", label: "General", icon: <ConfigIcon /> },
     { id: "appearance", label: "Appearance", icon: <AppearanceIcon /> },
-    { id: "configuration", label: "Configuration", icon: <PermissionIcon mode={effectivePermissionMode} /> },
+    { id: "configuration", label: "Configuration", icon: <WaveformIcon /> },
     { id: "archive", label: archivedCount > 0 ? `Archive (${archivedCount})` : "Archive", icon: <ArchiveIcon /> },
   ];
+
+  useEffect(() => {
+    if (open) setActiveTab("general");
+  }, [open]);
 
   async function changeRealtimeModel(model: RealtimeModelId): Promise<void> {
     let updated = false;
@@ -1816,10 +1647,12 @@ function VoiceSettingsPane({
 
   return (
     <aside className="voice-settings-pane" aria-hidden={!open} inert={!open} aria-label="Settings">
-      {resizer}
       <div className="voice-settings-inner">
         <header className="voice-settings-header">
           <h2>Controls</h2>
+          <button type="button" aria-label="Close settings" onClick={onClose}>
+            <CloseIcon />
+          </button>
         </header>
 
         <nav className="voice-settings-nav" aria-label="Control sections" role="tablist">
@@ -1938,209 +1771,82 @@ function VoiceSettingsPane({
           {activeTab === "appearance" && (
             <section className="voice-settings-section">
               <h3>Orb</h3>
-              <VoiceOrbPresetPicker
-                value={orbPresetId}
-                customization={orbCustomization}
-                onChange={onOrbPresetChange}
-                onCustomizationChange={onOrbCustomizationChange}
-              />
+              <VoiceOrbColorPicker customization={orbCustomization} onCustomizationChange={onOrbCustomizationChange} />
             </section>
           )}
 
           {activeTab === "configuration" && (
-            <>
-              <section className="voice-settings-section">
-                <h3>Realtime voice</h3>
-                <div className="voice-settings-card">
-                  <label className="voice-settings-field">
-                    Model
-                    <span className="voice-settings-select-wrap">
-                      <select
-                        value={state.realtime.model}
-                        onChange={(event) => void changeRealtimeModel(event.target.value as RealtimeModelId)}
-                      >
-                        {REALTIME_MODEL_OPTIONS.map((model) => (
-                          <option key={model.model} value={model.model}>
-                            {model.displayName}
-                          </option>
-                        ))}
-                      </select>
-                      <DownIcon />
-                    </span>
-                  </label>
-
-                  <div className={`realtime-reasoning-panel ${realtimeSupportsReasoning ? "" : "disabled"}`}>
-                    <div className="realtime-reasoning-header">
-                      <span>
-                        <strong>Reasoning</strong>
-                        <small>
-                          {realtimeSupportsReasoning
-                            ? formatEffort(selectedRealtimeReasoningEffort)
-                            : "Off on Realtime 1.5"}
-                        </small>
-                      </span>
-                      <span className="realtime-reasoning-badge">
-                        {realtimeSupportsReasoning ? "2.0" : "1.5"}
-                      </span>
-                    </div>
-                    <div className="voice-settings-segmented realtime-reasoning" aria-label="Realtime reasoning effort">
-                      {REALTIME_REASONING_EFFORT_OPTIONS.map((effort) => (
-                        <button
-                          key={effort}
-                          type="button"
-                          className={
-                            realtimeSupportsReasoning && effort === selectedRealtimeReasoningEffort
-                              ? "selected"
-                              : ""
-                          }
-                          disabled={!realtimeSupportsReasoning}
-                          onClick={() => void changeRealtimeReasoningEffort(effort)}
-                        >
-                          {formatEffort(effort)}
-                        </button>
+            <section className="voice-settings-section">
+              <h3>Realtime voice</h3>
+              <div className="voice-settings-card">
+                <label className="voice-settings-field">
+                  Model
+                  <span className="voice-settings-select-wrap">
+                    <select
+                      value={state.realtime.model}
+                      onChange={(event) => void changeRealtimeModel(event.target.value as RealtimeModelId)}
+                    >
+                      {REALTIME_MODEL_OPTIONS.map((model) => (
+                        <option key={model.model} value={model.model}>
+                          {model.displayName}
+                        </option>
                       ))}
-                    </div>
+                    </select>
+                    <DownIcon />
+                  </span>
+                </label>
+
+                <div className={`realtime-reasoning-panel ${realtimeSupportsReasoning ? "" : "disabled"}`}>
+                  <div className="realtime-reasoning-header">
+                    <span>
+                      <strong>Reasoning</strong>
+                      <small>
+                        {realtimeSupportsReasoning
+                          ? formatEffort(selectedRealtimeReasoningEffort)
+                          : "Off on Realtime 1.5"}
+                      </small>
+                    </span>
+                    <span className="realtime-reasoning-badge">
+                      {realtimeSupportsReasoning ? "2.0" : "1.5"}
+                    </span>
                   </div>
-
-                  <label className="voice-settings-field">
-                    Voice
-                    <span className="voice-settings-select-wrap">
-                      <select
-                        value={state.realtime.voice}
-                        onChange={(event) => void changeRealtimeVoice(event.target.value as RealtimeVoiceId)}
-                      >
-                        {REALTIME_VOICE_OPTIONS.map((voice) => (
-                          <option key={voice.voice} value={voice.voice}>
-                            {voice.displayName}
-                          </option>
-                        ))}
-                      </select>
-                      <DownIcon />
-                    </span>
-                  </label>
-                </div>
-              </section>
-
-              <section className="voice-settings-section">
-                <h3>Codex model</h3>
-                <div className="voice-settings-card">
-                  <label className="voice-settings-field">
-                    Model
-                    <span className="voice-settings-select-wrap">
-                      <select
-                        value={effectiveModel}
-                        onChange={(event) => {
-                          const model = event.target.value || null;
-                          const nextModel = modelOptions.find((candidate) => candidate.model === model) ?? null;
-                          const serviceTier =
-                            model && !supportsFastMode(nextModel) ? DEFAULT_CODEX_SERVICE_TIER : effectiveServiceTier;
-                          void onAction(() =>
-                            window.codexVoice.setCodexSettings({ model, serviceTier }, modelScope),
-                          );
-                        }}
-                      >
-                        {modelOptions.length === 0 && (
-                          <option value={effectiveModel}>{formatModelName(effectiveModel)}</option>
-                        )}
-                        {modelOptions.map((model) => (
-                          <option key={model.id} value={model.model}>
-                            {model.displayName || formatModelName(model.model)}
-                          </option>
-                        ))}
-                      </select>
-                      <DownIcon />
-                    </span>
-                  </label>
-
-                  <div className="voice-settings-segmented" aria-label="Reasoning effort">
-                    {(["low", "medium", "high", "xhigh"] as ReasoningEffort[]).map((effort) => (
+                  <div className="voice-settings-segmented realtime-reasoning" aria-label="Realtime reasoning effort">
+                    {REALTIME_REASONING_EFFORT_OPTIONS.map((effort) => (
                       <button
                         key={effort}
                         type="button"
-                        className={effort === effectiveEffort ? "selected" : ""}
-                        onClick={() =>
-                          void onAction(() =>
-                            window.codexVoice.setCodexSettings({ reasoningEffort: effort }, modelScope),
-                          )
+                        className={
+                          realtimeSupportsReasoning && effort === selectedRealtimeReasoningEffort
+                            ? "selected"
+                            : ""
                         }
+                        disabled={!realtimeSupportsReasoning}
+                        onClick={() => void changeRealtimeReasoningEffort(effort)}
                       >
                         {formatEffort(effort)}
                       </button>
                     ))}
                   </div>
-
-                  <div className="voice-settings-speed">
-                    <div className="voice-settings-speed-header">
-                      <span>
-                        <strong>Speed</strong>
-                        <small>{fastModeOn ? "Fast mode" : "Standard speed"}</small>
-                      </span>
-                    </div>
-                    <div className="voice-settings-segmented codex-speed" aria-label="Codex speed">
-                      <button
-                        type="button"
-                        className={!fastModeOn ? "selected" : ""}
-                        onClick={() =>
-                          void onAction(() =>
-                            window.codexVoice.setCodexSettings(
-                              { serviceTier: DEFAULT_CODEX_SERVICE_TIER },
-                              modelScope,
-                            ),
-                          )
-                        }
-                      >
-                        Standard
-                      </button>
-                      <button
-                        type="button"
-                        className={fastModeOn ? "selected" : ""}
-                        disabled={!modelSupportsFast}
-                        title={modelSupportsFast ? "Use Fast mode" : "Fast mode is not reported for this model"}
-                        onClick={() =>
-                          void onAction(() =>
-                            window.codexVoice.setCodexSettings(
-                              { serviceTier: FAST_CODEX_SERVICE_TIER },
-                              modelScope,
-                            ),
-                          )
-                        }
-                      >
-                        Fast
-                      </button>
-                    </div>
-                  </div>
                 </div>
-              </section>
 
-              <section className="voice-settings-section">
-                <h3>Permissions</h3>
-                <div className="voice-settings-card permission-settings-card">
-                  <div className="voice-settings-permission-note">
-                    <strong>Direct voice tools run in this workspace</strong>
-                    <small>{workspace}</small>
-                  </div>
-                  {CODEX_PERMISSION_PROFILES.map((profile) => (
-                    <button
-                      key={profile.mode}
-                      type="button"
-                      className={`voice-settings-permission ${profile.mode === effectivePermissionMode ? "selected" : ""}`}
-                      onClick={() =>
-                        void onAction(() =>
-                          window.codexVoice.setCodexSettings({ permissionMode: profile.mode }, modelScope),
-                        )
-                      }
+                <label className="voice-settings-field">
+                  Voice
+                  <span className="voice-settings-select-wrap">
+                    <select
+                      value={state.realtime.voice}
+                      onChange={(event) => void changeRealtimeVoice(event.target.value as RealtimeVoiceId)}
                     >
-                      <PermissionIcon mode={profile.mode} />
-                      <span>
-                        <strong>{profile.displayName}</strong>
-                        <small>{profile.description}</small>
-                      </span>
-                      {profile.mode === effectivePermissionMode && <CheckIcon />}
-                    </button>
-                  ))}
-                </div>
-              </section>
-            </>
+                      {REALTIME_VOICE_OPTIONS.map((voice) => (
+                        <option key={voice.voice} value={voice.voice}>
+                          {voice.displayName}
+                        </option>
+                      ))}
+                    </select>
+                    <DownIcon />
+                  </span>
+                </label>
+              </div>
+            </section>
           )}
 
           {activeTab === "archive" && (
@@ -2163,488 +1869,49 @@ function VoiceSettingsPane({
   );
 }
 
-function VoiceOrbPresetPicker({
-  value,
+function VoiceOrbColorPicker({
   customization,
-  onChange,
   onCustomizationChange,
-  showCustomization = true,
 }: {
-  value: VoiceOrbPresetId;
   customization: VoiceOrbCustomization;
-  onChange: (presetId: VoiceOrbPresetId) => void;
   onCustomizationChange: (customization: VoiceOrbCustomization) => void;
-  showCustomization?: boolean;
 }): React.ReactElement {
-  const selectedPreset = voiceOrbPresetById(value);
-  const selectedIndex = Math.max(0, voiceOrbPresets.findIndex((preset) => preset.id === value));
-
-  function selectOffset(offset: number): void {
-    onChange(voiceOrbPresetAtOffset(value, offset));
-  }
-
-  function updateCustomization(patch: Partial<VoiceOrbCustomization>): void {
-    onCustomizationChange(normalizeVoiceOrbCustomization({ ...customization, ...patch }));
-  }
-
-  function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>): void {
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      selectOffset(-1);
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      selectOffset(1);
-    }
-  }
-
-  function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
-    if (Math.abs(event.deltaX) < 12 && Math.abs(event.deltaY) < 18) return;
-    event.preventDefault();
-    selectOffset(event.deltaX + event.deltaY > 0 ? 1 : -1);
+  function selectColor(accentColor: string): void {
+    onCustomizationChange(normalizeVoiceOrbCustomization({ ...customization, accentColor }));
   }
 
   return (
     <div className="voice-settings-card voice-orb-picker-card">
-      <div className="voice-orb-preset-tabs" role="tablist" aria-label="Orb presets">
-        {voiceOrbPresets.map((preset) => (
-          <button
-            key={preset.id}
-            type="button"
-            className={preset.id === value ? "selected" : ""}
-            role="tab"
-            aria-selected={preset.id === value}
-            onClick={() => onChange(preset.id)}
-          >
-            {preset.name}
-          </button>
-        ))}
-      </div>
-
-      <div
-        className="voice-orb-carousel"
-        tabIndex={0}
-        role="tabpanel"
-        aria-label={`${selectedPreset.name} orb preview, ${selectedIndex + 1} of ${voiceOrbPresets.length}`}
-        onKeyDown={handleKeyDown}
-        onWheel={handleWheel}
-      >
+      <div className="voice-orb-carousel" aria-label="Orb preview">
         <div className="voice-orb-carousel-center">
-          <div className={`voice-orb-carousel-preview ${selectedPreset.id}`}>
-            <VoiceOrbCanvas
-              tone="listening"
-              outputLevel={selectedPreset.previewLevel}
-              presetId={selectedPreset.id}
-              customization={customization}
-              preview
-            />
+          <div className="voice-orb-carousel-preview">
+            <VoiceOrbCanvas tone="listening" outputLevel={0.32} customization={customization} preview />
           </div>
           <div className="voice-orb-carousel-label">
-            <strong>{selectedPreset.name}</strong>
-            <small>{selectedPreset.detail}</small>
+            <strong>Aurora</strong>
+            <small>Color only</small>
           </div>
         </div>
       </div>
 
-      {showCustomization && (
-        <div className="voice-orb-customizer" aria-label="Orb customization">
-          <div className="voice-orb-control-row">
-            <span className="voice-orb-control-label">Color</span>
-            <div className="voice-orb-color-controls">
-              <div className="voice-orb-swatches" aria-label="Orb colors">
-                {voiceOrbColorOptions.map((option) => (
-                  <button
-                    key={option.color}
-                    type="button"
-                    className={option.color.toLowerCase() === customization.accentColor.toLowerCase() ? "selected" : ""}
-                    style={{ backgroundColor: option.color }}
-                    aria-label={option.label}
-                    onClick={() => updateCustomization({ accentColor: option.color })}
-                  />
-                ))}
-              </div>
-              <label className="voice-orb-color-picker" aria-label="Custom orb color">
-                <input
-                  type="color"
-                  value={customization.accentColor}
-                  onChange={(event) => updateCustomization({ accentColor: event.target.value })}
-                />
-              </label>
-            </div>
-          </div>
-
-          <div className="voice-orb-slider-grid">
-            <VoiceOrbSlider
-              label="Glow"
-              value={customization.glow}
-              onChange={(glow) => updateCustomization({ glow })}
-            />
-            <VoiceOrbSlider
-              label="Reactivity"
-              value={customization.reactivity}
-              onChange={(reactivity) => updateCustomization({ reactivity })}
-            />
-            <VoiceOrbSlider
-              label="Wave height"
-              value={customization.waveHeight}
-              onChange={(waveHeight) => updateCustomization({ waveHeight })}
-            />
-          </div>
-
-          <button
-            type="button"
-            className="voice-orb-reset-button"
-            onClick={() => onCustomizationChange(defaultVoiceOrbCustomization)}
-          >
-            <RefreshIcon />
-            <span>Reset</span>
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function VoiceOrbSlider({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  onChange: (value: number) => void;
-}): React.ReactElement {
-  return (
-    <label className="voice-orb-slider">
-      <span>{label}</span>
-      <input
-        type="range"
-        min={0}
-        max={100}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-      />
-    </label>
-  );
-}
-
-const onboardingStepOrder: OnboardingStep[] = ["key", "voice", "orb", "project"];
-
-function OnboardingFlow({
-  state,
-  realtimeIssue,
-  apiKey,
-  orbPresetId,
-  orbCustomization,
-  onApiKeyChange,
-  onSaveApiKey,
-  onVoiceChange,
-  onOrbPresetChange,
-  onOrbCustomizationChange,
-  onStartProject,
-  onClose,
-}: {
-  state: AppState;
-  realtimeIssue: string | null;
-  apiKey: string;
-  orbPresetId: VoiceOrbPresetId;
-  orbCustomization: VoiceOrbCustomization;
-  onApiKeyChange: (value: string) => void;
-  onSaveApiKey: () => Promise<void>;
-  onVoiceChange: (voice: RealtimeVoiceId) => Promise<void>;
-  onOrbPresetChange: (presetId: VoiceOrbPresetId) => void;
-  onOrbCustomizationChange: (customization: VoiceOrbCustomization) => void;
-  onStartProject: (mode: "scratch" | "folder") => void;
-  onClose: () => void;
-}): React.ReactElement {
-  const initialStep = state.realtime.available ? "voice" : "key";
-  const [step, setStep] = useState<OnboardingStep>(initialStep);
-  const [revealed, setRevealed] = useState(false);
-  const health = realtimeHealth(state.realtime, realtimeIssue);
-  const hasApiKey = Boolean(apiKey.trim());
-  const apiKeyManagedByEnvironment = state.realtime.apiKeySource === "environment";
-  const selectedVoice = realtimeVoiceOption(state.realtime.voice);
-  const selectedOrb = voiceOrbPresetById(orbPresetId);
-  const hasProject = state.projects.length > 0;
-  const stepIndex = onboardingStepOrder.indexOf(step);
-  const canGoBack = stepIndex > 0;
-  const isLastStep = step === "project";
-
-  const stepMeta: Array<{
-    id: OnboardingStep;
-    label: string;
-    complete: boolean;
-  }> = [
-    { id: "key", label: "Key", complete: state.realtime.available },
-    { id: "voice", label: "Voice", complete: true },
-    { id: "orb", label: "Orb", complete: true },
-    { id: "project", label: "Project", complete: hasProject },
-  ];
-
-  async function saveKeyAndContinue(): Promise<void> {
-    if (hasApiKey) {
-      await onSaveApiKey();
-      setStep("voice");
-      return;
-    }
-    if (state.realtime.available) {
-      setStep("voice");
-      return;
-    }
-  }
-
-  async function goNext(): Promise<void> {
-    if (step === "key") {
-      await saveKeyAndContinue();
-      return;
-    }
-    if (isLastStep) {
-      onClose();
-      return;
-    }
-    setStep(onboardingStepOrder[Math.min(onboardingStepOrder.length - 1, stepIndex + 1)]);
-  }
-
-  function goBack(): void {
-    if (!canGoBack) return;
-    setStep(onboardingStepOrder[stepIndex - 1]);
-  }
-
-  function startProject(mode: "scratch" | "folder"): void {
-    onStartProject(mode);
-  }
-
-  return (
-    <div className="voice-modal-backdrop api-key-backdrop onboarding-backdrop" role="presentation">
-      <section className="voice-dialog api-key-dialog onboarding-dialog" aria-label="Codex Voice onboarding">
-        <div className="api-key-visual onboarding-visual">
-          <div className="onboarding-progress">
-            {stepMeta.map((item) => (
+      <div className="voice-orb-customizer" aria-label="Orb color">
+        <div className="voice-orb-control-row">
+          <span className="voice-orb-control-label">Color</span>
+          <div className="voice-orb-swatches" aria-label="Orb colors">
+            {voiceOrbColorOptions.map((option) => (
               <button
-                key={item.id}
+                key={option.color}
                 type="button"
-                className={[
-                  item.id,
-                  item.id === step ? "selected" : "",
-                  item.complete ? "complete" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                aria-label={`Go to ${item.label}`}
-                aria-current={item.id === step ? "step" : undefined}
-                title={item.label}
-                onClick={() => setStep(item.id)}
-              >
-                <span className="onboarding-progress-mark" />
-              </button>
+                className={option.color.toLowerCase() === customization.accentColor.toLowerCase() ? "selected" : ""}
+                style={{ backgroundColor: option.color }}
+                aria-label={option.label}
+                onClick={() => selectColor(option.color)}
+              />
             ))}
           </div>
-          <div className={`onboarding-hero-icon ${step}`} aria-hidden="true">
-            <OnboardingStepIcon step={step} orbPresetId={orbPresetId} orbCustomization={orbCustomization} />
-          </div>
         </div>
-
-        <div className="onboarding-track-window">
-          <div className="onboarding-track" style={{ transform: `translateX(-${stepIndex * 100}%)` }}>
-            <article className="onboarding-card">
-              <div className="onboarding-card-header">
-                <div className="api-key-title-row">
-                  <h2>OpenAI API key</h2>
-                  <span
-                    className={`api-key-status ${health.ok ? "ready" : "broken"}`}
-                    tabIndex={health.ok ? undefined : 0}
-                    aria-label={health.ok ? "Realtime API key is ready" : health.message}
-                    title={health.ok ? "Realtime API key is ready" : undefined}
-                  >
-                    {!health.ok && <span className="api-key-health-popover">{health.message}</span>}
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  className="api-key-info-button"
-                  aria-label="API key storage details"
-                  title="Storage details"
-                >
-                  <InfoIcon />
-                  <span className="api-key-info-popover" role="status">
-                    Main creates Realtime client secrets. Saved keys are not sent back to this window.
-                  </span>
-                </button>
-              </div>
-
-              <div className="voice-field api-key-field">
-                <div className="api-key-input-wrap">
-                  <input
-                    id="openai-api-key-onboarding-input"
-                    aria-label="OpenAI API key"
-                    autoFocus
-                    type={revealed ? "text" : "password"}
-                    value={apiKey}
-                    onChange={(event) => onApiKeyChange(event.target.value)}
-                    placeholder={apiKeyInputPlaceholder(state.realtime)}
-                    disabled={apiKeyManagedByEnvironment}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                  <div className="api-key-input-actions">
-                    <button
-                      type="button"
-                      aria-label={revealed ? "Hide API key" : "Reveal API key"}
-                      title={revealed ? "Hide key" : "Reveal key"}
-                      disabled={!hasApiKey}
-                      onClick={() => setRevealed((current) => !current)}
-                    >
-                      {revealed ? <EyeOffIcon /> : <EyeIcon />}
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-            </article>
-
-            <article className="onboarding-card">
-              <div className="onboarding-card-header">
-                <div>
-                  <h2>Choose a voice</h2>
-                  <p>{selectedVoice.displayName} is selected.</p>
-                </div>
-              </div>
-
-              <div className="onboarding-voice-grid" aria-label="Realtime voice">
-                {REALTIME_VOICE_OPTIONS.map((option) => (
-                  <button
-                    key={option.voice}
-                    type="button"
-                    className={option.voice === state.realtime.voice ? "selected" : ""}
-                    onClick={() => void onVoiceChange(option.voice)}
-                  >
-                    <strong>{option.displayName}</strong>
-                    <small>{option.description}</small>
-                  </button>
-                ))}
-              </div>
-            </article>
-
-            <article className="onboarding-card onboarding-orb-card">
-              <div className="onboarding-card-header">
-                <div>
-                  <h2>Pick an orb</h2>
-                  <p>{selectedOrb.name} is selected.</p>
-                </div>
-              </div>
-              <VoiceOrbPresetPicker
-                value={orbPresetId}
-                customization={orbCustomization}
-                onChange={onOrbPresetChange}
-                onCustomizationChange={onOrbCustomizationChange}
-                showCustomization={false}
-              />
-            </article>
-
-            <article className="onboarding-card onboarding-project-card">
-              <div className="onboarding-card-header">
-                <div>
-                  <h2>Start your first project</h2>
-                  <p>{hasProject ? "Project ready." : "Create a clean space or attach a folder."}</p>
-                </div>
-              </div>
-
-              <div className="onboarding-project-stage">
-                <div className="onboarding-project-menu-wrap">
-                  <div className="onboarding-project-menu" role="menu">
-                    <button type="button" role="menuitem" onClick={() => startProject("scratch")}>
-                      <PlusIcon />
-                      <span>Start from scratch</span>
-                    </button>
-                    <button type="button" role="menuitem" onClick={() => startProject("folder")}>
-                      <FolderIcon />
-                      <span>Use an existing folder</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </article>
-          </div>
-        </div>
-
-        <div className="onboarding-actions">
-          <button type="button" onClick={onClose}>
-            Later
-          </button>
-          <div>
-            <button type="button" disabled={!canGoBack} onClick={goBack}>
-              Back
-            </button>
-            <button
-              type="button"
-              className="voice-primary"
-              disabled={step === "key" && !state.realtime.available && !hasApiKey}
-              onClick={() => void goNext()}
-            >
-              {isLastStep ? "Done" : "Next"}
-            </button>
-          </div>
-        </div>
-      </section>
+      </div>
     </div>
-  );
-}
-
-function OnboardingStepIcon({
-  step,
-  orbPresetId,
-  orbCustomization,
-}: {
-  step: OnboardingStep;
-  orbPresetId: VoiceOrbPresetId;
-  orbCustomization: VoiceOrbCustomization;
-}): React.ReactElement {
-  if (step === "key") return <OnboardingKeyIcon />;
-  if (step === "voice") return <OnboardingVoiceIcon />;
-  if (step === "orb") {
-    return (
-      <span className="onboarding-mini-orb" aria-hidden="true">
-        <VoiceOrbCanvas
-          tone="listening"
-          outputLevel={0.42}
-          presetId={orbPresetId}
-          customization={orbCustomization}
-          preview
-        />
-      </span>
-    );
-  }
-  return <OnboardingFolderIcon />;
-}
-
-function OnboardingKeyIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="onboarding-key-icon">
-      <circle cx="8.1" cy="12" r="3.15" />
-      <path className="key-shaft" d="M11.25 12h8" />
-      <path className="key-tooth" d="M16.8 12v2.65M19.25 12v2.15" />
-    </svg>
-  );
-}
-
-function OnboardingVoiceIcon(): React.ReactElement {
-  return (
-    <span className="onboarding-wave-icon" aria-hidden="true">
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-    </span>
-  );
-}
-
-function OnboardingFolderIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="onboarding-folder-icon">
-      <path className="folder-back" d="M3.75 8.1a2 2 0 0 1 2-2h4.08l1.78 1.95h6.64a2 2 0 0 1 2 2v7.1a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V8.1Z" />
-      <path className="folder-lid" d="M3.75 9.75h6.08l1.78-1.7h6.64a2 2 0 0 1 2 2v.9H3.75V9.75Z" />
-      <path className="folder-front" d="M3.75 10.85h16.5l-1.28 6.52a2 2 0 0 1-1.96 1.62H5.72a2 2 0 0 1-1.96-1.62L3.75 10.85Z" />
-    </svg>
   );
 }
 
@@ -2655,20 +1922,17 @@ function StatusDot({ ready }: { ready: boolean }): React.ReactElement {
 function VoiceOrbCanvas({
   tone,
   outputLevel,
-  presetId,
   customization = defaultVoiceOrbCustomization,
   preview = false,
 }: {
   tone: VoiceTone;
   outputLevel: number;
-  presetId: VoiceOrbPresetId;
   customization?: VoiceOrbCustomization;
   preview?: boolean;
 }): React.ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const toneRef = useRef(tone);
   const outputLevelRef = useRef(outputLevel);
-  const presetIdRef = useRef(presetId);
   const customizationRef = useRef(customization);
 
   useEffect(() => {
@@ -2678,10 +1942,6 @@ function VoiceOrbCanvas({
   useEffect(() => {
     outputLevelRef.current = outputLevel;
   }, [outputLevel]);
-
-  useEffect(() => {
-    presetIdRef.current = presetId;
-  }, [presetId]);
 
   useEffect(() => {
     customizationRef.current = customization;
@@ -2712,7 +1972,6 @@ function VoiceOrbCanvas({
         return;
       }
 
-      const preset = voiceOrbPresetById(presetIdRef.current);
       const orbCustomization = customizationRef.current;
       const reactivityScale = 0.55 + orbCustomization.reactivity / 100;
       const waveScale = 0.58 + orbCustomization.waveHeight / 100;
@@ -2737,12 +1996,12 @@ function VoiceOrbCanvas({
 
       context.clearRect(0, 0, width, height);
       context.save();
-      clipOrbShapePath(context, width, height, preset.shape);
+      clipOrbShapePath(context, width, height);
 
-      drawOrbPresetBase(context, width, height, preset.id, renderedLevel, cloudPhase);
+      drawOrbPresetBase(context, width, height, renderedLevel, cloudPhase);
       drawOrbTint(context, width, height, orbCustomization.accentColor, renderedLevel);
-      drawOrbClouds(context, width, height, renderedLevel, cloudPhase, hovering, preset.id);
-      const palette = orbWavePalette(preset.id, orbCustomization.accentColor);
+      drawOrbClouds(context, width, height, renderedLevel, cloudPhase, hovering);
+      const palette = orbWavePalette(orbCustomization.accentColor);
 
       drawOrbWaveLayer(context, width, height, {
         baseline: height * (0.72 - renderedLevel * 0.18),
@@ -2786,7 +2045,7 @@ function VoiceOrbCanvas({
       });
 
       context.restore();
-      drawOrbPresetEdge(context, width, height, preset.shape, preset.id, renderedLevel, orbCustomization);
+      drawOrbPresetEdge(context, width, height, orbCustomization);
       animationFrame = window.requestAnimationFrame(draw);
     };
 
@@ -2815,65 +2074,11 @@ function beginSphereShapePath(
   context.arc(width / 2, height / 2, Math.min(width, height) / 2 - 1, 0, Math.PI * 2);
 }
 
-function getIconCloudPath(): Path2D {
-  iconCloudPath ??= new Path2D(iconCloudPathData);
-  return iconCloudPath;
-}
-
-function iconCloudFitRect(width: number, height: number): { x: number; y: number; width: number; height: number } {
-  const inset = Math.max(3, Math.min(width, height) * 0.04);
-  const availableWidth = Math.max(1, width - inset * 2);
-  const availableHeight = Math.max(1, height - inset * 2);
-  const sourceAspect = iconCloudSourceBounds.width / iconCloudSourceBounds.height;
-  let fittedWidth = availableWidth;
-  let fittedHeight = fittedWidth / sourceAspect;
-
-  if (fittedHeight > availableHeight) {
-    fittedHeight = availableHeight;
-    fittedWidth = fittedHeight * sourceAspect;
-  }
-
-  return {
-    x: (width - fittedWidth) / 2,
-    y: (height - fittedHeight) / 2,
-    width: fittedWidth,
-    height: fittedHeight,
-  };
-}
-
-function applyIconCloudPathTransform(
-  context: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-): number {
-  const rect = iconCloudFitRect(width, height);
-  const scaleX = rect.width / iconCloudSourceBounds.width;
-  const scaleY = rect.height / iconCloudSourceBounds.height;
-
-  context.translate(rect.x + rect.width / 2, rect.y + rect.height / 2);
-  context.rotate(iconCloudRotationRadians);
-  context.translate(-rect.width / 2, -rect.height / 2);
-  context.scale(scaleX, scaleY);
-  context.translate(-iconCloudSourceBounds.x, iconCloudSourceBounds.yTop);
-  context.scale(1, -1);
-
-  return (scaleX + scaleY) / 2;
-}
-
 function clipOrbShapePath(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  shape: VoiceOrbPreset["shape"],
 ): void {
-  if (shape === "cloud") {
-    const transform = context.getTransform();
-    applyIconCloudPathTransform(context, width, height);
-    context.clip(getIconCloudPath());
-    context.setTransform(transform);
-    return;
-  }
-
   beginSphereShapePath(context, width, height);
   context.clip();
 }
@@ -2882,16 +2087,7 @@ function strokeOrbShapePath(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  shape: VoiceOrbPreset["shape"],
 ): void {
-  if (shape === "cloud") {
-    const lineWidth = context.lineWidth;
-    const scale = applyIconCloudPathTransform(context, width, height);
-    context.lineWidth = lineWidth / scale;
-    context.stroke(getIconCloudPath());
-    return;
-  }
-
   beginSphereShapePath(context, width, height);
   context.stroke();
 }
@@ -2900,90 +2096,30 @@ function drawOrbPresetBase(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  presetId: VoiceOrbPresetId,
-  level: number,
-  phase: number,
+  _level: number,
+  _phase: number,
 ): void {
-  context.save();
-  if (presetId === "aurora") {
-    const base = context.createLinearGradient(0, height * 0.04, 0, height);
-    base.addColorStop(0, "rgba(255, 255, 250, 0.92)");
-    base.addColorStop(0.38, "rgba(225, 255, 255, 0.86)");
-    base.addColorStop(0.7, "rgba(68, 198, 255, 0.72)");
-    base.addColorStop(1, "rgba(0, 120, 255, 0.82)");
-    context.fillStyle = base;
-    context.fillRect(0, 0, width, height);
-    context.restore();
-    return;
-  }
-
-  if (presetId === "cloud") {
-    const base = context.createLinearGradient(0, height * 0.16, 0, height * 0.9);
-    base.addColorStop(0, "rgba(246, 252, 255, 0.96)");
-    base.addColorStop(0.28, "rgba(196, 239, 255, 0.92)");
-    base.addColorStop(0.62, "rgba(59, 154, 255, 0.92)");
-    base.addColorStop(1, "rgba(34, 50, 255, 0.96)");
-    context.fillStyle = base;
-    context.fillRect(0, 0, width, height);
-
-    context.globalCompositeOperation = "screen";
-    context.globalAlpha = 0.32 + level * 0.14;
-    context.fillStyle = "rgba(255, 255, 255, 0.75)";
-    context.beginPath();
-    context.ellipse(
-      width * (0.43 + Math.sin(phase) * 0.03),
-      height * 0.28,
-      width * 0.37,
-      height * 0.2,
-      -0.1,
-      0,
-      Math.PI * 2,
-    );
-    context.fill();
-    context.restore();
-    return;
-  }
-
-  const base = context.createRadialGradient(width * 0.47, height * 0.18, 0, width * 0.5, height * 0.52, width * 0.58);
-  base.addColorStop(0, "rgba(245, 252, 255, 0.72)");
-  base.addColorStop(0.36, "rgba(82, 128, 170, 0.48)");
-  base.addColorStop(0.7, "rgba(21, 30, 48, 0.9)");
-  base.addColorStop(1, "rgba(4, 7, 15, 0.98)");
+  const base = context.createLinearGradient(0, height * 0.04, 0, height);
+  base.addColorStop(0, "rgba(255, 255, 250, 0.92)");
+  base.addColorStop(0.38, "rgba(225, 255, 255, 0.86)");
+  base.addColorStop(0.7, "rgba(68, 198, 255, 0.72)");
+  base.addColorStop(1, "rgba(0, 120, 255, 0.82)");
   context.fillStyle = base;
   context.fillRect(0, 0, width, height);
-  context.restore();
 }
 
 function drawOrbPresetEdge(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  shape: VoiceOrbPreset["shape"],
-  presetId: VoiceOrbPresetId,
-  level: number,
   customization: VoiceOrbCustomization,
 ): void {
-  const accent = rgbaFromHex(customization.accentColor, presetId === "nocturne" ? 0.46 : 0.62);
-  const glowScale = 0.48 + customization.glow / 75;
   context.save();
   context.globalCompositeOperation = "screen";
-  context.shadowColor =
-    accent ??
-    (presetId === "cloud"
-      ? "rgba(101, 193, 255, 0.68)"
-      : presetId === "aurora"
-        ? "rgba(161, 232, 255, 0.42)"
-        : "rgba(154, 227, 255, 0.44)");
-  context.shadowBlur = (7 + level * 16) * glowScale;
-  context.strokeStyle =
-    rgbaFromHex(customization.accentColor, 0.42) ??
-    (presetId === "cloud"
-      ? "rgba(205, 241, 255, 0.72)"
-      : presetId === "aurora"
-        ? "rgba(238, 255, 255, 0.52)"
-        : "rgba(213, 245, 255, 0.46)");
-  context.lineWidth = presetId === "cloud" ? 2.2 : 1.4;
-  strokeOrbShapePath(context, width, height, shape);
+  context.shadowBlur = 0;
+  context.strokeStyle = rgbaFromHex(customization.accentColor, 0.42) ?? "rgba(238, 255, 255, 0.52)";
+  context.lineWidth = 1.4;
+  strokeOrbShapePath(context, width, height);
   context.restore();
 }
 
@@ -3013,14 +2149,6 @@ function drawOrbTint(
   context.fillStyle = band;
   context.fillRect(0, 0, width, height);
 
-  const glow = context.createRadialGradient(width * 0.55, height * 0.68, 0, width * 0.5, height * 0.58, width * 0.72);
-  glow.addColorStop(0, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.32 + level * 0.18})`);
-  glow.addColorStop(0.5, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${0.18 + level * 0.1})`);
-  glow.addColorStop(1, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0)`);
-  context.globalCompositeOperation = "screen";
-  context.globalAlpha = 1;
-  context.fillStyle = glow;
-  context.fillRect(0, 0, width, height);
   context.restore();
 }
 
@@ -3038,32 +2166,21 @@ function rgbaFromHex(color: string, alpha: number): string | null {
   return rgb ? `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})` : null;
 }
 
-function scaledGlowAlpha(alpha: number, glow: number): number {
-  const normalizedGlow = clampControlValue(glow, defaultVoiceOrbCustomization.glow);
-  const scale = normalizedGlow / defaultVoiceOrbCustomization.glow;
-  return Math.min(1, Math.max(0, Number((alpha * scale).toFixed(3))));
-}
-
-function glowColor(accent: string, alpha: number, glow: number, fallback: string): string {
-  return rgbaFromHex(accent, scaledGlowAlpha(alpha, glow)) ?? fallback;
-}
-
 function voiceAccentStyle(customization: VoiceOrbCustomization): React.CSSProperties {
   const accent = isHexColor(customization.accentColor)
     ? customization.accentColor
     : defaultVoiceOrbCustomization.accentColor;
-  const glow = clampControlValue(customization.glow, defaultVoiceOrbCustomization.glow);
   return {
     "--voice-accent": accent,
     "--voice-accent-soft": rgbaFromHex(accent, 0.22) ?? "rgba(29, 155, 240, 0.22)",
     "--voice-accent-mid": rgbaFromHex(accent, 0.34) ?? "rgba(29, 155, 240, 0.34)",
     "--voice-accent-strong": rgbaFromHex(accent, 0.58) ?? "rgba(29, 155, 240, 0.58)",
-    "--voice-glow-faint": glowColor(accent, 0.08, glow, "rgba(29, 155, 240, 0.08)"),
-    "--voice-glow-soft": glowColor(accent, 0.13, glow, "rgba(29, 155, 240, 0.13)"),
-    "--voice-glow-medium": glowColor(accent, 0.2, glow, "rgba(29, 155, 240, 0.2)"),
-    "--voice-glow-strong": glowColor(accent, 0.3, glow, "rgba(29, 155, 240, 0.3)"),
-    "--voice-glow-hot": glowColor(accent, 0.42, glow, "rgba(29, 155, 240, 0.42)"),
-    "--voice-glow-rim": glowColor(accent, 0.48, glow, "rgba(29, 155, 240, 0.48)"),
+    "--voice-glow-faint": "transparent",
+    "--voice-glow-soft": "transparent",
+    "--voice-glow-medium": "transparent",
+    "--voice-glow-strong": "transparent",
+    "--voice-glow-hot": "transparent",
+    "--voice-glow-rim": "rgba(235, 251, 255, 0.38)",
   } as React.CSSProperties;
 }
 
@@ -3083,7 +2200,7 @@ function rgbaFromRgb(rgb: { r: number; g: number; b: number }, alpha: number): s
   return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
 }
 
-function orbWavePalette(presetId: VoiceOrbPresetId, accentColor?: string): {
+function orbWavePalette(accentColor?: string): {
   deep: Array<[number, string]>;
   mid: Array<[number, string]>;
   mist: Array<[number, string]>;
@@ -3091,92 +2208,33 @@ function orbWavePalette(presetId: VoiceOrbPresetId, accentColor?: string): {
 } {
   const accent = accentColor ? rgbFromHex(accentColor) : null;
   if (accent) {
-    const light = mixRgb(accent, { r: 255, g: 255, b: 255 }, presetId === "nocturne" ? 0.34 : 0.5);
+    const light = mixRgb(accent, { r: 255, g: 255, b: 255 }, 0.5);
     const mist = mixRgb(accent, { r: 236, g: 255, b: 255 }, 0.68);
-    const deep = mixRgb(accent, { r: 0, g: 24, b: 88 }, presetId === "nocturne" ? 0.58 : 0.34);
-    const lowAlpha = presetId === "nocturne" ? 0.1 : 0.16;
-    const midAlpha = presetId === "nocturne" ? 0.36 : 0.54;
-    const highAlpha = presetId === "nocturne" ? 0.62 : 0.78;
+    const deep = mixRgb(accent, { r: 0, g: 24, b: 88 }, 0.34);
 
     return {
       deep: [
-        [0, rgbaFromRgb(mist, lowAlpha)],
-        [0.34, rgbaFromRgb(accent, midAlpha)],
-        [0.7, rgbaFromRgb(accent, highAlpha)],
-        [1, rgbaFromRgb(deep, presetId === "nocturne" ? 0.9 : 0.96)],
+        [0, rgbaFromRgb(mist, 0.16)],
+        [0.34, rgbaFromRgb(accent, 0.54)],
+        [0.7, rgbaFromRgb(accent, 0.78)],
+        [1, rgbaFromRgb(deep, 0.96)],
       ],
       mid: [
         [0, "rgba(255, 255, 255, 0.2)"],
-        [0.35, rgbaFromRgb(light, presetId === "nocturne" ? 0.3 : 0.48)],
-        [0.72, rgbaFromRgb(accent, presetId === "nocturne" ? 0.42 : 0.58)],
-        [1, rgbaFromRgb(deep, presetId === "nocturne" ? 0.5 : 0.66)],
+        [0.35, rgbaFromRgb(light, 0.48)],
+        [0.72, rgbaFromRgb(accent, 0.58)],
+        [1, rgbaFromRgb(deep, 0.66)],
       ],
       mist: [
         [0, "rgba(255, 255, 255, 0.42)"],
-        [0.48, rgbaFromRgb(mist, presetId === "nocturne" ? 0.18 : 0.28)],
-        [1, rgbaFromRgb(accent, presetId === "nocturne" ? 0.12 : 0.2)],
+        [0.48, rgbaFromRgb(mist, 0.28)],
+        [1, rgbaFromRgb(accent, 0.2)],
       ],
       crest: [
         [0, "rgba(255, 255, 244, 0)"],
-        [0.25, rgbaFromRgb(light, presetId === "nocturne" ? 0.55 : 0.78)],
-        [0.58, rgbaFromRgb(mist, presetId === "nocturne" ? 0.46 : 0.68)],
+        [0.25, rgbaFromRgb(light, 0.78)],
+        [0.58, rgbaFromRgb(mist, 0.68)],
         [1, "rgba(255, 255, 244, 0)"],
-      ],
-    };
-  }
-
-  if (presetId === "cloud") {
-    return {
-      deep: [
-        [0, "rgba(180, 247, 255, 0.08)"],
-        [0.35, "rgba(79, 208, 255, 0.36)"],
-        [0.72, "rgba(34, 103, 255, 0.74)"],
-        [1, "rgba(24, 39, 255, 0.92)"],
-      ],
-      mid: [
-        [0, "rgba(252, 255, 255, 0.22)"],
-        [0.4, "rgba(176, 227, 255, 0.46)"],
-        [0.78, "rgba(86, 128, 255, 0.52)"],
-        [1, "rgba(56, 90, 255, 0.64)"],
-      ],
-      mist: [
-        [0, "rgba(255, 255, 255, 0.46)"],
-        [0.5, "rgba(232, 249, 255, 0.28)"],
-        [1, "rgba(163, 221, 255, 0.16)"],
-      ],
-      crest: [
-        [0, "rgba(255, 255, 244, 0)"],
-        [0.25, "rgba(255, 255, 255, 0.82)"],
-        [0.58, "rgba(201, 236, 255, 0.72)"],
-        [1, "rgba(255, 255, 244, 0)"],
-      ],
-    };
-  }
-
-  if (presetId === "nocturne") {
-    return {
-      deep: [
-        [0, "rgba(164, 231, 255, 0.04)"],
-        [0.3, "rgba(65, 165, 212, 0.2)"],
-        [0.66, "rgba(31, 78, 139, 0.52)"],
-        [1, "rgba(12, 31, 74, 0.82)"],
-      ],
-      mid: [
-        [0, "rgba(243, 255, 255, 0.12)"],
-        [0.36, "rgba(148, 227, 255, 0.24)"],
-        [0.72, "rgba(36, 142, 206, 0.32)"],
-        [1, "rgba(19, 88, 164, 0.42)"],
-      ],
-      mist: [
-        [0, "rgba(232, 255, 255, 0.24)"],
-        [0.5, "rgba(162, 231, 255, 0.14)"],
-        [1, "rgba(84, 164, 220, 0.08)"],
-      ],
-      crest: [
-        [0, "rgba(203, 246, 255, 0)"],
-        [0.28, "rgba(203, 246, 255, 0.46)"],
-        [0.6, "rgba(143, 221, 255, 0.4)"],
-        [1, "rgba(203, 246, 255, 0)"],
       ],
     };
   }
@@ -3231,17 +2289,14 @@ function drawOrbClouds(
   level: number,
   phase: number,
   hovering: boolean,
-  presetId: VoiceOrbPresetId,
 ): void {
   const lift = level * height * 0.08;
   const hoverLift = hovering ? height * 0.015 : 0;
-  const cloudAlpha = presetId === "nocturne" ? 0.2 : 0.42;
-  const cloudWhite = presetId === "nocturne" ? "rgba(210, 246, 255, 0.4)" : "rgba(255, 255, 246, 0.7)";
 
   context.save();
   context.globalCompositeOperation = "screen";
   context.filter = `blur(${8 + level * 5}px)`;
-  context.globalAlpha = cloudAlpha + level * 0.26;
+  context.globalAlpha = 0.42 + level * 0.26;
 
   const topGradient = context.createRadialGradient(
     width * (0.46 + Math.sin(phase * 0.9) * 0.05),
@@ -3251,7 +2306,7 @@ function drawOrbClouds(
     height * 0.22,
     width * 0.58,
   );
-  topGradient.addColorStop(0, cloudWhite);
+  topGradient.addColorStop(0, "rgba(255, 255, 246, 0.7)");
   topGradient.addColorStop(0.48, "rgba(220, 255, 252, 0.28)");
   topGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
   context.fillStyle = topGradient;
@@ -3386,10 +2441,10 @@ function ApiKeyDialog({
   const [infoOpen, setInfoOpen] = useState(false);
   const [waveDancing, setWaveDancing] = useState(false);
   const waveDanceTimeoutRef = useRef<number | null>(null);
-  const title = mode === "onboarding" ? "Connect OpenAI" : "OpenAI API key";
+  const title = mode === "connect" ? "Connect OpenAI" : "OpenAI API key";
   const primaryLabel =
-    realtime.apiKeySource === "saved" ? "Replace" : mode === "onboarding" ? "Save key" : "Save";
-  const secondaryLabel = mode === "onboarding" ? "Later" : "Cancel";
+    realtime.apiKeySource === "saved" ? "Replace" : mode === "connect" ? "Save key" : "Save";
+  const secondaryLabel = mode === "connect" ? "Later" : "Cancel";
   const hasApiKey = Boolean(apiKey.trim());
   const apiKeyManagedByEnvironment = realtime.apiKeySource === "environment";
   const health = realtimeHealth(realtime, realtimeIssue);
@@ -3922,21 +2977,6 @@ function DebugDashboard({
             <button
               onClick={() =>
                 void onAction(async () => {
-                  await window.codexVoice.openVoiceWindow();
-                  await onLogEvent({
-                    at: new Date().toISOString(),
-                    source: "app",
-                    kind: "debug/startOnboarding",
-                    message: "Show onboarding requested from Debug UI.",
-                  });
-                })
-              }
-            >
-              Show onboarding
-            </button>
-            <button
-              onClick={() =>
-                void onAction(async () => {
                   const summary = await window.codexVoice.summarizeProject(activeProject?.id);
                   await onLogEvent({
                     at: new Date().toISOString(),
@@ -4261,6 +3301,14 @@ function permissionProfile(mode: CodexPermissionMode) {
   return CODEX_PERMISSION_PROFILES.find((profile) => profile.mode === mode) ?? CODEX_PERMISSION_PROFILES[0];
 }
 
+function LightningIcon(): React.ReactElement {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="lightning-icon">
+      <path d="M13.5 2.75 5.75 13.2h5.45l-.7 8.05 7.75-10.45H12.8l.7-8.05Z" />
+    </svg>
+  );
+}
+
 function FolderIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -4289,15 +3337,6 @@ function CheckIcon(): React.ReactElement {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m5.5 12.5 4.25 4.25L18.5 7.25" />
-    </svg>
-  );
-}
-
-function LeftPaneIcon(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <rect x="4.6" y="4.4" width="14.8" height="15.2" rx="3" />
-      <path d="M9.6 7.2v9.6" />
     </svg>
   );
 }
