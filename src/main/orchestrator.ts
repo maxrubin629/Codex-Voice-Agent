@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import type {
   AppEvent,
   ActiveThreadSummary,
+  CancelQueuedCodexRequestResult,
   CodexApprovalPolicy,
   CodexApprovalsReviewer,
   AppState,
@@ -24,6 +26,7 @@ import type {
   PendingRequestQuestion,
   PendingRequestQuestionOption,
   PendingCodexRequest,
+  QueuedCodexRequestResult,
   RealtimeReasoningEffort,
   ReasoningEffort,
   ThreadArtifactCandidate,
@@ -32,9 +35,6 @@ import type {
   ThreadSummaryItem,
   ThreadSummaryTurn,
   ToolQuestionAnswer,
-  VoiceExecCommandArgs,
-  VoiceExecCommandResult,
-  VoiceWriteStdinArgs,
   VoiceProject,
   VoiceTranscriptMessage,
 } from "../shared/types";
@@ -114,30 +114,14 @@ type ReviewTarget =
   | { type: "commit"; sha: string; title: string | null }
   | { type: "custom"; instructions: string };
 
-type CommandExecResponse = {
-  exitCode?: number;
-  exit_code?: number;
-  stdout?: string;
-  stderr?: string;
-};
-
-type VoiceExecSession = {
-  sessionId: number;
-  processId: string;
-  output: string;
-  readOffset: number;
-  startedAt: number;
-  completedAt: number | null;
-  exitCode: number | null;
-  error: Error | null;
-  done: Promise<void>;
-};
-
-type VoiceToolContext = {
-  project: VoiceProject | null;
-  chat: VoiceChat | null;
-  permissionMode: CodexPermissionMode;
-  permissionProfile: unknown | null;
+type QueuedCodexRequest = {
+  id: string;
+  text: string;
+  chatId: string;
+  projectId: string;
+  threadId: string;
+  workspacePath: string | null;
+  queuedAt: string;
 };
 
 export class VoiceCodexOrchestrator extends EventEmitter {
@@ -163,10 +147,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private threadByTurn = new Map<string, string>();
   private tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
   private threadStatusByThread = new Map<string, string>();
-  private voiceExecNextSessionId = 1;
-  private voiceExecNextProcessId = 1;
-  private voiceExecSessions = new Map<number, VoiceExecSession>();
-  private voiceExecSessionByProcessId = new Map<string, VoiceExecSession>();
+  private queuedRequestsByThread = new Map<string, QueuedCodexRequest[]>();
+  private drainingQueuedThreads = new Set<string>();
 
   constructor(
     private readonly store: ProjectStore,
@@ -394,22 +376,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       return this.handleNativeSlashCommand(trimmed);
     }
 
-    const resolvedWorkspacePath = workspacePath?.trim()
-      ? await resolveWorkspacePathInput(workspacePath)
-      : await inferWorkspacePathFromText(trimmed);
-    let context: ChatContext;
-    if (resolvedWorkspacePath && !chatId) {
-      const project = await this.projectForWorkspace(titleFromText(trimmed), resolvedWorkspacePath);
-      const chat = activeChatForProject(project);
-      const updated = chat ? project : await this.startChatThread(project, titleFromText(trimmed));
-      context = this.requireActiveChatContextFromProject(updated);
-    } else if (!this.activeProjectId && !chatId) {
-      const project = await this.createProject(titleFromText(trimmed));
-      const updated = await this.startChatThread(project, titleFromText(trimmed));
-      context = this.requireActiveChatContextFromProject(updated);
-    } else {
-      context = await this.requireChatContextForPrompt(trimmed, chatId);
-    }
+    const context = await this.resolveChatContextForRequest(trimmed, chatId, workspacePath);
     const { project, chat } = await this.resumeChatThread(context.project, context.chat);
     if (!chat.codexThreadId) throw new Error("Active chat is missing a Codex thread id.");
 
@@ -488,6 +455,142 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitEvent("app", "turnSteered", `Steered "${chat.displayName}".`, { text, chatId: chat.id });
     this.emitState();
     return { turnId };
+  }
+
+  async queueCodexRequest(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+  ): Promise<QueuedCodexRequestResult> {
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Cannot queue an empty request for Codex.");
+
+    const { project, chat } = await this.resolveChatContextForRequest(trimmed, chatId, workspacePath);
+    const threadId = chat.codexThreadId;
+    const activeTurnId = threadId ? this.activeTurnByThread.get(threadId) ?? null : null;
+    if (!threadId || !activeTurnId) {
+      const started = await this.sendToCodex(trimmed, chat.id, workspacePath);
+      return {
+        queued: false,
+        queuedId: null,
+        message: "Codex was idle, so the request started immediately.",
+        chatId: chat.id,
+        turnId: started.turnId,
+        position: 0,
+        text: trimmed,
+        started,
+      };
+    }
+
+    const queue = this.queuedRequestsByThread.get(threadId) ?? [];
+    const queued: QueuedCodexRequest = {
+      id: randomUUID(),
+      text: trimmed,
+      chatId: chat.id,
+      projectId: project.id,
+      threadId,
+      workspacePath: workspacePath?.trim() || null,
+      queuedAt: new Date().toISOString(),
+    };
+    queue.push(queued);
+    this.queuedRequestsByThread.set(threadId, queue);
+
+    await this.store.updateChat(project.id, chat.id, {
+      lastStatus: queue.length === 1 ? "Queued next request." : `Queued ${queue.length} requests.`,
+    });
+    this.status = `Queued next request for "${chat.displayName}".`;
+    this.emitEvent("app", "turnQueued", this.status, {
+      queuedId: queued.id,
+      chatId: chat.id,
+      threadId,
+      activeTurnId,
+      position: queue.length,
+      text: trimmed,
+    });
+    this.emitState();
+    return {
+      queued: true,
+      queuedId: queued.id,
+      message: `Queued request ${queue.length} for "${chat.displayName}".`,
+      chatId: chat.id,
+      turnId: activeTurnId,
+      position: queue.length,
+      text: trimmed,
+    };
+  }
+
+  async cancelQueuedCodexRequest(
+    queuedId?: string | null,
+    chatId?: string,
+  ): Promise<CancelQueuedCodexRequestResult> {
+    const targetQueuedId = queuedId?.trim() || null;
+    const scopedContext = !targetQueuedId || chatId ? await this.requireChatContext(chatId) : null;
+    const scopedChatId = scopedContext?.chat.id ?? null;
+    const scopedThreadId = scopedContext?.chat.codexThreadId ?? null;
+
+    let match:
+      | {
+          threadId: string;
+          queue: QueuedCodexRequest[];
+          index: number;
+          queued: QueuedCodexRequest;
+        }
+      | null = null;
+
+    for (const [threadId, queue] of this.queuedRequestsByThread.entries()) {
+      if (scopedThreadId && threadId !== scopedThreadId) continue;
+      const index = targetQueuedId
+        ? queue.findIndex((queued) => queued.id === targetQueuedId)
+        : lastQueuedRequestIndexForChat(queue, scopedChatId);
+      if (index === -1) continue;
+      match = { threadId, queue, index, queued: queue[index] };
+      break;
+    }
+
+    if (!match) {
+      throw new Error(
+        targetQueuedId
+          ? `No queued Codex request matched ${targetQueuedId}.`
+          : "There is no queued Codex request to cancel.",
+      );
+    }
+
+    match.queue.splice(match.index, 1);
+    if (match.queue.length === 0) {
+      this.queuedRequestsByThread.delete(match.threadId);
+    } else {
+      this.queuedRequestsByThread.set(match.threadId, match.queue);
+    }
+
+    const context = await this.findChatByThread(match.threadId);
+    const remaining = match.queue.length;
+    const message = remaining === 0
+      ? "Cancelled the queued Codex request."
+      : `Cancelled the queued Codex request. ${remaining} queued request${remaining === 1 ? "" : "s"} remain.`;
+    if (context) {
+      await this.store.updateChat(context.project.id, context.chat.id, {
+        lastStatus: remaining === 0 ? "Cancelled queued request." : `Queued ${remaining} requests.`,
+      });
+    }
+    this.status = message;
+    this.emitEvent("app", "queuedTurnCancelled", message, {
+      queuedId: match.queued.id,
+      chatId: match.queued.chatId,
+      threadId: match.threadId,
+      remaining,
+      text: match.queued.text,
+    });
+    this.emitState();
+
+    return {
+      cancelled: true,
+      queuedId: match.queued.id,
+      message,
+      chatId: match.queued.chatId,
+      threadId: match.threadId,
+      remaining,
+      text: match.queued.text,
+    };
   }
 
   async interruptCodex(chatId?: string): Promise<void> {
@@ -731,54 +834,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
-  async execCommandForVoice(args: VoiceExecCommandArgs): Promise<VoiceExecCommandResult> {
-    const command = commandVectorFromVoiceArgs(args);
-    return this.runVoiceCommand(command, args);
-  }
-
-  async writeStdinForVoice(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult> {
-    const session = this.voiceExecSessions.get(args.session_id);
-    if (!session) throw new Error(`Unknown exec_command session: ${args.session_id}`);
-
-    const startedAt = Date.now();
-    const chars = args.chars ?? "";
-    if (chars && session.completedAt) {
-      throw new Error(`exec_command session ${args.session_id} is no longer running.`);
-    }
-    if (chars) {
-      await this.codex.request("command/exec/write", {
-        processId: session.processId,
-        deltaBase64: Buffer.from(chars).toString("base64"),
-      });
-    }
-
-    await waitForVoiceSession(session, normalizeYieldMs(args.yield_time_ms));
-    return formatVoiceExecResult(session, startedAt, args.max_output_tokens, true);
-  }
-
-  async terminateVoiceExecSession(sessionId: number): Promise<void> {
-    const session = this.voiceExecSessions.get(sessionId);
-    if (!session || session.completedAt) return;
-    await this.codex.request("command/exec/terminate", {
-      processId: session.processId,
-    });
-    await waitForVoiceSession(session, 500);
-    this.emitEvent("app", "voiceExecTerminated", `Terminated voice exec session ${sessionId}.`, {
-      sessionId,
-      processId: session.processId,
-    });
-    this.emitState();
-  }
-
-  async applyPatchForVoice(input: string): Promise<VoiceExecCommandResult> {
-    if (!input.trim()) throw new Error("apply_patch input is required.");
-    return this.runVoiceCommand(["apply_patch", input], {
-      cmd: "apply_patch",
-      yield_time_ms: 1_000,
-      max_output_tokens: 6_000,
-    });
-  }
-
   async getChatStatus(chatId?: string): Promise<CodexChatRuntime[]> {
     const project = chatId ? await this.requireProjectForChat(chatId) : await this.requireProject();
     const runtimes = this.chatRuntimeStates(project);
@@ -959,90 +1014,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return config;
   }
 
-  private async runVoiceCommand(
-    command: string[],
-    args: VoiceExecCommandArgs,
-  ): Promise<VoiceExecCommandResult> {
-    if (command.length === 0) throw new Error("exec_command command must not be empty.");
-
-    const startedAt = Date.now();
-    const context = await this.resolveVoiceToolContext();
-    const cwd = resolveVoiceWorkdir(args.workdir, context.project ? projectWorkspacePath(context.project) : null);
-    const processId = `voice-exec-${Date.now()}-${this.voiceExecNextProcessId++}`;
-    const sessionId = this.voiceExecNextSessionId++;
-    const session: VoiceExecSession = {
-      sessionId,
-      processId,
-      output: "",
-      readOffset: 0,
-      startedAt,
-      completedAt: null,
-      exitCode: null,
-      error: null,
-      done: Promise.resolve(),
-    };
-
-    this.voiceExecSessions.set(sessionId, session);
-    this.voiceExecSessionByProcessId.set(processId, session);
-    const request = this.codex.request(
-      "command/exec",
-      {
-        command,
-        processId,
-        tty: Boolean(args.tty),
-        streamStdin: true,
-        streamStdoutStderr: true,
-        cwd,
-        ...(context.permissionProfile ? { permissionProfile: context.permissionProfile } : {}),
-      },
-      60 * 60 * 1_000,
-    ) as Promise<CommandExecResponse>;
-
-    session.done = request
-      .then((response) => {
-        session.exitCode = numberField(response.exitCode) ?? numberField(response.exit_code) ?? null;
-        if (response.stdout) session.output += response.stdout;
-        if (response.stderr) session.output += response.stderr;
-      })
-      .catch((error) => {
-        session.error = error instanceof Error ? error : new Error(String(error));
-      })
-      .finally(() => {
-        session.completedAt = Date.now();
-        const cleanupTimer = setTimeout(() => {
-          this.voiceExecSessions.delete(session.sessionId);
-          this.voiceExecSessionByProcessId.delete(session.processId);
-        }, 10 * 60 * 1_000);
-        if (typeof cleanupTimer === "object" && "unref" in cleanupTimer) {
-          cleanupTimer.unref();
-        }
-      });
-
-    await waitForVoiceSession(session, normalizeYieldMs(args.yield_time_ms));
-    return formatVoiceExecResult(session, startedAt, args.max_output_tokens, true);
-  }
-
-  private async resolveVoiceToolContext(): Promise<VoiceToolContext> {
-    const project = await this.getActiveProject();
-    const chat = project ? activeChatForProject(project) : null;
-    const settings = project
-      ? this.threadSettingsForChat(project, chat)
-      : {
-          model: this.defaultModel,
-          reasoningEffort: this.defaultReasoningEffort,
-          permissionMode: this.defaultPermissionMode,
-        };
-    return {
-      project,
-      chat,
-      permissionMode: settings.permissionMode,
-      permissionProfile: voicePermissionProfile(
-        settings.permissionMode,
-        project ? projectWorkspacePath(project) : null,
-      ),
-    };
-  }
-
   private async getActiveProject(): Promise<VoiceProject | null> {
     return this.activeProjectId ? this.store.getProject(this.activeProjectId) : null;
   }
@@ -1078,6 +1049,28 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       return existing;
     }
     return this.createProject(displayName, workspacePath);
+  }
+
+  private async resolveChatContextForRequest(
+    trimmed: string,
+    chatId?: string,
+    workspacePath?: string | null,
+  ): Promise<ChatContext> {
+    const resolvedWorkspacePath = workspacePath?.trim()
+      ? await resolveWorkspacePathInput(workspacePath)
+      : await inferWorkspacePathFromText(trimmed);
+    if (resolvedWorkspacePath && !chatId) {
+      const project = await this.projectForWorkspace(titleFromText(trimmed), resolvedWorkspacePath);
+      const chat = activeChatForProject(project);
+      const updated = chat ? project : await this.startChatThread(project, titleFromText(trimmed));
+      return this.requireActiveChatContextFromProject(updated);
+    }
+    if (!this.activeProjectId && !chatId) {
+      const project = await this.createProject(titleFromText(trimmed));
+      const updated = await this.startChatThread(project, titleFromText(trimmed));
+      return this.requireActiveChatContextFromProject(updated);
+    }
+    return this.requireChatContextForPrompt(trimmed, chatId);
   }
 
   private async requireActiveProject(): Promise<VoiceProject> {
@@ -1219,16 +1212,13 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private handleNotification(message: CodexJsonMessage): void {
     const method = message.method ?? "notification";
     const params = message.params as Record<string, unknown> | undefined;
-    if (method === "command/exec/outputDelta") {
-      this.handleVoiceCommandOutputDelta(params);
-    }
     const threadId = stringField(params?.threadId);
     const status = statusFromNotification(method, params);
     if (status) {
       this.status = status;
       this.emitEvent("codex", method, status, message.params);
       if (threadId) this.updateChatForThread(threadId, { lastStatus: status });
-    } else if (method !== "command/exec/outputDelta") {
+    } else {
       this.emitEvent("codex", method, method, message.params);
     }
 
@@ -1293,10 +1283,23 @@ export class VoiceCodexOrchestrator extends EventEmitter {
               turnId: turn.id,
             });
           }
+          const nextQueuedRequest = this.peekQueuedRequest(completedThreadId);
           if (turn.id && turn.status !== "interrupted") {
-            void this.captureCompletedTurnOutput(completedThreadId, turn.id, lastStatus);
+            const completedTurnId = turn.id;
+            void (async () => {
+              const announcedWithFinalOutput = await this.captureCompletedTurnOutput(
+                completedThreadId,
+                completedTurnId,
+                lastStatus,
+                nextQueuedRequest?.text,
+              );
+              await this.startNextQueuedRequest(completedThreadId, completedTurnId, announcedWithFinalOutput);
+            })();
           } else {
-            this.updateChatForThread(completedThreadId, { lastStatus });
+            void (async () => {
+              await this.updateCompletedTurnStatus(completedThreadId, lastStatus);
+              await this.startNextQueuedRequest(completedThreadId, turn.id, false);
+            })();
           }
         }
       }
@@ -1320,19 +1323,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
-  private handleVoiceCommandOutputDelta(params: Record<string, unknown> | undefined): void {
-    const processId = stringField(params?.processId);
-    const deltaBase64 = stringField(params?.deltaBase64);
-    if (!processId || !deltaBase64) return;
-    const session = this.voiceExecSessionByProcessId.get(processId);
-    if (!session) return;
-    try {
-      session.output += Buffer.from(deltaBase64, "base64").toString("utf8");
-    } catch {
-      session.output += deltaBase64;
-    }
-  }
-
   private clearPendingRequestsForTurn(threadId: string, turnId?: string): number {
     let cleared = 0;
     for (const [requestId, request] of this.pendingRequests.entries()) {
@@ -1342,6 +1332,57 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       cleared += 1;
     }
     return cleared;
+  }
+
+  private peekQueuedRequest(threadId: string): QueuedCodexRequest | null {
+    return this.queuedRequestsByThread.get(threadId)?.[0] ?? null;
+  }
+
+  private async startNextQueuedRequest(
+    threadId: string,
+    previousTurnId: string | undefined,
+    announcedWithFinalOutput: boolean,
+  ): Promise<void> {
+    if (this.drainingQueuedThreads.has(threadId)) return;
+    const queue = this.queuedRequestsByThread.get(threadId);
+    const queued = queue?.shift();
+    if (!queued) return;
+    if (!queue || queue.length === 0) {
+      this.queuedRequestsByThread.delete(threadId);
+    }
+
+    this.drainingQueuedThreads.add(threadId);
+    try {
+      const context = await this.findChatByThread(threadId);
+      if (!context) {
+        throw new Error("Could not find the chat for the queued Codex request.");
+      }
+      this.status = `Codex finished and is moving on to "${shortRequestLabel(queued.text)}".`;
+      await this.store.updateChat(context.project.id, context.chat.id, {
+        lastStatus: "Starting queued request.",
+      });
+      const result = await this.sendToCodex(queued.text, context.chat.id, queued.workspacePath);
+      this.emitEvent("app", "queuedTurnStarted", this.status, {
+        queuedId: queued.id,
+        previousTurnId,
+        turnId: result.turnId,
+        chatId: context.chat.id,
+        threadId,
+        text: queued.text,
+        announcedWithFinalOutput,
+      });
+    } catch (error) {
+      this.emitEvent("app", "queuedTurnFailed", "Codex finished, but the queued request could not be started.", {
+        queuedId: queued.id,
+        previousTurnId,
+        threadId,
+        text: queued.text,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.emitState();
+    } finally {
+      this.drainingQueuedThreads.delete(threadId);
+    }
   }
 
   private waitForTurnText(turnId: string): Promise<string> {
@@ -1354,7 +1395,12 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     });
   }
 
-  private async captureCompletedTurnOutput(threadId: string, turnId: string, lastStatus: string): Promise<void> {
+  private async captureCompletedTurnOutput(
+    threadId: string,
+    turnId: string,
+    lastStatus: string,
+    nextQueuedRequestText?: string,
+  ): Promise<boolean> {
     try {
       const response = (await this.codex.request("thread/read", {
         threadId,
@@ -1367,7 +1413,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           threadId,
           turnId,
         });
-        return;
+        return false;
       }
 
       if (turn.status === "interrupted") {
@@ -1376,7 +1422,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           threadId,
           turnId,
         });
-        return;
+        return false;
       }
 
       const finalAssistantText = finalAssistantTextFromTurn(turn);
@@ -1387,7 +1433,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           turnId,
           status: turn.status,
         });
-        return;
+        return false;
       }
 
       const output: CodexTurnOutput = {
@@ -1395,6 +1441,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         turnId,
         status: turn.status ?? "completed",
         finalAssistantText,
+        ...(nextQueuedRequestText ? { nextQueuedRequestText } : {}),
         items: Array.isArray(turn.items) ? turn.items : [],
         startedAt: numberOrNull(turn.startedAt),
         completedAt: numberOrNull(turn.completedAt),
@@ -1410,6 +1457,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       }
       this.emitEvent("codex", "turn/finalOutput", "Codex final output is available for voice context.", output);
       this.emitState();
+      return true;
     } catch (error) {
       await this.updateCompletedTurnStatus(threadId, lastStatus);
       this.emitEvent(
@@ -1418,6 +1466,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         error instanceof Error ? error.message : "Unable to read Codex final turn output.",
         { threadId, turnId },
       );
+      return false;
     }
   }
 
@@ -2829,96 +2878,6 @@ const knownThreadItemTypes = new Set([
   "web-search",
 ]);
 
-function commandVectorFromVoiceArgs(args: VoiceExecCommandArgs): string[] {
-  const cmd = args.cmd.trim();
-  if (!cmd) throw new Error("exec_command cmd is required.");
-  const shell = args.shell?.trim() || process.env.SHELL || "/bin/zsh";
-  const flag = args.login === false ? "-c" : "-lc";
-  return [shell, flag, cmd];
-}
-
-function resolveVoiceWorkdir(workdir: string | null | undefined, projectFolderPath: string | null): string {
-  const base = projectFolderPath ?? process.cwd();
-  if (!workdir?.trim()) return base;
-  return path.isAbsolute(workdir) ? workdir : path.resolve(base, workdir);
-}
-
-function voicePermissionProfile(
-  mode: CodexPermissionMode,
-  projectFolderPath: string | null,
-): unknown | null {
-  if (mode === "custom-config") return null;
-  if (mode === "full-access") return { type: "disabled" };
-
-  return workspaceWritePermissionProfile(projectFolderPath ?? process.cwd());
-}
-
-function workspaceWritePermissionProfile(projectFolderPath: string): unknown {
-  const protectedSubpaths = [".git", ".agents", ".codex"].map((subpath) => path.join(projectFolderPath, subpath));
-  return {
-    type: "managed",
-    network: { enabled: false },
-    fileSystem: {
-      type: "restricted",
-      entries: [
-        { path: { type: "special", value: { kind: "root" } }, access: "read" },
-        { path: { type: "path", path: projectFolderPath }, access: "write" },
-        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
-        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
-        ...protectedSubpaths.map((protectedPath) => ({
-          path: { type: "path", path: protectedPath },
-          access: "read",
-        })),
-      ],
-    },
-  };
-}
-
-function normalizeYieldMs(value: number | null | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return 1_000;
-  return Math.max(0, Math.min(30_000, Math.floor(value)));
-}
-
-async function waitForVoiceSession(session: VoiceExecSession, yieldMs: number): Promise<void> {
-  if (session.completedAt) return;
-  await Promise.race([session.done, sleep(yieldMs)]);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function formatVoiceExecResult(
-  session: VoiceExecSession,
-  startedAt: number,
-  maxOutputTokens: number | null | undefined,
-  consume: boolean,
-): VoiceExecCommandResult {
-  if (session.error) throw session.error;
-  const output = consume ? session.output.slice(session.readOffset) : session.output;
-  if (consume) session.readOffset = session.output.length;
-  const approxTokens = approximateTokenCount(output);
-  return {
-    wall_time_seconds: (Date.now() - startedAt) / 1_000,
-    ...(session.completedAt ? { exit_code: session.exitCode ?? 0 } : { session_id: session.sessionId }),
-    original_token_count: approxTokens,
-    output: truncateOutput(output, maxOutputTokens),
-  };
-}
-
-function truncateOutput(output: string, maxOutputTokens: number | null | undefined): string {
-  const maxTokens = typeof maxOutputTokens === "number" && Number.isFinite(maxOutputTokens)
-    ? Math.max(1, Math.floor(maxOutputTokens))
-    : 6_000;
-  const maxChars = maxTokens * 4;
-  if (output.length <= maxChars) return output;
-  return `${output.slice(0, maxChars)}\n[output truncated]`;
-}
-
-function approximateTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
 function finalAssistantTextFromTurn(turn: CodexThreadTurn): string | null {
   const agentMessages = (turn.items ?? []).filter((item) => {
     return normalizeThreadItemType(item) === "assistant-message" && textFromThreadMessageItem(item) !== null;
@@ -3524,10 +3483,6 @@ function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-function numberField(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
 function activeChatForProject(project: VoiceProject): VoiceChat | null {
   const chats = project.chats.filter((chat) => !chat.archivedAt);
   return (
@@ -3538,8 +3493,22 @@ function activeChatForProject(project: VoiceProject): VoiceChat | null {
   );
 }
 
+function lastQueuedRequestIndexForChat(queue: QueuedCodexRequest[], chatId: string | null): number {
+  if (!chatId) return -1;
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    if (queue[index].chatId === chatId) return index;
+  }
+  return -1;
+}
+
 function titleFromText(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 48) || "Voice Project";
+}
+
+function shortRequestLabel(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 90) return normalized;
+  return `${normalized.slice(0, 87).trimEnd()}...`;
 }
 
 function parseSlashInput(text: string): { command: string; args: string[]; rest: string } {
