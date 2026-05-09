@@ -1,11 +1,13 @@
 {
-  "name": "voice-computer-use",
+  "name": "codex-voice",
+  "productName": "Codex Voice",
   "version": "0.0.1",
   "private": true,
   "description": "A local Realtime voice layer around Codex app-server projects.",
   "license": "MIT",
   "main": "out/main/index.js",
   "scripts": {
+    "predev": "node scripts/prepare-dev-electron.mjs",
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
     "preview": "electron-vite preview",

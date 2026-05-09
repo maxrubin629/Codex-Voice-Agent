@@ -9,15 +9,24 @@ import type {
   CodexVoiceApi,
   ReasoningEffort,
   ToolQuestionAnswer,
+  WindowChromeState,
 } from "../shared/types";
 
 const api: CodexVoiceApi = {
   getState: () => ipcRenderer.invoke("app:getState"),
+  openVoiceWindow: () => ipcRenderer.invoke("app:openVoiceWindow"),
+  getWindowChromeState: () => ipcRenderer.invoke("app:getWindowChromeState"),
+  expandVoiceWindowForRightPane: () => ipcRenderer.invoke("app:expandVoiceWindowForRightPane"),
+  collapseVoiceWindowFromRightPane: () => ipcRenderer.invoke("app:collapseVoiceWindowFromRightPane"),
   openDebugWindow: () => ipcRenderer.invoke("app:openDebugWindow"),
   getEvents: () => ipcRenderer.invoke("app:getEvents"),
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
   logEvent: (event: AppEvent) => ipcRenderer.invoke("app:logEvent", event),
-  createProject: (name?: string) => ipcRenderer.invoke("projects:create", { name }),
+  selectWorkspaceFolder: () => ipcRenderer.invoke("projects:selectWorkspaceFolder"),
+  setWorkspaceFolder: (workspacePath: string, name?: string | null) =>
+    ipcRenderer.invoke("projects:setWorkspaceFolder", { workspacePath, name }),
+  createProject: (name?: string, workspacePath?: string | null) =>
+    ipcRenderer.invoke("projects:create", { name, workspacePath }),
   resumeProject: (projectId: string) => ipcRenderer.invoke("projects:resume", { projectId }),
   archiveProject: (projectId: string) => ipcRenderer.invoke("projects:archive", { projectId }),
   restoreProject: (projectId: string) => ipcRenderer.invoke("projects:restore", { projectId }),
@@ -33,8 +42,13 @@ const api: CodexVoiceApi = {
   showProjectChats: (open?: boolean) => ipcRenderer.invoke("projects:showChats", { open }),
   summarizeProject: (projectId?: string, chatId?: string) =>
     ipcRenderer.invoke("projects:summarize", { projectId, chatId }),
-  sendToCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:send", { text, chatId }),
+  sendToCodex: (text: string, chatId?: string, workspacePath?: string | null) =>
+    ipcRenderer.invoke("codex:send", { text, chatId, workspacePath }),
   steerCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:steer", { text, chatId }),
+  queueCodexRequest: (text: string, chatId?: string, workspacePath?: string | null) =>
+    ipcRenderer.invoke("codex:queue", { text, chatId, workspacePath }),
+  cancelQueuedCodexRequest: (queuedId?: string | null, chatId?: string) =>
+    ipcRenderer.invoke("codex:cancelQueued", { queuedId, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
   setCodexSettings: (
@@ -50,9 +64,19 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:answerApproval", { requestId, decision }),
   answerToolQuestion: (requestId: string | number, answers: ToolQuestionAnswer[]) =>
     ipcRenderer.invoke("codex:answerToolQuestion", { requestId, answers }),
+  getActiveThreadSummary: (chatId?: string) =>
+    ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
+  getTranscriptMessages: (chatId?: string) =>
+    ipcRenderer.invoke("rightPanel:getTranscriptMessages", { chatId }),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),
+  setRealtimeSettings: (settings) => ipcRenderer.invoke("realtime:setSettings", { settings }),
+  onWindowChromeState: (listener: (state: WindowChromeState) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: WindowChromeState) => listener(state);
+    ipcRenderer.on("app:windowChromeState", handler);
+    return () => ipcRenderer.off("app:windowChromeState", handler);
+  },
   onAppState: (listener: (state: AppState) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, state: AppState) => listener(state);
     ipcRenderer.on("app:state", handler);

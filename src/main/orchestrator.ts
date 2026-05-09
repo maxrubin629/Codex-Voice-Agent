@@ -1,7 +1,13 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
+import path from "node:path";
 import type {
   AppEvent,
+  ActiveThreadSummary,
+  CancelQueuedCodexRequestResult,
   CodexApprovalPolicy,
+  CodexApprovalsReviewer,
   AppState,
   ApprovalDecision,
   CodexActionResult,
@@ -20,9 +26,17 @@ import type {
   PendingRequestQuestion,
   PendingRequestQuestionOption,
   PendingCodexRequest,
+  QueuedCodexRequestResult,
+  RealtimeReasoningEffort,
   ReasoningEffort,
+  ThreadArtifactCandidate,
+  ThreadProgressItem,
+  ThreadSourceCandidate,
+  ThreadSummaryItem,
+  ThreadSummaryTurn,
   ToolQuestionAnswer,
   VoiceProject,
+  VoiceTranscriptMessage,
 } from "../shared/types";
 import {
   CODEX_PERMISSION_PROFILES,
@@ -32,8 +46,9 @@ import {
   DEFAULT_CODEX_SERVICE_TIER,
   FAST_CODEX_SERVICE_TIER,
 } from "../shared/types";
+import { transcriptMessageFromEvent } from "../shared/transcriptMessages";
 import { CodexBridge, type CodexJsonMessage } from "./codexBridge";
-import { createRealtimeClientSecret, realtimeConfig } from "./realtime";
+import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
 import { ProjectStore } from "./projectStore";
 
 type TurnWaiter = {
@@ -45,7 +60,9 @@ type TurnWaiter = {
 
 type ThreadReadResponse = {
   thread?: {
+    id?: string;
     turns?: CodexThreadTurn[];
+    status?: unknown;
   };
 };
 
@@ -57,12 +74,16 @@ type CodexThreadTurn = {
   startedAt?: number | null;
   completedAt?: number | null;
   durationMs?: number | null;
+  [key: string]: unknown;
 };
 
 type CodexThreadItem = {
   type?: string;
   text?: string;
   phase?: string | null;
+  status?: string;
+  id?: string;
+  [key: string]: unknown;
 };
 
 type ChatContext = {
@@ -71,11 +92,37 @@ type ChatContext = {
   recovered?: boolean;
 };
 
+const CODEX_VOICE_BRIDGE_PROMPT = [
+  "This thread will sometimes receive messages from a voice interface.",
+  "",
+  "Codex (you) owns the actual planning, computer use, tool use, browser use, and execution.",
+  "",
+  "For requests that may require controlling desktop apps or browser state, use tool_search to discover relevant tools such as computer-use or Chrome before choosing an approach. Ask for clarification or approval when needed, and keep final outputs clear, with the right amount of detail to be relayed by voice.",
+  "",
+  "Messages beginning with exactly `Voice ===` followed by a newline are mediated by the Realtime model. Treat the content after that marker as the user's intended request, but account for possible transcription, summarization, or routing errors. The Realtime model cannot directly see the state of the project or thread unless that information is provided to it through the conversation. If the request is ambiguous, ask a concise clarification.",
+  "",
+  "Messages that do not begin with that marker are normal text-based messages from the user and should be treated normally.",
+  "",
+  "Do not mention this convention unless it is relevant to resolving ambiguity.",
+].join("\n");
+const CODEX_VOICE_MARKER = "Voice ===\n";
+const CODEX_VOICE_BRIDGE_PROMPT_PATTERN = new RegExp(escapeRegExp(CODEX_VOICE_BRIDGE_PROMPT));
+
 type ReviewTarget =
   | { type: "uncommittedChanges" }
   | { type: "baseBranch"; branch: string }
   | { type: "commit"; sha: string; title: string | null }
   | { type: "custom"; instructions: string };
+
+type QueuedCodexRequest = {
+  id: string;
+  text: string;
+  chatId: string;
+  projectId: string;
+  threadId: string;
+  workspacePath: string | null;
+  queuedAt: string;
+};
 
 export class VoiceCodexOrchestrator extends EventEmitter {
   private activeProjectId: string | null = null;
@@ -100,6 +147,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private threadByTurn = new Map<string, string>();
   private tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
   private threadStatusByThread = new Map<string, string>();
+  private queuedRequestsByThread = new Map<string, QueuedCodexRequest[]>();
+  private drainingQueuedThreads = new Set<string>();
 
   constructor(
     private readonly store: ProjectStore,
@@ -151,14 +200,47 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     };
   }
 
-  async createProject(name?: string): Promise<VoiceProject> {
-    const project = await this.store.createProject(name);
+  async createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject> {
+    const resolvedWorkspacePath = await resolveWorkspacePathInput(workspacePath);
+    const project = await this.store.createProject(name, resolvedWorkspacePath);
     this.activeProjectId = project.id;
     this.showProjectChatsFlag = false;
     this.status = `Active project: ${project.displayName}`;
     this.emitEvent("app", "projectCreated", `Created project "${project.displayName}".`, project);
     this.emitState();
     return project;
+  }
+
+  async setWorkspaceFolder(workspacePath?: string | null, name?: string | null): Promise<VoiceProject> {
+    const resolvedWorkspacePath = await resolveWorkspacePathInput(workspacePath);
+    if (!resolvedWorkspacePath) throw new Error("No workspace folder selected.");
+
+    const activeProject = await this.getActiveProject();
+    const projects = await this.store.listProjects();
+    const existing = projects.find((project) => samePath(projectWorkspacePath(project), resolvedWorkspacePath));
+    if (existing && existing.id !== activeProject?.id) {
+      this.activeProjectId = existing.id;
+      this.showProjectChatsFlag = false;
+      this.status = `Active project: ${existing.displayName}`;
+      this.emitEvent("app", "workspaceSelected", `Selected workspace "${existing.displayName}".`, existing);
+      this.emitState();
+      return existing;
+    }
+
+    if (!activeProject) {
+      return this.createProject(name || path.basename(resolvedWorkspacePath) || undefined, resolvedWorkspacePath);
+    }
+
+    const updated = await this.store.updateProject(activeProject.id, {
+      workspacePath: resolvedWorkspacePath,
+      lastStatus: `Workspace: ${resolvedWorkspacePath}`,
+    });
+    this.activeProjectId = updated.id;
+    this.showProjectChatsFlag = false;
+    this.status = `Workspace selected: ${resolvedWorkspacePath}`;
+    this.emitEvent("app", "workspaceSelected", `Selected workspace "${resolvedWorkspacePath}".`, updated);
+    this.emitState();
+    return updated;
   }
 
   async resumeProject(projectId: string): Promise<VoiceProject> {
@@ -286,7 +368,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
-  async sendToCodex(text: string, chatId?: string): Promise<CodexActionResult> {
+  async sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult> {
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Cannot send an empty request to Codex.");
 
@@ -294,22 +376,17 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       return this.handleNativeSlashCommand(trimmed);
     }
 
-    let context: ChatContext;
-    if (!this.activeProjectId && !chatId) {
-      const project = await this.createProject(titleFromText(trimmed));
-      const updated = await this.startChatThread(project, titleFromText(trimmed));
-      context = this.requireActiveChatContextFromProject(updated);
-    } else {
-      context = await this.requireChatContextForPrompt(trimmed, chatId);
-    }
+    const context = await this.resolveChatContextForRequest(trimmed, chatId, workspacePath);
     const { project, chat } = await this.resumeChatThread(context.project, context.chat);
     if (!chat.codexThreadId) throw new Error("Active chat is missing a Codex thread id.");
 
     const turnSettings = this.resolveTurnSettings(project, chat);
+    const cwd = projectWorkspacePath(project);
+    const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(chat.codexThreadId);
     const result = (await this.codex.request("turn/start", {
       threadId: chat.codexThreadId,
-      cwd: project.folderPath,
-      ...permissionParams(turnSettings.permissionMode),
+      cwd,
+      ...turnPermissionParams(turnSettings.permissionMode),
       personality: "friendly",
       ...(turnSettings.model ? { model: turnSettings.model } : {}),
       ...(turnSettings.serviceTier ? { serviceTier: turnSettings.serviceTier } : {}),
@@ -317,7 +394,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       input: [
         {
           type: "text",
-          text: codexTurnText(trimmed),
+          text: codexVoiceTurnText(trimmed, bridgeAlreadyInjected),
           text_elements: [],
         },
       ],
@@ -380,6 +457,142 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return { turnId };
   }
 
+  async queueCodexRequest(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+  ): Promise<QueuedCodexRequestResult> {
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Cannot queue an empty request for Codex.");
+
+    const { project, chat } = await this.resolveChatContextForRequest(trimmed, chatId, workspacePath);
+    const threadId = chat.codexThreadId;
+    const activeTurnId = threadId ? this.activeTurnByThread.get(threadId) ?? null : null;
+    if (!threadId || !activeTurnId) {
+      const started = await this.sendToCodex(trimmed, chat.id, workspacePath);
+      return {
+        queued: false,
+        queuedId: null,
+        message: "Codex was idle, so the request started immediately.",
+        chatId: chat.id,
+        turnId: started.turnId,
+        position: 0,
+        text: trimmed,
+        started,
+      };
+    }
+
+    const queue = this.queuedRequestsByThread.get(threadId) ?? [];
+    const queued: QueuedCodexRequest = {
+      id: randomUUID(),
+      text: trimmed,
+      chatId: chat.id,
+      projectId: project.id,
+      threadId,
+      workspacePath: workspacePath?.trim() || null,
+      queuedAt: new Date().toISOString(),
+    };
+    queue.push(queued);
+    this.queuedRequestsByThread.set(threadId, queue);
+
+    await this.store.updateChat(project.id, chat.id, {
+      lastStatus: queue.length === 1 ? "Queued next request." : `Queued ${queue.length} requests.`,
+    });
+    this.status = `Queued next request for "${chat.displayName}".`;
+    this.emitEvent("app", "turnQueued", this.status, {
+      queuedId: queued.id,
+      chatId: chat.id,
+      threadId,
+      activeTurnId,
+      position: queue.length,
+      text: trimmed,
+    });
+    this.emitState();
+    return {
+      queued: true,
+      queuedId: queued.id,
+      message: `Queued request ${queue.length} for "${chat.displayName}".`,
+      chatId: chat.id,
+      turnId: activeTurnId,
+      position: queue.length,
+      text: trimmed,
+    };
+  }
+
+  async cancelQueuedCodexRequest(
+    queuedId?: string | null,
+    chatId?: string,
+  ): Promise<CancelQueuedCodexRequestResult> {
+    const targetQueuedId = queuedId?.trim() || null;
+    const scopedContext = !targetQueuedId || chatId ? await this.requireChatContext(chatId) : null;
+    const scopedChatId = scopedContext?.chat.id ?? null;
+    const scopedThreadId = scopedContext?.chat.codexThreadId ?? null;
+
+    let match:
+      | {
+          threadId: string;
+          queue: QueuedCodexRequest[];
+          index: number;
+          queued: QueuedCodexRequest;
+        }
+      | null = null;
+
+    for (const [threadId, queue] of this.queuedRequestsByThread.entries()) {
+      if (scopedThreadId && threadId !== scopedThreadId) continue;
+      const index = targetQueuedId
+        ? queue.findIndex((queued) => queued.id === targetQueuedId)
+        : lastQueuedRequestIndexForChat(queue, scopedChatId);
+      if (index === -1) continue;
+      match = { threadId, queue, index, queued: queue[index] };
+      break;
+    }
+
+    if (!match) {
+      throw new Error(
+        targetQueuedId
+          ? `No queued Codex request matched ${targetQueuedId}.`
+          : "There is no queued Codex request to cancel.",
+      );
+    }
+
+    match.queue.splice(match.index, 1);
+    if (match.queue.length === 0) {
+      this.queuedRequestsByThread.delete(match.threadId);
+    } else {
+      this.queuedRequestsByThread.set(match.threadId, match.queue);
+    }
+
+    const context = await this.findChatByThread(match.threadId);
+    const remaining = match.queue.length;
+    const message = remaining === 0
+      ? "Cancelled the queued Codex request."
+      : `Cancelled the queued Codex request. ${remaining} queued request${remaining === 1 ? "" : "s"} remain.`;
+    if (context) {
+      await this.store.updateChat(context.project.id, context.chat.id, {
+        lastStatus: remaining === 0 ? "Cancelled queued request." : `Queued ${remaining} requests.`,
+      });
+    }
+    this.status = message;
+    this.emitEvent("app", "queuedTurnCancelled", message, {
+      queuedId: match.queued.id,
+      chatId: match.queued.chatId,
+      threadId: match.threadId,
+      remaining,
+      text: match.queued.text,
+    });
+    this.emitState();
+
+    return {
+      cancelled: true,
+      queuedId: match.queued.id,
+      message,
+      chatId: match.queued.chatId,
+      threadId: match.threadId,
+      remaining,
+      text: match.queued.text,
+    };
+  }
+
   async interruptCodex(chatId?: string): Promise<void> {
     const { project, chat } = await this.requireChatContext(chatId);
     const threadId = chat.codexThreadId;
@@ -416,8 +629,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const turnSettings = this.resolveTurnSettings(resumed.project, resumed.chat);
     const result = (await this.codex.request("turn/start", {
       threadId: resumedThreadId,
-      cwd: resumed.project.folderPath,
-      ...permissionParams(turnSettings.permissionMode),
+      cwd: projectWorkspacePath(resumed.project),
+      ...turnPermissionParams(turnSettings.permissionMode),
       personality: "friendly",
       ...(turnSettings.model ? { model: turnSettings.model } : {}),
       ...(turnSettings.serviceTier ? { serviceTier: turnSettings.serviceTier } : {}),
@@ -627,6 +840,79 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return chatId ? runtimes.filter((runtime) => runtime.chatId === chatId) : runtimes;
   }
 
+  async getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary> {
+    let project: VoiceProject | null = null;
+    let chat: VoiceChat | null = null;
+    try {
+      project = chatId ? await this.requireProjectForChat(chatId) : await this.getActiveProject();
+      chat = project
+        ? chatId
+          ? project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt) ?? null
+          : activeChatForProject(project)
+        : null;
+    } catch (error) {
+      return emptyActiveThreadSummary({
+        status: "error",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!project) {
+      return emptyActiveThreadSummary({
+        status: "empty",
+        errorMessage: "No active project.",
+      });
+    }
+    if (!chat) {
+      return emptyActiveThreadSummary({
+        status: "empty",
+        project,
+        errorMessage: "No active chat.",
+      });
+    }
+    if (!chat.codexThreadId) {
+      return emptyActiveThreadSummary({
+        status: "empty",
+        project,
+        chat,
+        errorMessage: "Active chat does not have a Codex thread yet.",
+      });
+    }
+
+    try {
+      const response = (await this.codex.request("thread/read", {
+        threadId: chat.codexThreadId,
+        includeTurns: true,
+      })) as ThreadReadResponse;
+      return activeThreadSummaryFromRead(project, chat, response);
+    } catch (error) {
+      return emptyActiveThreadSummary({
+        status: "error",
+        project,
+        chat,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async getTranscriptMessages(chatId?: string): Promise<VoiceTranscriptMessage[]> {
+    const project = chatId ? await this.requireProjectForChat(chatId) : await this.getActiveProject();
+    const chat = project
+      ? chatId
+        ? project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt) ?? null
+        : activeChatForProject(project)
+      : null;
+    if (!project || !chat) return [];
+    return this.store.listTranscriptMessages(project.id, chat.id);
+  }
+
+  async recordTranscriptEvent(event: AppEvent): Promise<void> {
+    const message = transcriptMessageFromEvent(event);
+    if (!message) return;
+    const project = await this.requireProjectForChat(message.chatId);
+    await this.store.upsertTranscriptMessage(project.id, message.chatId, message);
+  }
+
   async setCodexSettings(
     settings: {
       model?: string | null;
@@ -714,6 +1000,20 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
   createRealtimeClientSecret = createRealtimeClientSecret;
 
+  async setRealtimeSettings(settings: {
+    model?: AppState["realtime"]["model"] | null;
+    voice?: AppState["realtime"]["voice"] | null;
+    reasoningEffort?: RealtimeReasoningEffort | null;
+  }): Promise<AppState["realtime"]> {
+    const config = saveRealtimeSettings(settings);
+    this.status = `Updated Realtime voice: ${config.model}, ${config.voice}, reasoning ${
+      config.reasoningEffort ?? "none"
+    }.`;
+    this.emitEvent("app", "settingsChanged", this.status, config);
+    this.emitState();
+    return config;
+  }
+
   private async getActiveProject(): Promise<VoiceProject | null> {
     return this.activeProjectId ? this.store.getProject(this.activeProjectId) : null;
   }
@@ -739,6 +1039,38 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         candidate.chats.some((chat) => chat.id === chatId && (includeArchived || !chat.archivedAt)),
       ) ?? null
     );
+  }
+
+  private async projectForWorkspace(displayName: string, workspacePath: string): Promise<VoiceProject> {
+    const projects = await this.store.listProjects();
+    const existing = projects.find((project) => samePath(projectWorkspacePath(project), workspacePath));
+    if (existing) {
+      this.activeProjectId = existing.id;
+      return existing;
+    }
+    return this.createProject(displayName, workspacePath);
+  }
+
+  private async resolveChatContextForRequest(
+    trimmed: string,
+    chatId?: string,
+    workspacePath?: string | null,
+  ): Promise<ChatContext> {
+    const resolvedWorkspacePath = workspacePath?.trim()
+      ? await resolveWorkspacePathInput(workspacePath)
+      : await inferWorkspacePathFromText(trimmed);
+    if (resolvedWorkspacePath && !chatId) {
+      const project = await this.projectForWorkspace(titleFromText(trimmed), resolvedWorkspacePath);
+      const chat = activeChatForProject(project);
+      const updated = chat ? project : await this.startChatThread(project, titleFromText(trimmed));
+      return this.requireActiveChatContextFromProject(updated);
+    }
+    if (!this.activeProjectId && !chatId) {
+      const project = await this.createProject(titleFromText(trimmed));
+      const updated = await this.startChatThread(project, titleFromText(trimmed));
+      return this.requireActiveChatContextFromProject(updated);
+    }
+    return this.requireChatContextForPrompt(trimmed, chatId);
   }
 
   private async requireActiveProject(): Promise<VoiceProject> {
@@ -778,6 +1110,14 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return { project, chat };
   }
 
+  private async threadHasVoiceBridgePrompt(threadId: string): Promise<boolean> {
+    const response = (await this.codex.request("thread/read", {
+      threadId,
+      includeTurns: true,
+    })) as ThreadReadResponse;
+    return threadTurnsHaveVoiceBridgePrompt(response.thread?.turns);
+  }
+
   private async resumeChatThread(project: VoiceProject, chat: VoiceChat): Promise<ChatContext> {
     if (!chat.codexThreadId) {
       throw new Error(`Chat "${chat.displayName}" does not have a Codex thread id.`);
@@ -787,29 +1127,31 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     try {
       await this.codex.request("thread/resume", {
         threadId: chat.codexThreadId,
-        cwd: project.folderPath,
-        ...permissionParams(chatSettings.permissionMode),
+        cwd: projectWorkspacePath(project),
+        ...threadPermissionParams(chatSettings.permissionMode),
         personality: "friendly",
         excludeTurns: true,
         ...(chatSettings.model ? { model: chatSettings.model } : {}),
         ...(chatSettings.serviceTier ? { serviceTier: chatSettings.serviceTier } : {}),
       });
+      await this.syncThreadName(chat.codexThreadId, chat.displayName);
       return { project, chat };
     } catch (error) {
       if (!isMissingCodexThreadError(error)) throw error;
     }
 
     const result = (await this.codex.request("thread/start", {
-      cwd: project.folderPath,
+      cwd: projectWorkspacePath(project),
       ...(chatSettings.model ? { model: chatSettings.model } : {}),
       ...(chatSettings.serviceTier ? { serviceTier: chatSettings.serviceTier } : {}),
-      ...permissionParams(chatSettings.permissionMode),
+      ...threadPermissionParams(chatSettings.permissionMode),
       personality: "friendly",
       serviceName: "codex_voice",
     })) as { thread?: { id?: string } };
 
     const codexThreadId = result.thread?.id;
     if (!codexThreadId) throw new Error("Codex did not return a replacement thread id.");
+    await this.syncThreadName(codexThreadId, chat.displayName);
 
     const updatedProject = await this.store.updateChat(project.id, chat.id, {
       codexThreadId,
@@ -830,18 +1172,29 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private async startChatThread(project: VoiceProject, displayName: string): Promise<VoiceProject> {
     const chatSettings = this.initialChatSettings(project);
     const result = (await this.codex.request("thread/start", {
-      cwd: project.folderPath,
+      cwd: projectWorkspacePath(project),
       ...(chatSettings.model ? { model: chatSettings.model } : {}),
       ...(chatSettings.serviceTier ? { serviceTier: chatSettings.serviceTier } : {}),
-      ...permissionParams(chatSettings.permissionMode),
+      ...threadPermissionParams(chatSettings.permissionMode),
       personality: "friendly",
       serviceName: "codex_voice",
     })) as { thread?: { id?: string } };
 
     const codexThreadId = result.thread?.id;
     if (!codexThreadId) throw new Error("Codex did not return a thread id.");
+    await this.syncThreadName(codexThreadId, displayName);
 
     return this.store.addChat(project.id, displayName, codexThreadId, chatSettings);
+  }
+
+  private async syncThreadName(threadId: string, name: string): Promise<void> {
+    try {
+      await this.codex.request("thread/name/set", { threadId, name });
+    } catch (error) {
+      this.emitEvent("app", "threadNameSyncFailed", `Could not sync Codex thread name: ${error instanceof Error ? error.message : String(error)}`, {
+        threadId,
+      });
+    }
   }
 
   private handleServerRequest(message: CodexJsonMessage): void {
@@ -865,7 +1218,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       this.status = status;
       this.emitEvent("codex", method, status, message.params);
       if (threadId) this.updateChatForThread(threadId, { lastStatus: status });
-    } else if (method !== "item/agentMessage/delta") {
+    } else {
       this.emitEvent("codex", method, method, message.params);
     }
 
@@ -922,11 +1275,31 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           this.activeTurnReasoningEffortByThread.delete(completedThreadId);
           this.activeTurnServiceTierByThread.delete(completedThreadId);
           this.activeTurnPermissionModeByThread.delete(completedThreadId);
-          const lastStatus = turn.status === "failed" ? "Codex turn failed." : "Codex finished.";
-          if (turn.id) {
-            void this.captureCompletedTurnOutput(completedThreadId, turn.id, lastStatus);
+          const lastStatus = completedTurnStatusText(turn.status);
+          const cleared = this.clearPendingRequestsForTurn(completedThreadId, turn.id);
+          if (cleared > 0) {
+            this.emitEvent("app", "pendingRequestsCleared", `Cleared ${cleared} pending Codex request${cleared === 1 ? "" : "s"} for the ended turn.`, {
+              threadId: completedThreadId,
+              turnId: turn.id,
+            });
+          }
+          const nextQueuedRequest = this.peekQueuedRequest(completedThreadId);
+          if (turn.id && turn.status !== "interrupted") {
+            const completedTurnId = turn.id;
+            void (async () => {
+              const announcedWithFinalOutput = await this.captureCompletedTurnOutput(
+                completedThreadId,
+                completedTurnId,
+                lastStatus,
+                nextQueuedRequest?.text,
+              );
+              await this.startNextQueuedRequest(completedThreadId, completedTurnId, announcedWithFinalOutput);
+            })();
           } else {
-            this.updateChatForThread(completedThreadId, { lastStatus });
+            void (async () => {
+              await this.updateCompletedTurnStatus(completedThreadId, lastStatus);
+              await this.startNextQueuedRequest(completedThreadId, turn.id, false);
+            })();
           }
         }
       }
@@ -938,6 +1311,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           this.turnWaiters.delete(turn.id);
           if (turn.status === "failed") {
             waiter.reject(new Error(turn.error?.message ?? "Codex summary turn failed."));
+          } else if (turn.status === "interrupted") {
+            waiter.reject(new Error("Codex summary turn was interrupted."));
           } else {
             waiter.resolve(waiter.text.trim() || "Codex finished, but no summary text was returned.");
           }
@@ -946,6 +1321,68 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     }
 
     this.emitState();
+  }
+
+  private clearPendingRequestsForTurn(threadId: string, turnId?: string): number {
+    let cleared = 0;
+    for (const [requestId, request] of this.pendingRequests.entries()) {
+      if (request.threadId !== threadId) continue;
+      if (turnId && request.turnId && request.turnId !== turnId) continue;
+      this.pendingRequests.delete(requestId);
+      cleared += 1;
+    }
+    return cleared;
+  }
+
+  private peekQueuedRequest(threadId: string): QueuedCodexRequest | null {
+    return this.queuedRequestsByThread.get(threadId)?.[0] ?? null;
+  }
+
+  private async startNextQueuedRequest(
+    threadId: string,
+    previousTurnId: string | undefined,
+    announcedWithFinalOutput: boolean,
+  ): Promise<void> {
+    if (this.drainingQueuedThreads.has(threadId)) return;
+    const queue = this.queuedRequestsByThread.get(threadId);
+    const queued = queue?.shift();
+    if (!queued) return;
+    if (!queue || queue.length === 0) {
+      this.queuedRequestsByThread.delete(threadId);
+    }
+
+    this.drainingQueuedThreads.add(threadId);
+    try {
+      const context = await this.findChatByThread(threadId);
+      if (!context) {
+        throw new Error("Could not find the chat for the queued Codex request.");
+      }
+      this.status = `Codex finished and is moving on to "${shortRequestLabel(queued.text)}".`;
+      await this.store.updateChat(context.project.id, context.chat.id, {
+        lastStatus: "Starting queued request.",
+      });
+      const result = await this.sendToCodex(queued.text, context.chat.id, queued.workspacePath);
+      this.emitEvent("app", "queuedTurnStarted", this.status, {
+        queuedId: queued.id,
+        previousTurnId,
+        turnId: result.turnId,
+        chatId: context.chat.id,
+        threadId,
+        text: queued.text,
+        announcedWithFinalOutput,
+      });
+    } catch (error) {
+      this.emitEvent("app", "queuedTurnFailed", "Codex finished, but the queued request could not be started.", {
+        queuedId: queued.id,
+        previousTurnId,
+        threadId,
+        text: queued.text,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.emitState();
+    } finally {
+      this.drainingQueuedThreads.delete(threadId);
+    }
   }
 
   private waitForTurnText(turnId: string): Promise<string> {
@@ -958,7 +1395,12 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     });
   }
 
-  private async captureCompletedTurnOutput(threadId: string, turnId: string, lastStatus: string): Promise<void> {
+  private async captureCompletedTurnOutput(
+    threadId: string,
+    turnId: string,
+    lastStatus: string,
+    nextQueuedRequestText?: string,
+  ): Promise<boolean> {
     try {
       const response = (await this.codex.request("thread/read", {
         threadId,
@@ -967,22 +1409,31 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       const turn = response.thread?.turns?.find((candidate) => candidate.id === turnId);
       if (!turn) {
         await this.updateCompletedTurnStatus(threadId, lastStatus);
-        this.emitEvent("app", "turnOutputUnavailable", "Codex completed, but thread/read did not include the completed turn.", {
+        this.emitEvent("app", "turnOutputUnavailable", "Codex turn ended, but thread/read did not include the completed turn.", {
           threadId,
           turnId,
         });
-        return;
+        return false;
+      }
+
+      if (turn.status === "interrupted") {
+        await this.updateCompletedTurnStatus(threadId, lastStatus);
+        this.emitEvent("app", "turnOutputSkipped", "Codex turn was interrupted; partial output was not injected into voice context.", {
+          threadId,
+          turnId,
+        });
+        return false;
       }
 
       const finalAssistantText = finalAssistantTextFromTurn(turn);
       if (!finalAssistantText) {
         await this.updateCompletedTurnStatus(threadId, lastStatus);
-        this.emitEvent("app", "turnOutputUnavailable", "Codex completed, but no final assistant output was available.", {
+        this.emitEvent("app", "turnOutputUnavailable", "Codex turn ended, but no final assistant output was available.", {
           threadId,
           turnId,
           status: turn.status,
         });
-        return;
+        return false;
       }
 
       const output: CodexTurnOutput = {
@@ -990,6 +1441,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         turnId,
         status: turn.status ?? "completed",
         finalAssistantText,
+        ...(nextQueuedRequestText ? { nextQueuedRequestText } : {}),
+        items: Array.isArray(turn.items) ? turn.items : [],
         startedAt: numberOrNull(turn.startedAt),
         completedAt: numberOrNull(turn.completedAt),
         durationMs: numberOrNull(turn.durationMs),
@@ -1004,6 +1457,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       }
       this.emitEvent("codex", "turn/finalOutput", "Codex final output is available for voice context.", output);
       this.emitState();
+      return true;
     } catch (error) {
       await this.updateCompletedTurnStatus(threadId, lastStatus);
       this.emitEvent(
@@ -1012,6 +1466,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         error instanceof Error ? error.message : "Unable to read Codex final turn output.",
         { threadId, turnId },
       );
+      return false;
     }
   }
 
@@ -1285,7 +1740,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     if (lowerCommand === "new") {
       const project = await this.createProject(rest || undefined);
-      return this.commandResult(`Created new Codex voice project: ${project.displayName}\n${project.folderPath}`, project);
+      return this.commandResult(
+        `Created new Codex voice project: ${project.displayName}\nWorkspace: ${projectWorkspacePath(project)}\nVoice folder: ${project.folderPath}`,
+        project,
+      );
     }
 
     if (lowerCommand === "resume") {
@@ -1373,7 +1831,11 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           "Permission modes",
           ...CODEX_PERMISSION_PROFILES.map(
             (profile) =>
-              `${profile.mode} - ${profile.displayName}: approval ${profile.approvalPolicy}, sandbox ${profile.sandbox}`,
+              `${profile.mode} - ${profile.displayName}: approval ${formatPermissionValue(
+                profile.approvalPolicy,
+              )}, reviewer ${formatPermissionValue(profile.approvalsReviewer)}, sandbox ${formatPermissionValue(
+                profile.sandbox,
+              )}`,
           ),
         ].join("\n"),
         activeProject,
@@ -1451,7 +1913,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private async handlePluginsSlash(): Promise<CodexActionResult> {
     const project = await this.getActiveProject();
     const result = (await this.codex.request("plugin/list", {
-      cwds: project?.folderPath ? [project.folderPath] : null,
+      cwds: project ? [projectWorkspacePath(project)] : null,
     })) as {
       marketplaces?: Array<{
         name: string;
@@ -1485,7 +1947,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       "Codex /status",
       `Chat: ${chat?.displayName ?? "none"}`,
       `Thread: ${threadId ?? "none"}`,
-      `Folder: ${project?.folderPath ?? "none"}`,
+      `Workspace: ${project ? projectWorkspacePath(project) : "none"}`,
+      `Voice folder: ${project?.folderPath ?? "none"}`,
       `Runtime: ${this.threadStatusByThread.get(threadId ?? "") ?? this.status}`,
       `Active turn: ${threadId ? this.activeTurnByThread.get(threadId) ?? "none" : "none"}`,
       `Effective next turn: model ${resolved.model ?? "default"}, reasoning ${
@@ -1510,14 +1973,16 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     try {
       const result = (await this.codex.request("config/read", {
         includeLayers: false,
-        cwd: project?.folderPath ?? null,
+        cwd: project ? projectWorkspacePath(project) : null,
       })) as { config?: Record<string, unknown> };
       const config = result.config ?? {};
       return `Config defaults: model ${formatConfigValue(config.model)}, reasoning ${formatConfigValue(
         config.model_reasoning_effort,
       )}, speed ${formatServiceTier(
         typeof config.service_tier === "string" ? config.service_tier : null,
-      )}, approval ${formatConfigValue(config.approval_policy)}, sandbox ${formatConfigValue(config.sandbox_mode)}.`;
+      )}, approval ${formatConfigValue(config.approval_policy)}, reviewer ${formatConfigValue(
+        config.approvals_reviewer,
+      )}, sandbox ${formatConfigValue(config.sandbox_mode)}.`;
     } catch (error) {
       return `Config defaults: unavailable (${error instanceof Error ? error.message : String(error)}).`;
     }
@@ -1648,16 +2113,821 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 }
 
-function finalAssistantTextFromTurn(turn: CodexThreadTurn): string | null {
-  const agentMessages = (turn.items ?? []).filter(
-    (item): item is CodexThreadItem & { text: string } =>
-      item.type === "agentMessage" && typeof item.text === "string" && item.text.trim().length > 0,
+function emptyActiveThreadSummary({
+  status = "empty",
+  project = null,
+  chat = null,
+  errorMessage,
+}: {
+  status?: ActiveThreadSummary["status"];
+  project?: VoiceProject | null;
+  chat?: VoiceChat | null;
+  errorMessage?: string;
+}): ActiveThreadSummary {
+  return {
+    status,
+    ...(errorMessage ? { errorMessage } : {}),
+    projectId: project?.id ?? null,
+    projectName: project?.displayName ?? null,
+    workspacePath: project ? projectWorkspacePath(project) : null,
+    chatId: chat?.id ?? null,
+    chatName: chat?.displayName ?? null,
+    threadId: chat?.codexThreadId ?? null,
+    turnCount: 0,
+    latestTurnStatus: null,
+    latestAssistantText: chat?.lastTurnOutput?.finalAssistantText ?? null,
+    progress: [],
+    artifacts: [],
+    sources: [],
+    referencedFiles: [],
+    turns: [],
+    rawUnknownItems: [],
+  };
+}
+
+function activeThreadSummaryFromRead(
+  project: VoiceProject,
+  chat: VoiceChat,
+  response: ThreadReadResponse,
+): ActiveThreadSummary {
+  const rawTurns = response.thread?.turns ?? [];
+  const turns = rawTurns.map((turn, index) => summarizeThreadTurn(turn, index));
+  const rawItems = rawTurns.flatMap((turn) => turn.items ?? []);
+  const artifacts = dedupeArtifacts([
+    ...rawTurns.flatMap((turn, index) => artifactCandidatesFromTurn(turn, index)),
+    ...rawItems.flatMap((item, index) => artifactCandidatesFromItem(item, index)),
+  ]);
+  const sources = dedupeSources(rawItems.flatMap((item, index) => sourceCandidatesFromItem(item, index)));
+  const referencedFiles = artifacts.filter((artifact) => artifact.kind === "file");
+  const latestAssistantText =
+    [...turns].reverse().find((turn) => turn.assistantText?.trim())?.assistantText ??
+    chat.lastTurnOutput?.finalAssistantText ??
+    null;
+  const latestTurn = rawTurns.at(-1) ?? null;
+
+  return {
+    status: "ready",
+    projectId: project.id,
+    projectName: project.displayName,
+    workspacePath: projectWorkspacePath(project),
+    chatId: chat.id,
+    chatName: chat.displayName,
+    threadId: chat.codexThreadId,
+    turnCount: rawTurns.length,
+    latestTurnStatus: latestTurn?.status ?? null,
+    latestAssistantText,
+    progress: progressItemsFromThread(rawTurns, rawItems),
+    artifacts,
+    sources,
+    referencedFiles,
+    turns,
+    rawUnknownItems: rawItems
+      .filter((item) => !knownThreadItemTypes.has(normalizeThreadItemType(item)))
+      .slice(-40),
+  };
+}
+
+function summarizeThreadTurn(turn: CodexThreadTurn, index: number): ThreadSummaryTurn {
+  const items = turn.items ?? [];
+  return {
+    id: turn.id ?? `turn-${index + 1}`,
+    status: turn.status ?? "unknown",
+    startedAt: numberOrNull(turn.startedAt),
+    completedAt: numberOrNull(turn.completedAt),
+    durationMs: numberOrNull(turn.durationMs),
+    userText: userTextFromTurn(turn),
+    assistantText: finalAssistantTextFromTurn(turn),
+    itemCount: items.length,
+    items: items.map((item, itemIndex) => summarizeThreadItem(item, turn.id ?? `turn-${index + 1}`, itemIndex)),
+    ...(turn.error?.message ? { errorMessage: turn.error.message } : {}),
+  };
+}
+
+function summarizeThreadItem(item: CodexThreadItem, turnId: string, itemIndex: number): ThreadSummaryItem {
+  const type = rawThreadItemType(item);
+  return {
+    id: itemId(item, `${turnId}:item-${itemIndex + 1}`),
+    type,
+    status: stringField(item.status) ?? stringField(item.phase) ?? null,
+    label: labelForThreadItem(item),
+    detail: detailForThreadItem(item),
+    raw: item,
+  };
+}
+
+function progressItemsFromThread(
+  turns: CodexThreadTurn[],
+  rawItems: CodexThreadItem[],
+): ThreadProgressItem[] {
+  const progress: ThreadProgressItem[] = [];
+  for (const [index, item] of rawItems.entries()) {
+    const type = normalizeThreadItemType(item);
+    const status = normalizeProgressStatus(item.status ?? item.phase);
+    if (type === "todo-list") {
+      const tasks = taskRecords(item);
+      const completed = tasks.filter((task) => normalizeProgressStatus(task.status) === "completed").length;
+      progress.push({
+        id: itemId(item, `progress-${index}`),
+        label: "To do list",
+        detail: tasks.length > 0 ? `${completed} of ${tasks.length} tasks completed` : detailForThreadItem(item),
+        status: tasks.length > 0 && completed === tasks.length ? "completed" : status,
+        sourceType: type,
+        raw: item,
+      });
+      continue;
+    }
+    if (type === "proposed-plan" || type === "plan-implementation") {
+      progress.push({
+        id: itemId(item, `progress-${index}`),
+        label: type === "proposed-plan" ? "Plan proposed" : "Plan implementation",
+        detail: firstTextField(item, ["text", "summary", "description", "title"]),
+        status,
+        sourceType: type,
+        raw: item,
+      });
+      continue;
+    }
+    if (type === "reasoning") {
+      const summary = reasoningSummary(item);
+      if (summary) {
+        progress.push({
+          id: itemId(item, `progress-${index}`),
+          label: "Reasoning",
+          detail: summary,
+          status,
+          sourceType: type,
+          raw: item,
+        });
+      }
+      continue;
+    }
+    if (
+      status === "in_progress" ||
+      type === "exec" ||
+      type === "patch" ||
+      type === "web-search" ||
+      type === "mcp-tool-call" ||
+      type === "sub-agent" ||
+      type === "generated-image"
+    ) {
+      progress.push({
+        id: itemId(item, `progress-${index}`),
+        label: labelForThreadItem(item),
+        detail: detailForThreadItem(item),
+        status,
+        sourceType: type,
+        raw: item,
+      });
+    }
+  }
+
+  const latestTurn = turns.at(-1);
+  if (latestTurn && latestTurn.status && normalizeProgressStatus(latestTurn.status) === "in_progress") {
+    progress.push({
+      id: latestTurn.id ?? "latest-turn",
+      label: "Turn in progress",
+      detail: latestTurn.items?.at(-1) ? labelForThreadItem(latestTurn.items.at(-1)!) : null,
+      status: "in_progress",
+      sourceType: "turn",
+      raw: latestTurn,
+    });
+  }
+
+  return progress.slice(-18);
+}
+
+function artifactCandidatesFromTurn(turn: CodexThreadTurn, index: number): ThreadArtifactCandidate[] {
+  const candidates: ThreadArtifactCandidate[] = [];
+  const turnId = turn.id ?? `turn-${index + 1}`;
+  const artifacts = recordField(turn, "artifacts");
+  if (artifacts) {
+    for (const target of targetStringsFromFields(artifacts, ["editedFilePaths", "edited_file_paths"])) {
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-edited-${turnId}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Edited file",
+        mimeType: null,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+    for (const target of targetStringsFromFields(artifacts, [
+      "referencedFilePaths",
+      "referenced_file_paths",
+      "filePaths",
+      "file_paths",
+      "files",
+    ])) {
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-referenced-${turnId}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Referenced file",
+        mimeType: null,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+    for (const resource of recordsFromFields(artifacts, [
+      "endResources",
+      "end_resources",
+      "resources",
+      "generatedImages",
+      "generated_images",
+      "images",
+    ])) {
+      const target = firstStringField(resource, ["uri", "url", "path", "filePath", "target", "src"]);
+      if (!target) continue;
+      const mimeType = firstStringField(resource, ["mimeType", "mime_type", "contentType", "content_type"]);
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-resource-${turnId}:${target}`,
+        title: firstStringField(resource, ["name", "title"]) ?? titleFromTarget(target),
+        subtitle: mimeType ?? "Turn resource",
+        mimeType,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+    for (const target of collectTargets(artifacts).slice(0, 16)) {
+      candidates.push(artifactFromTarget(target.value, {
+        id: `turn-artifact-target-${turnId}:${target.value}`,
+        title: titleFromTarget(target.value),
+        subtitle: target.label,
+        mimeType: null,
+        sourceType: "turn-artifacts",
+        raw: turn,
+      }));
+    }
+  }
+
+  const assistantText = finalAssistantTextFromTurn(turn);
+  if (assistantText) {
+    for (const target of extractTargetsFromText(assistantText).slice(0, 12)) {
+      candidates.push(artifactFromTarget(target, {
+        id: `turn-artifact-text-${turnId}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Assistant output reference",
+        mimeType: null,
+        sourceType: "assistant-message",
+        raw: turn,
+      }));
+    }
+  }
+
+  return candidates;
+}
+
+function artifactCandidatesFromItem(item: CodexThreadItem, index: number): ThreadArtifactCandidate[] {
+  const candidates: ThreadArtifactCandidate[] = [];
+  const type = normalizeThreadItemType(item);
+  const directResource = recordField(item, "resource");
+  if (directResource) {
+    const uri = firstStringField(directResource, ["uri", "url", "target"]);
+    const mimeType = firstStringField(directResource, ["mimeType", "mime_type"]);
+    if (uri) {
+      candidates.push(artifactFromTarget(uri, {
+        id: itemId(item, `artifact-resource-${index}`),
+        title: firstStringField(directResource, ["name", "title"]) ?? titleFromTarget(uri),
+        subtitle: mimeType ?? "Embedded resource",
+        mimeType,
+        sourceType: type,
+        raw: item,
+      }));
+    }
+  }
+
+  if (type === "generated-image") {
+    for (const target of targetStringsFromFields(item, ["url", "imageUrl", "image_url", "path", "filePath", "src"])) {
+      candidates.push(artifactFromTarget(target, {
+        id: `${itemId(item, `artifact-image-${index}`)}:${target}`,
+        title: titleFromTarget(target),
+        subtitle: "Generated image",
+        mimeType: firstStringField(item, ["mimeType", "mime_type"]) ?? "image",
+        sourceType: type,
+        raw: item,
+      }));
+    }
+  }
+
+  for (const filePath of fileChangePaths(item)) {
+    candidates.push({
+      id: `${itemId(item, `artifact-file-${index}`)}:${filePath}`,
+      kind: "file",
+      title: titleFromTarget(filePath),
+      subtitle: "Edited or referenced file",
+      path: filePath,
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  for (const target of collectTargets(item).slice(0, 12)) {
+    candidates.push(artifactFromTarget(target.value, {
+      id: `${itemId(item, `artifact-target-${index}`)}:${target.value}`,
+      title: titleFromTarget(target.value),
+      subtitle: target.label,
+      mimeType: null,
+      sourceType: type,
+      raw: item,
+    }));
+  }
+
+  return candidates;
+}
+
+function sourceCandidatesFromItem(item: CodexThreadItem, index: number): ThreadSourceCandidate[] {
+  const type = normalizeThreadItemType(item);
+  const sources: ThreadSourceCandidate[] = [];
+  if (type === "web-search") {
+    const query = firstStringField(item, ["query", "searchQuery", "text"]);
+    sources.push({
+      id: itemId(item, `source-web-${index}`),
+      kind: "web",
+      title: query ? `Web search: ${query}` : "Web search",
+      subtitle: normalizeProgressStatus(item.status) === "in_progress" ? "Searching" : "Search result",
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  if (type === "mcp-tool-call" || type === "sub-agent" || type === "exec") {
+    const server = firstStringField(item, ["server", "namespace"]);
+    if (server !== "node_repl") {
+      sources.push({
+        id: itemId(item, `source-tool-${index}`),
+        kind: "tool",
+        title: labelForThreadItem(item),
+        subtitle: detailForThreadItem(item),
+        sourceType: type,
+        raw: item,
+      });
+    }
+  }
+
+  if (type === "generated-image") {
+    sources.push({
+      id: itemId(item, `source-image-${index}`),
+      kind: "resource",
+      title: labelForThreadItem(item),
+      subtitle: detailForThreadItem(item),
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  for (const target of collectTargets(item).slice(0, 16)) {
+    const artifact = artifactFromTarget(target.value, {
+      id: `${itemId(item, `source-target-${index}`)}:${target.value}`,
+      title: titleFromTarget(target.value),
+      subtitle: target.label,
+      mimeType: null,
+      sourceType: type,
+      raw: item,
+    });
+    sources.push({
+      id: artifact.id,
+      kind: artifact.kind === "url" ? "web" : artifact.kind === "file" ? "file" : "resource",
+      title: artifact.title,
+      subtitle: artifact.subtitle,
+      url: artifact.url,
+      path: artifact.path,
+      sourceType: type,
+      raw: item,
+    });
+  }
+
+  return sources;
+}
+
+function artifactFromTarget(
+  target: string,
+  base: Omit<ThreadArtifactCandidate, "kind" | "path" | "url">,
+): ThreadArtifactCandidate {
+  if (isUrl(target)) {
+    return {
+      ...base,
+      kind: "url",
+      url: target,
+    };
+  }
+  if (looksLikeFilePath(target)) {
+    return {
+      ...base,
+      kind: "file",
+      path: target,
+    };
+  }
+  return {
+    ...base,
+    kind: "resource",
+    url: target,
+  };
+}
+
+function collectTargets(value: unknown, depth = 0, label = "Reference"): Array<{ value: string; label: string }> {
+  if (depth > 4 || value == null) return [];
+  if (Array.isArray(value)) return value.flatMap((entry) => collectTargets(entry, depth + 1, label));
+  if (typeof value !== "object") return [];
+
+  const targets: Array<{ value: string; label: string }> = [];
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const nextLabel = humanizeKey(key);
+    if (typeof entry === "string" && targetKeyNames.has(key.toLowerCase())) {
+      const trimmed = entry.trim();
+      if (isUrl(trimmed) || looksLikeFilePath(trimmed)) {
+        targets.push({ value: trimmed, label: nextLabel });
+      }
+    }
+    if (entry && typeof entry === "object") {
+      targets.push(...collectTargets(entry, depth + 1, nextLabel));
+    }
+  }
+  return dedupeTargets(targets);
+}
+
+function fileChangePaths(item: CodexThreadItem): string[] {
+  const paths = new Set<string>();
+  for (const key of ["path", "filePath", "filepath", "filename", "target"]) {
+    const value = firstStringField(item, [key]);
+    if (value && looksLikeFilePath(value)) paths.add(value);
+  }
+  for (const key of [
+    "editedFilePaths",
+    "edited_file_paths",
+    "referencedFilePaths",
+    "referenced_file_paths",
+    "filePaths",
+    "file_paths",
+    "fileChanges",
+    "changes",
+    "diff",
+    "files",
+    "edits",
+  ]) {
+    const value = (item as Record<string, unknown>)[key];
+    if (typeof value === "string") {
+      if (looksLikeFilePath(value)) paths.add(value);
+      for (const candidate of extractTargetsFromText(value)) {
+        if (looksLikeFilePath(candidate)) paths.add(candidate);
+      }
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const name of Object.keys(value)) {
+        if (looksLikeFilePath(name)) paths.add(name);
+      }
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry === "string" && looksLikeFilePath(entry)) paths.add(entry);
+        if (entry && typeof entry === "object") {
+          for (const field of ["path", "filePath", "filepath", "filename", "target", "name"]) {
+            const candidate = firstStringField(entry as Record<string, unknown>, [field]);
+            if (candidate && looksLikeFilePath(candidate)) paths.add(candidate);
+          }
+        }
+      }
+    }
+  }
+  return [...paths];
+}
+
+function dedupeArtifacts(candidates: ThreadArtifactCandidate[]): ThreadArtifactCandidate[] {
+  const seen = new Set<string>();
+  const output: ThreadArtifactCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = candidate.path ?? candidate.url ?? candidate.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(candidate);
+  }
+  return output.slice(-60);
+}
+
+function dedupeSources(candidates: ThreadSourceCandidate[]): ThreadSourceCandidate[] {
+  const seen = new Set<string>();
+  const output: ThreadSourceCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = candidate.url ?? candidate.path ?? candidate.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(candidate);
+  }
+  return output.slice(-60);
+}
+
+function dedupeTargets(targets: Array<{ value: string; label: string }>): Array<{ value: string; label: string }> {
+  const seen = new Set<string>();
+  const output: Array<{ value: string; label: string }> = [];
+  for (const target of targets) {
+    if (seen.has(target.value)) continue;
+    seen.add(target.value);
+    output.push(target);
+  }
+  return output;
+}
+
+function rawThreadItemType(item: CodexThreadItem): string {
+  return String(item.type ?? "unknown");
+}
+
+function normalizeThreadItemType(itemOrType: CodexThreadItem | string | null | undefined): string {
+  const raw = typeof itemOrType === "string" ? itemOrType : itemOrType?.type;
+  if (!raw) return "unknown";
+  const normalized = raw
+    .replace(/([a-z])([A-Z])/g, "$1-$2")
+    .replace(/_/g, "-")
+    .toLowerCase();
+  if (normalized === "agent-message" || normalized === "assistant-message") return "assistant-message";
+  if (normalized === "user-message" || normalized === "user-input") return "user-message";
+  if (normalized === "command-execution" || normalized === "exec") return "exec";
+  if (normalized === "file-change" || normalized === "patch" || normalized === "turn-diff") return "patch";
+  if (normalized === "mcp-tool-call" || normalized === "tool-call" || normalized === "dynamic-tool-call") {
+    return "mcp-tool-call";
+  }
+  if (normalized === "mcp-server-elicitation") return "mcp-tool-call";
+  if (normalized === "web-search") return "web-search";
+  if (normalized === "todo-list") return "todo-list";
+  if (normalized === "proposed-plan") return "proposed-plan";
+  if (normalized === "plan-implementation") return "plan-implementation";
+  if (
+    normalized === "collab-agent-tool-call" ||
+    normalized === "multi-agent-action" ||
+    normalized === "remote-task-created" ||
+    normalized === "worked-for"
+  ) {
+    return "sub-agent";
+  }
+  if (normalized === "generated-image" || normalized === "image-generation") return "generated-image";
+  if (normalized === "automation-update" || normalized === "system-event") return "system-event";
+  if (normalized === "tool-output") return "tool-output";
+  return normalized;
+}
+
+function labelForThreadItem(item: CodexThreadItem): string {
+  const type = normalizeThreadItemType(item);
+  if (type === "assistant-message") return "Assistant message";
+  if (type === "user-message") return "User message";
+  if (type === "exec") return "Command";
+  if (type === "patch") return "File change";
+  if (type === "mcp-tool-call") return "Tool call";
+  if (type === "web-search") return "Web search";
+  if (type === "todo-list") return "To do list";
+  if (type === "proposed-plan") return "Proposed plan";
+  if (type === "plan-implementation") return "Plan implementation";
+  if (type === "reasoning") return "Reasoning";
+  if (type === "sub-agent") return "Sub-agent";
+  if (type === "generated-image") return "Generated image";
+  return humanizeKey(rawThreadItemType(item));
+}
+
+function detailForThreadItem(item: CodexThreadItem): string | null {
+  const type = normalizeThreadItemType(item);
+  if (type === "exec") return firstStringField(item, ["command", "cmd", "aggregatedOutput", "output", "text"]);
+  if (type === "web-search") return firstStringField(item, ["query", "searchQuery", "text"]);
+  if (type === "mcp-tool-call" || type === "sub-agent") {
+    return [firstStringField(item, ["server", "namespace"]), firstStringField(item, ["tool", "name"])]
+      .filter(Boolean)
+      .join(".") || null;
+  }
+  if (type === "todo-list") {
+    const tasks = taskRecords(item);
+    if (tasks.length > 0) return `${tasks.length} tasks`;
+  }
+  if (type === "patch") {
+    const paths = fileChangePaths(item);
+    if (paths.length === 1) return paths[0];
+    if (paths.length > 1) return `${paths.length} files`;
+  }
+  if (type === "generated-image") {
+    return firstStringField(item, ["prompt", "description", "url", "path", "filePath"]);
+  }
+  return firstTextField(item, ["title", "summary", "text", "message", "description", "content"]);
+}
+
+function firstTextField(record: Record<string, unknown>, fields: string[]): string | null {
+  const value = firstStringField(record, fields);
+  if (!value) return null;
+  return value.length > 240 ? `${value.slice(0, 240)}...` : value;
+}
+
+function firstStringField(record: Record<string, unknown>, fields: string[]): string | null {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function recordField(record: Record<string, unknown>, field: string): Record<string, unknown> | null {
+  const value = record[field];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function targetStringsFromFields(record: Record<string, unknown>, fields: string[]): string[] {
+  const output = new Set<string>();
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed && (isUrl(trimmed) || looksLikeFilePath(trimmed))) output.add(trimmed);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry === "string") {
+          const trimmed = entry.trim();
+          if (trimmed && (isUrl(trimmed) || looksLikeFilePath(trimmed))) output.add(trimmed);
+        } else if (entry && typeof entry === "object") {
+          const target = firstStringField(entry as Record<string, unknown>, ["uri", "url", "path", "filePath", "target", "src"]);
+          if (target && (isUrl(target) || looksLikeFilePath(target))) output.add(target);
+        }
+      }
+    }
+  }
+  return [...output];
+}
+
+function recordsFromFields(record: Record<string, unknown>, fields: string[]): Array<Record<string, unknown>> {
+  const output: Array<Record<string, unknown>> = [];
+  for (const field of fields) {
+    const value = record[field];
+    if (Array.isArray(value)) {
+      output.push(...value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object" && !Array.isArray(entry))));
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      output.push(value as Record<string, unknown>);
+    }
+  }
+  return output;
+}
+
+function itemId(item: CodexThreadItem, fallback: string): string {
+  return firstStringField(item, ["id", "itemId", "callId", "requestId", "taskId"]) ?? fallback;
+}
+
+function taskRecords(item: CodexThreadItem): Array<Record<string, unknown>> {
+  for (const field of ["items", "tasks", "todos"]) {
+    const value = item[field];
+    if (Array.isArray(value)) {
+      return value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object"));
+    }
+  }
+  return [];
+}
+
+function reasoningSummary(item: CodexThreadItem): string | null {
+  const summary = item.summary;
+  if (Array.isArray(summary)) {
+    const parts = summary
+      .map((entry) => typeof entry === "string" ? entry : firstTextField(entry as Record<string, unknown>, ["text", "summary"]))
+      .filter(Boolean);
+    return parts.at(-1) ?? null;
+  }
+  return firstTextField(item, ["summary", "text"]);
+}
+
+function normalizeProgressStatus(value: unknown): ThreadProgressItem["status"] {
+  const normalized = typeof value === "string" ? value.toLowerCase().replace(/-/g, "_") : "";
+  if (normalized === "completed" || normalized === "done" || normalized === "success") return "completed";
+  if (normalized === "failed" || normalized === "error") return "failed";
+  if (normalized === "pending" || normalized === "queued") return "pending";
+  if (normalized === "in_progress" || normalized === "inprogress" || normalized === "running") return "in_progress";
+  return "unknown";
+}
+
+function isUrl(value: string): boolean {
+  return /^(https?|file):\/\//i.test(value);
+}
+
+function extractTargetsFromText(value: string): string[] {
+  const targets = new Set<string>();
+  for (const match of value.matchAll(/\b(?:https?|file):\/\/[^\s<>"')]+/gi)) {
+    targets.add(cleanTrailingTargetPunctuation(match[0]));
+  }
+  for (const match of value.matchAll(/(?:^|[\s"'`(])((?:\.{1,2}\/|\/|~\/)[^\s"'`)]+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8})/g)) {
+    const candidate = cleanTrailingTargetPunctuation(match[1] ?? "");
+    if (candidate && looksLikeFilePath(candidate)) targets.add(candidate);
+  }
+  return [...targets];
+}
+
+function cleanTrailingTargetPunctuation(value: string): string {
+  return value.replace(/[),.;:]+$/g, "");
+}
+
+function looksLikeFilePath(value: string): boolean {
+  if (!value || /\n/.test(value)) return false;
+  if (/^(https?|data):\/\//i.test(value)) return false;
+  if (/^(file):\/\//i.test(value)) return true;
+  return (
+    value.startsWith("/") ||
+    value.startsWith("~/") ||
+    value.startsWith("./") ||
+    value.startsWith("../") ||
+    /\.[A-Za-z0-9]{1,8}$/.test(value)
   );
+}
+
+function titleFromTarget(value: string): string {
+  try {
+    if (isUrl(value)) {
+      const url = new URL(value);
+      return url.pathname.split("/").filter(Boolean).at(-1) ?? url.hostname;
+    }
+  } catch {
+    // Fall through to path handling.
+  }
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+function humanizeKey(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^./, (letter) => letter.toUpperCase()) || "Item";
+}
+
+const targetKeyNames = new Set([
+  "file",
+  "filepath",
+  "filename",
+  "href",
+  "path",
+  "source",
+  "target",
+  "uri",
+  "url",
+]);
+
+const knownThreadItemTypes = new Set([
+  "assistant-message",
+  "exec",
+  "generated-image",
+  "mcp-tool-call",
+  "patch",
+  "plan-implementation",
+  "proposed-plan",
+  "reasoning",
+  "sub-agent",
+  "system-event",
+  "todo-list",
+  "tool-output",
+  "user-message",
+  "web-search",
+]);
+
+function finalAssistantTextFromTurn(turn: CodexThreadTurn): string | null {
+  const agentMessages = (turn.items ?? []).filter((item) => {
+    return normalizeThreadItemType(item) === "assistant-message" && textFromThreadMessageItem(item) !== null;
+  });
   const finalMessage =
-    [...agentMessages].reverse().find((item) => item.phase === "final_answer") ??
+    [...agentMessages].reverse().find((item) => isFinalAssistantPhase(item.phase ?? item.status)) ??
     agentMessages[agentMessages.length - 1] ??
     null;
-  return finalMessage?.text ?? null;
+  return finalMessage ? textFromThreadMessageItem(finalMessage) : firstTextField(turn, [
+    "finalAssistantText",
+    "assistantText",
+    "output",
+    "message",
+    "text",
+  ]);
+}
+
+function userTextFromTurn(turn: CodexThreadTurn): string | null {
+  const userMessages = (turn.items ?? [])
+    .filter((item) => normalizeThreadItemType(item) === "user-message")
+    .map(textFromThreadMessageItem)
+    .filter((text): text is string => Boolean(text));
+  if (userMessages.length > 0) return userMessages.join("\n\n");
+  return firstTextField(turn, ["userText", "input", "prompt", "request"]);
+}
+
+function textFromThreadMessageItem(item: CodexThreadItem): string | null {
+  const direct = firstStringField(item, ["text", "message", "content"]);
+  if (direct) return direct;
+  const content = item.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : part && typeof part === "object" && !Array.isArray(part)
+            ? firstStringField(part as Record<string, unknown>, ["text", "content"])
+            : null,
+      )
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    return text || null;
+  }
+  return null;
+}
+
+function isFinalAssistantPhase(value: unknown): boolean {
+  const normalized = typeof value === "string" ? value.toLowerCase().replace(/-/g, "_") : "";
+  return normalized === "final_answer" || normalized === "final" || normalized === "completed" || normalized === "complete";
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -2177,27 +3447,36 @@ function statusFromNotification(method: string, params?: Record<string, unknown>
   if (method === "turn/started") return "Codex started working.";
   if (method === "turn/completed") {
     const turn = (params?.turn ?? {}) as { status?: string };
-    return turn.status === "failed" ? "Codex turn failed." : "Codex finished.";
+    return completedTurnStatusText(turn.status);
   }
   if (method === "item/started") {
     const item = (params?.item ?? {}) as { type?: string; command?: string; server?: string; tool?: string; query?: string };
-    if (item.type === "commandExecution") return `Codex is running: ${item.command ?? "a command"}`;
-    if (item.type === "fileChange") return "Codex is preparing file changes.";
-    if (item.type === "mcpToolCall") return `Codex is using ${item.server ?? "an app"} ${item.tool ?? "tool"}.`;
-    if (item.type === "webSearch") return `Codex is searching: ${item.query ?? "the web"}`;
-    if (item.type === "collabAgentToolCall") return "Codex is coordinating a sub-agent.";
-    if (item.type === "agentMessage") return "Codex is writing a response.";
+    const type = normalizeThreadItemType(item.type);
+    if (type === "exec") return `Codex is running: ${item.command ?? "a command"}`;
+    if (type === "patch") return "Codex is preparing file changes.";
+    if (type === "mcp-tool-call") return `Codex is using ${item.server ?? "an app"} ${item.tool ?? "tool"}.`;
+    if (type === "web-search") return `Codex is searching: ${item.query ?? "the web"}`;
+    if (type === "sub-agent") return "Codex is coordinating a sub-agent.";
+    if (type === "assistant-message") return "Codex is writing a response.";
     return `Codex started ${item.type ?? "work"}.`;
   }
   if (method === "item/completed") {
     const item = (params?.item ?? {}) as { type?: string };
-    if (item.type === "commandExecution") return "Codex finished a command.";
-    if (item.type === "fileChange") return "Codex finished file changes.";
-    if (item.type === "mcpToolCall") return "Codex finished using an app tool.";
+    const type = normalizeThreadItemType(item.type);
+    if (type === "exec") return "Codex finished a command.";
+    if (type === "patch") return "Codex finished file changes.";
+    if (type === "mcp-tool-call") return "Codex finished using an app tool.";
+    if (type === "generated-image") return "Codex generated an image.";
   }
   if (method === "serverRequest/resolved") return "Codex request resolved.";
   if (method === "error") return "Codex reported an error.";
   return null;
+}
+
+function completedTurnStatusText(status: unknown): string {
+  if (status === "failed") return "Codex turn failed.";
+  if (status === "interrupted") return "Codex interrupted.";
+  return "Codex finished.";
 }
 
 function stringField(value: unknown): string | undefined {
@@ -2214,8 +3493,22 @@ function activeChatForProject(project: VoiceProject): VoiceChat | null {
   );
 }
 
+function lastQueuedRequestIndexForChat(queue: QueuedCodexRequest[], chatId: string | null): number {
+  if (!chatId) return -1;
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    if (queue[index].chatId === chatId) return index;
+  }
+  return -1;
+}
+
 function titleFromText(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 48) || "Voice Project";
+}
+
+function shortRequestLabel(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 90) return normalized;
+  return `${normalized.slice(0, 87).trimEnd()}...`;
 }
 
 function parseSlashInput(text: string): { command: string; args: string[]; rest: string } {
@@ -2237,7 +3530,7 @@ function nativeSlashHelpText(): string {
     "/mcp [verbose] - list MCP servers reported by app-server.",
     "/apps - list apps/connectors reported by app-server.",
     "/plugins - list plugins reported by app-server.",
-    "/permissions [default|auto-review|full-access] - show or update chat permission mode.",
+    "/permissions [default|auto-review|full-access|custom-config] - show or update chat permission mode.",
     "/new [name] and /resume [projectId] - voice-project equivalents of Codex conversation controls.",
     "Recognized but UI-only or not wired yet: /feedback, /plan-mode, /diff, /init, /agent, /mention, /stop, /fork, /side, /clear, /copy, /quit.",
   ].join("\n");
@@ -2536,15 +3829,31 @@ function permissionProfile(mode: CodexPermissionMode) {
   );
 }
 
-function permissionParams(mode: CodexPermissionMode): {
-  approvalPolicy: CodexApprovalPolicy;
-  sandbox: CodexSandboxMode;
-} {
+type CodexPermissionParams = {
+  approvalPolicy?: CodexApprovalPolicy;
+  approvalsReviewer?: CodexApprovalsReviewer;
+  sandbox?: CodexSandboxMode;
+};
+
+function threadPermissionParams(mode: CodexPermissionMode): CodexPermissionParams {
+  return codexPermissionParams(mode);
+}
+
+function turnPermissionParams(mode: CodexPermissionMode): CodexPermissionParams {
+  return codexPermissionParams(mode);
+}
+
+function codexPermissionParams(mode: CodexPermissionMode): CodexPermissionParams {
   const profile = permissionProfile(mode);
   return {
-    approvalPolicy: profile.approvalPolicy,
-    sandbox: profile.sandbox,
+    ...(profile.approvalPolicy ? { approvalPolicy: profile.approvalPolicy } : {}),
+    ...(profile.approvalsReviewer ? { approvalsReviewer: profile.approvalsReviewer } : {}),
+    ...(profile.sandbox ? { sandbox: profile.sandbox } : {}),
   };
+}
+
+function formatPermissionValue(value: string | null): string {
+  return value ?? "config.toml";
 }
 
 function permissionModeFromText(text: string): CodexPermissionMode {
@@ -2552,7 +3861,14 @@ function permissionModeFromText(text: string): CodexPermissionMode {
   if (["default", "default-permissions", "normal"].includes(normalized)) return "default";
   if (["auto", "auto-review", "autoreview"].includes(normalized)) return "auto-review";
   if (["full", "full-access", "danger", "danger-full-access"].includes(normalized)) return "full-access";
-  throw new Error("Unknown permission mode. Use default, auto-review, or full-access.");
+  if (
+    ["custom", "custom-config", "custom-config-toml", "custom-config.toml", "config", "config-toml", "config.toml"].includes(
+      normalized,
+    )
+  ) {
+    return "custom-config";
+  }
+  throw new Error("Unknown permission mode. Use default, auto-review, full-access, or custom-config.");
 }
 
 function isMissingCodexThreadError(error: unknown): boolean {
@@ -2560,16 +3876,82 @@ function isMissingCodexThreadError(error: unknown): boolean {
   return /no rollout found for thread id/i.test(message) || /unknown thread/i.test(message);
 }
 
-function codexTurnText(userText: string): string {
-  return [
-    "This request came through a local Realtime voice interface.",
-    "Treat the current working directory as this voice project's workspace.",
-    "Codex owns the actual planning, computer use, tool use, browser use, and execution.",
-    "For requests that may require controlling desktop apps, the model should use tool_search to discover computer-use before choosing an approach; do this only once per new tool or plugin requested by the user.",
-    "If the user's request mentions the Computer Use plugin, Codex must satisfy that request by discovering and using the actual computer-use plugin. Do not replace it with shell commands, open -a, AppleScript via terminal, or other terminal workarounds.",
-    "Ask for clarification or approval when needed, and keep final status concise enough to relay by voice.",
-    "",
-    "User's spoken request:",
-    userText,
-  ].join("\n");
+function projectWorkspacePath(project: VoiceProject): string {
+  return project.workspacePath || project.folderPath;
+}
+
+async function resolveWorkspacePathInput(value: string | null | undefined): Promise<string | null> {
+  const raw = value?.trim();
+  if (!raw) return null;
+  const resolved = path.resolve(expandHomePath(raw));
+  const info = await stat(resolved).catch((error: unknown) => {
+    throw new Error(
+      `Workspace path is not accessible: ${resolved} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  });
+  if (!info.isDirectory()) {
+    throw new Error(`Workspace path is not a directory: ${resolved}`);
+  }
+  return resolved;
+}
+
+async function inferWorkspacePathFromText(text: string): Promise<string | null> {
+  const candidates = workspacePathCandidates(text);
+  for (const candidate of candidates) {
+    try {
+      return await resolveWorkspacePathInput(candidate);
+    } catch {
+      // Ignore path-like phrases that do not resolve to a real directory.
+    }
+  }
+  return null;
+}
+
+function workspacePathCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  const quotedPath = /["'`]((?:~\/|\/)[^"'`]+)["'`]/g;
+  for (const match of text.matchAll(quotedPath)) {
+    candidates.push(match[1]);
+  }
+
+  const pathLike = /(?:^|\s)((?:~\/|\/)[^\s,.;:!?]+)/g;
+  for (const match of text.matchAll(pathLike)) {
+    candidates.push(match[1]);
+  }
+
+  const workspaceRelative = /(?:^|\s)(workspace\/[A-Za-z0-9._/-]+)/gi;
+  for (const match of text.matchAll(workspaceRelative)) {
+    candidates.push(`~/${match[1]}`);
+  }
+
+  return [...new Set(candidates.map((candidate) => candidate.replace(/[)\]}]+$/, "")))];
+}
+
+function expandHomePath(value: string): string {
+  if (value === "~") return process.env.HOME ?? value;
+  if (value.startsWith("~/")) {
+    const home = process.env.HOME;
+    return home ? path.join(home, value.slice(2)) : value;
+  }
+  return value;
+}
+
+function samePath(left: string, right: string): boolean {
+  return path.resolve(left) === path.resolve(right);
+}
+
+function codexVoiceTurnText(userText: string, bridgeAlreadyInjected: boolean): string {
+  const voiceRequest = `${CODEX_VOICE_MARKER}${userText}`;
+  return bridgeAlreadyInjected ? voiceRequest : `${CODEX_VOICE_BRIDGE_PROMPT}\n\n${voiceRequest}`;
+}
+
+function threadTurnsHaveVoiceBridgePrompt(turns: CodexThreadTurn[] | undefined): boolean {
+  return (turns ?? []).some((turn) => {
+    const userText = userTextFromTurn(turn);
+    return userText ? CODEX_VOICE_BRIDGE_PROMPT_PATTERN.test(userText) : false;
+  });
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

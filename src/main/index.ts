@@ -1,20 +1,27 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, screen, type OpenDialogOptions } from "electron";
 import path from "node:path";
 import { clearOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
 import appIcon from "./assets/app-icon.png?asset";
 import { CodexBridge } from "./codexBridge";
 import { VoiceCodexOrchestrator } from "./orchestrator";
 import { ProjectStore } from "./projectStore";
+import { appendBufferedEvent } from "../shared/eventBuffer";
 import type {
   ApprovalDecision,
   AppEvent,
   CodexPermissionMode,
   CodexSettingsScope,
+  RealtimeModelId,
+  RealtimeReasoningEffort,
+  RealtimeVoiceId,
   ReasoningEffort,
   ToolQuestionAnswer,
+  WindowChromeState,
 } from "../shared/types";
 
-const maxBufferedEvents = 250;
+const appName = "Codex Voice";
+const voiceCompactWindowWidth = 444;
+const voiceExpandedRightPaneWidth = 874;
 
 let voiceWindow: BrowserWindow | null = null;
 let debugWindow: BrowserWindow | null = null;
@@ -23,6 +30,16 @@ let bufferedEvents: AppEvent[] = [];
 
 type RendererWindowKind = "voice" | "debug";
 
+guardConsoleStream(process.stdout);
+guardConsoleStream(process.stderr);
+
+function guardConsoleStream(stream: NodeJS.WriteStream): void {
+  stream.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EIO" || error.code === "EPIPE") return;
+    throw error;
+  });
+}
+
 function createVoiceWindow(): void {
   if (voiceWindow && !voiceWindow.isDestroyed()) {
     voiceWindow.show();
@@ -30,11 +47,17 @@ function createVoiceWindow(): void {
     return;
   }
   const window = new BrowserWindow({
-    width: 444,
+    width: voiceCompactWindowWidth,
     height: 661,
     minWidth: 410,
     minHeight: 640,
     title: "Codex Voice",
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset" as const,
+          trafficLightPosition: { x: 14, y: 18 },
+        }
+      : {}),
     icon: appIcon,
     backgroundColor: "#121212",
     webPreferences: {
@@ -47,9 +70,35 @@ function createVoiceWindow(): void {
 
   loadRenderer(window, "voice");
   window.webContents.setZoomFactor(0.85);
+  window.webContents.once("did-finish-load", () => publishWindowChromeState(window));
+  window.on("enter-full-screen", () => publishWindowChromeState(window));
+  window.on("leave-full-screen", () => publishWindowChromeState(window));
   window.on("closed", () => {
     if (voiceWindow === window) voiceWindow = null;
   });
+}
+
+function expandVoiceWindowForRightPane(window: BrowserWindow | null): boolean {
+  if (!window || window.isDestroyed() || window.isFullScreen()) return false;
+  const bounds = window.getBounds();
+  if (bounds.width >= voiceExpandedRightPaneWidth) return false;
+
+  const { workArea } = screen.getDisplayMatching(bounds);
+  const rightEdgeLimit = workArea.x + workArea.width;
+  const targetWidth = Math.min(voiceExpandedRightPaneWidth, rightEdgeLimit - bounds.x);
+  if (targetWidth <= bounds.width) return false;
+
+  window.setBounds({ ...bounds, width: targetWidth }, process.platform === "darwin");
+  return true;
+}
+
+function collapseVoiceWindowFromRightPane(window: BrowserWindow | null): boolean {
+  if (!window || window.isDestroyed() || window.isFullScreen()) return false;
+  const bounds = window.getBounds();
+  if (bounds.width <= voiceCompactWindowWidth) return false;
+
+  window.setBounds({ ...bounds, width: voiceCompactWindowWidth }, process.platform === "darwin");
+  return true;
 }
 
 function createDebugWindow(): void {
@@ -105,12 +154,26 @@ function broadcastToAppWindows(channel: string, payload: unknown): void {
   }
 }
 
+function windowChromeStateFor(window: BrowserWindow | null): WindowChromeState {
+  return {
+    isFullScreen: Boolean(window && !window.isDestroyed() && window.isFullScreen()),
+  };
+}
+
+function publishWindowChromeState(window: BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  window.webContents.send("app:windowChromeState", windowChromeStateFor(window));
+}
+
 function recordEvent(event: AppEvent): void {
-  bufferedEvents = [event, ...bufferedEvents].slice(0, maxBufferedEvents);
+  bufferedEvents = appendBufferedEvent(bufferedEvents, event);
 }
 
 function publishEvent(event: AppEvent): void {
   recordEvent(event);
+  void orchestrator?.recordTranscriptEvent(event).catch(() => {
+    // Transcript persistence should never break live event delivery.
+  });
   broadcastToAppWindows("app:event", event);
 }
 
@@ -152,7 +215,10 @@ function registerIpcHandler(
   ipcMain.handle(channel, listener);
 }
 
+app.setName(appName);
+
 app.whenReady().then(() => {
+  app.setAboutPanelOptions({ applicationName: appName });
   app.dock?.setIcon(appIcon);
   registerIpc();
   void boot();
@@ -172,6 +238,18 @@ app.on("before-quit", () => {
 
 function registerIpc(): void {
   registerIpcHandler("app:getState", () => requireOrchestrator().state());
+  registerIpcHandler("app:openVoiceWindow", () => {
+    createVoiceWindow();
+  });
+  registerIpcHandler("app:getWindowChromeState", (event) =>
+    windowChromeStateFor(BrowserWindow.fromWebContents(event.sender)),
+  );
+  registerIpcHandler("app:expandVoiceWindowForRightPane", (event) =>
+    expandVoiceWindowForRightPane(BrowserWindow.fromWebContents(event.sender)),
+  );
+  registerIpcHandler("app:collapseVoiceWindowFromRightPane", (event) =>
+    collapseVoiceWindowFromRightPane(BrowserWindow.fromWebContents(event.sender)),
+  );
   registerIpcHandler("app:openDebugWindow", () => {
     createDebugWindow();
   });
@@ -182,9 +260,32 @@ function registerIpc(): void {
   registerIpcHandler("app:logEvent", (_event, payload: AppEvent) => {
     publishEvent(normalizeAppEvent(payload));
   });
+  registerIpcHandler("projects:selectWorkspaceFolder", async () => {
+    const options: OpenDialogOptions = {
+      title: "Use an existing folder",
+      buttonLabel: "Use folder",
+      properties: ["openDirectory"],
+    };
+    const result =
+      voiceWindow && !voiceWindow.isDestroyed()
+        ? await dialog.showOpenDialog(voiceWindow, options)
+        : await dialog.showOpenDialog(options);
+    const folderPath = result.filePaths[0];
+    if (result.canceled || !folderPath) return null;
+    return {
+      path: folderPath,
+      name: path.basename(folderPath) || folderPath,
+    };
+  });
+  registerIpcHandler(
+    "projects:setWorkspaceFolder",
+    (_event, payload: { workspacePath?: string | null; name?: string | null }) =>
+      requireOrchestrator().setWorkspaceFolder(payload.workspacePath, payload.name),
+  );
   registerIpcHandler(
     "projects:create",
-    (_event, payload: { name?: string }) => requireOrchestrator().createProject(payload.name),
+    (_event, payload: { name?: string; workspacePath?: string | null }) =>
+      requireOrchestrator().createProject(payload.name, payload.workspacePath),
   );
   registerIpcHandler(
     "projects:resume",
@@ -234,11 +335,23 @@ function registerIpc(): void {
     (_event, payload: { projectId?: string; chatId?: string }) =>
       requireOrchestrator().summarizeProject(payload.projectId, payload.chatId),
   );
-  registerIpcHandler("codex:send", (_event, payload: { text: string; chatId?: string }) =>
-    requireOrchestrator().sendToCodex(payload.text, payload.chatId),
+  registerIpcHandler(
+    "codex:send",
+    (_event, payload: { text: string; chatId?: string; workspacePath?: string | null }) =>
+      requireOrchestrator().sendToCodex(payload.text, payload.chatId, payload.workspacePath),
   );
   registerIpcHandler("codex:steer", (_event, payload: { text: string; chatId?: string }) =>
     requireOrchestrator().steerCodex(payload.text, payload.chatId),
+  );
+  registerIpcHandler(
+    "codex:queue",
+    (_event, payload: { text: string; chatId?: string; workspacePath?: string | null }) =>
+      requireOrchestrator().queueCodexRequest(payload.text, payload.chatId, payload.workspacePath),
+  );
+  registerIpcHandler(
+    "codex:cancelQueued",
+    (_event, payload?: { queuedId?: string | null; chatId?: string }) =>
+      requireOrchestrator().cancelQueuedCodexRequest(payload?.queuedId, payload?.chatId),
   );
   registerIpcHandler("codex:interrupt", (_event, payload?: { chatId?: string }) =>
     requireOrchestrator().interruptCodex(payload?.chatId),
@@ -268,6 +381,14 @@ function registerIpc(): void {
     (_event, payload: { requestId: string | number; answers: ToolQuestionAnswer[] }) =>
       requireOrchestrator().answerToolQuestion(payload.requestId, payload.answers),
   );
+  registerIpcHandler(
+    "rightPanel:getActiveThreadSummary",
+    (_event, payload?: { chatId?: string }) => requireOrchestrator().getActiveThreadSummary(payload?.chatId),
+  );
+  registerIpcHandler(
+    "rightPanel:getTranscriptMessages",
+    (_event, payload?: { chatId?: string }) => requireOrchestrator().getTranscriptMessages(payload?.chatId),
+  );
   registerIpcHandler("settings:saveOpenAiApiKey", (_event, payload: { apiKey: string }) => {
     saveOpenAiApiKey(payload.apiKey);
   });
@@ -276,5 +397,19 @@ function registerIpc(): void {
   });
   registerIpcHandler("realtime:createClientSecret", () =>
     requireOrchestrator().createRealtimeClientSecret(),
+  );
+  registerIpcHandler(
+    "realtime:setSettings",
+    (
+      _event,
+      payload: {
+        settings: {
+          model?: RealtimeModelId | null;
+          voice?: RealtimeVoiceId | null;
+          reasoningEffort?: RealtimeReasoningEffort | null;
+        };
+      },
+    ) =>
+      requireOrchestrator().setRealtimeSettings(payload.settings),
   );
 }

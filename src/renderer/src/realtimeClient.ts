@@ -8,18 +8,51 @@ import type {
   PendingCodexRequest,
   ToolQuestionAnswer,
   VoiceChat,
+  VoiceTranscriptMessage,
 } from "../../shared/types";
 
 type RealtimeCallbacks = {
   onLog: (event: AppEvent) => void;
   onConnectionChange: (connected: boolean, label: string) => void;
+  onOutputLevel?: (level: number) => void;
+  getTranscriptMessages?: (chatId: string) => Promise<VoiceTranscriptMessage[]>;
+};
+
+export type RealtimeChatContext = {
+  projectId: string;
+  projectName: string;
+  chatId: string;
+  chatName: string;
+  threadId: string | null;
 };
 
 type FunctionCallItem = {
   type: "function_call";
   name: string;
   call_id: string;
+  id?: string;
+  status?: string;
   arguments?: string;
+};
+
+type TrackedFunctionCall = {
+  callId: string;
+  itemId?: string;
+  name: string;
+  arguments: string;
+  status?: string;
+  running: boolean;
+  outputSent: boolean;
+  stale: boolean;
+  cancel?: () => Promise<void>;
+  pendingOutput?: unknown;
+};
+
+type TrackedRealtimeResponse = {
+  responseId: string;
+  status?: string;
+  epoch: number;
+  calls: Map<string, TrackedFunctionCall>;
 };
 
 export class RealtimeVoiceClient {
@@ -27,7 +60,20 @@ export class RealtimeVoiceClient {
   private dc: RTCDataChannel | null = null;
   private localStream: MediaStream | null = null;
   private audioEl: HTMLAudioElement | null = null;
+  private outputAudioContext: AudioContext | null = null;
+  private outputAudioSource: MediaStreamAudioSourceNode | null = null;
+  private outputAnalyser: AnalyserNode | null = null;
+  private outputSamples: Uint8Array<ArrayBuffer> | null = null;
+  private outputLevelFrame: number | null = null;
+  private smoothedOutputLevel = 0;
   private isPaused = false;
+  private realtimeEpoch = 0;
+  private activeChatContext: RealtimeChatContext | null = null;
+  private injectedTranscriptFingerprints = new Map<string, string>();
+  private chatContextInjectionSeq = 0;
+  private trackedResponses = new Map<string, TrackedRealtimeResponse>();
+  private functionCallsByCallId = new Map<string, TrackedFunctionCall>();
+  private functionCallsByItemId = new Map<string, TrackedFunctionCall>();
 
   constructor(private readonly callbacks: RealtimeCallbacks) {}
 
@@ -50,7 +96,9 @@ export class RealtimeVoiceClient {
     this.audioEl = audioEl;
     audioEl.autoplay = true;
     pc.ontrack = (event) => {
-      audioEl.srcObject = event.streams[0];
+      const [remoteStream] = event.streams;
+      audioEl.srcObject = remoteStream;
+      if (remoteStream) this.setupOutputAnalyser(remoteStream);
     };
 
     try {
@@ -67,6 +115,7 @@ export class RealtimeVoiceClient {
           `Connected to ${secret.model} (${secret.voice}, reasoning ${secret.reasoningEffort}).`,
         );
         this.log("connection", "Realtime data channel opened.");
+        void this.injectActiveChatContext("connect");
       });
       dc.addEventListener("close", () => {
         this.callbacks.onConnectionChange(false, "Realtime data channel closed.");
@@ -102,6 +151,10 @@ export class RealtimeVoiceClient {
   }
 
   disconnect(): void {
+    this.realtimeEpoch += 1;
+    this.trackedResponses.clear();
+    this.functionCallsByCallId.clear();
+    this.functionCallsByItemId.clear();
     this.localStream?.getTracks().forEach((track) => track.stop());
     this.dc?.close();
     this.pc?.close();
@@ -109,6 +162,7 @@ export class RealtimeVoiceClient {
     this.dc = null;
     this.localStream = null;
     this.audioEl = null;
+    this.teardownOutputAnalyser();
     this.isPaused = false;
     this.callbacks.onConnectionChange(false, "Realtime disconnected.");
   }
@@ -122,9 +176,18 @@ export class RealtimeVoiceClient {
     if (this.audioEl) {
       this.audioEl.muted = paused;
     }
+    if (paused) this.callbacks.onOutputLevel?.(0);
     if (changed) {
       this.log(paused ? "voicePaused" : "voiceResumed", paused ? "Realtime voice paused." : "Realtime voice resumed.");
     }
+  }
+
+  setActiveChatContext(context: RealtimeChatContext | null): void {
+    const previousKey = chatContextKey(this.activeChatContext);
+    const nextKey = chatContextKey(context);
+    this.activeChatContext = context;
+    if (!this.connected || !nextKey || previousKey === nextKey) return;
+    void this.injectActiveChatContext("switch");
   }
 
   speakStatus(message: string): void {
@@ -141,10 +204,52 @@ export class RealtimeVoiceClient {
     });
   }
 
+  notifyCodexTurnCompleted(event: AppEvent): void {
+    if (!this.connected) return;
+    const update = codexCompletionUpdateText(event);
+    if (!update) return;
+
+    this.sendConversationText(update);
+    this.log("codexCompletion", event.message, event.raw);
+    if (this.paused) return;
+
+    this.send({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
+        instructions: codexCompletionSpeechInstructions(event),
+      },
+    });
+  }
+
+  speakQueuedCodexTransition(raw: unknown): void {
+    if (!this.connected) return;
+    const update = queuedCodexTransitionText(raw);
+    if (!update) return;
+
+    this.sendConversationText(update.contextText);
+    this.log("queuedCodexTransition", update.message, raw);
+    if (this.paused) return;
+
+    this.send({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
+        instructions: [
+          "A Codex completion-and-next-task status update was just added by the app.",
+          `Briefly tell the user: ${update.message}`,
+          "Use one short natural sentence.",
+          "Do not call tools.",
+        ].join("\n"),
+      },
+    });
+  }
+
   injectCodexTurnOutput(output: CodexTurnOutput): void {
     if (!this.connected) return;
     this.sendConversationText(codexTurnOutputContextText(output));
     this.log("codexTurnOutputContext", "Injected Codex final output into Realtime context.", output);
+    if (output.nextQueuedRequestText) return;
     if (this.paused) return;
 
     this.send({
@@ -208,6 +313,54 @@ export class RealtimeVoiceClient {
     });
   }
 
+  private async injectActiveChatContext(reason: "connect" | "switch"): Promise<void> {
+    const context = this.activeChatContext;
+    const contextKey = chatContextKey(context);
+    if (!context || !contextKey || !this.connected) return;
+
+    const injectionSeq = ++this.chatContextInjectionSeq;
+    try {
+      const messages = this.callbacks.getTranscriptMessages
+        ? await this.callbacks.getTranscriptMessages(context.chatId)
+        : [];
+      if (
+        !this.connected ||
+        injectionSeq !== this.chatContextInjectionSeq ||
+        chatContextKey(this.activeChatContext) !== contextKey
+      ) {
+        return;
+      }
+
+      const transcriptContext = transcriptContextFromMessages(messages);
+      const previousFingerprint = this.injectedTranscriptFingerprints.get(contextKey);
+      const includeTranscript = previousFingerprint !== transcriptContext.fingerprint;
+      const activeContext = activeChatContextText(
+        context,
+        includeTranscript ? transcriptContext : null,
+      );
+      this.sendConversationText(activeContext.text);
+      if (includeTranscript) {
+        this.injectedTranscriptFingerprints.set(contextKey, transcriptContext.fingerprint);
+      }
+      this.log("activeChatContext", `Injected active chat context for ${context.chatName}.`, {
+        reason,
+        chatId: context.chatId,
+        threadId: context.threadId,
+        transcriptIncluded: includeTranscript,
+        transcriptMessageCount: includeTranscript ? transcriptContext.count : 0,
+      });
+    } catch (error) {
+      this.log(
+        "activeChatContextFailed",
+        error instanceof Error ? error.message : "Unable to inject active chat context.",
+        {
+          reason,
+          chatId: context.chatId,
+        },
+      );
+    }
+  }
+
   private handleMessage(event: MessageEvent<string>): void {
     let payload: any;
     try {
@@ -217,18 +370,88 @@ export class RealtimeVoiceClient {
       return;
     }
 
+    if (payload.type === "input_audio_buffer.speech_started") {
+      this.log("userSpeechStarted", "User speech started.", payload);
+      this.invalidatePendingToolCalls("userSpeechStarted", payload);
+      return;
+    }
+
     if (payload.type === "response.output_audio_transcript.delta" && payload.delta) {
       this.log("voiceDelta", payload.delta, payload);
       return;
     }
 
+    if (payload.type === "conversation.item.input_audio_transcription.delta" && payload.delta) {
+      this.log("userTranscriptDelta", payload.delta, payload);
+      return;
+    }
+
+    if (payload.type === "conversation.item.input_audio_transcription.completed" && payload.transcript) {
+      this.log("userTranscript", payload.transcript, payload);
+      return;
+    }
+
+    if (payload.type === "response.output_audio_transcript.done" && payload.transcript) {
+      this.log("assistantTranscript", payload.transcript, payload);
+      return;
+    }
+
+    if (payload.type === "response.created") {
+      const responseId = stringValue(payload.response?.id);
+      if (responseId) this.ensureTrackedResponse(responseId);
+    }
+
+    if (payload.type === "response.output_item.added") {
+      const item = payload.item;
+      if (item?.type === "function_call") {
+        this.upsertFunctionCall(stringValue(payload.response_id), item as FunctionCallItem);
+      }
+    }
+
+    if (payload.type === "response.function_call_arguments.delta") {
+      const call = this.findFunctionCall(payload);
+      if (call && typeof payload.delta === "string") {
+        call.arguments += payload.delta;
+        this.log("toolArgsDelta", `${call.name} ${payload.delta}`, payload);
+      }
+    }
+
+    if (payload.type === "response.function_call_arguments.done") {
+      const call = this.findOrCreateFunctionCallFromArgumentEvent(payload);
+      if (call) {
+        call.arguments = typeof payload.arguments === "string" ? payload.arguments : call.arguments;
+        call.name = stringValue(payload.name) ?? call.name;
+        this.log("toolArgsDone", `${call.name} ${call.arguments}`, payload);
+      }
+    }
+
+    if (payload.type === "response.output_item.done") {
+      const item = payload.item;
+      if (item?.type === "function_call") {
+        this.upsertFunctionCall(stringValue(payload.response_id), item as FunctionCallItem);
+      }
+    }
+
     if (payload.type === "response.done") {
+      const responseId = stringValue(payload.response?.id);
+      const responseStatus = stringValue(payload.response?.status) ?? "completed";
+      const record = responseId ? this.ensureTrackedResponse(responseId) : null;
+      if (record) record.status = responseStatus;
+
       const output = payload.response?.output;
       if (Array.isArray(output)) {
         for (const item of output) {
           if (item?.type === "function_call") {
-            void this.handleFunctionCall(item as FunctionCallItem);
+            this.upsertFunctionCall(responseId, item as FunctionCallItem);
           }
+        }
+      }
+
+      if (record) {
+        if (responseStatus === "completed") {
+          void this.handleFunctionCalls(record);
+        } else {
+          this.skipFunctionCalls(record, `Realtime response ended with status ${responseStatus}.`);
         }
       }
     }
@@ -241,29 +464,238 @@ export class RealtimeVoiceClient {
     this.log(payload.type ?? "event", payload.type ?? "Realtime event.", payload);
   }
 
-  private async handleFunctionCall(item: FunctionCallItem): Promise<void> {
-    const args = safeJson(item.arguments);
-    this.log("toolCall", `${item.name} ${JSON.stringify(args)}`, item);
-    let output: unknown;
+  private ensureTrackedResponse(responseId: string): TrackedRealtimeResponse {
+    const existing = this.trackedResponses.get(responseId);
+    if (existing) return existing;
+    const record: TrackedRealtimeResponse = {
+      responseId,
+      epoch: this.realtimeEpoch,
+      calls: new Map(),
+    };
+    this.trackedResponses.set(responseId, record);
+    return record;
+  }
 
-    try {
-      output = await callVoiceTool(item.name, args);
-    } catch (error) {
-      output = {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+  private upsertFunctionCall(responseId: string | undefined, item: FunctionCallItem): TrackedFunctionCall | null {
+    const callId = stringValue(item.call_id);
+    const itemId = stringValue(item.id);
+    const name = stringValue(item.name);
+    if (!callId || !name) return null;
+
+    const record = responseId ? this.ensureTrackedResponse(responseId) : null;
+    const existing = this.functionCallsByCallId.get(callId) ?? (itemId ? this.functionCallsByItemId.get(itemId) : undefined);
+    const call =
+      existing ??
+      ({
+        callId,
+        itemId,
+        name,
+        arguments: "",
+        running: false,
+        outputSent: false,
+        stale: false,
+      } satisfies TrackedFunctionCall);
+
+    call.name = name;
+    call.itemId = itemId ?? call.itemId;
+    call.status = stringValue(item.status) ?? call.status;
+    if (typeof item.arguments === "string" && item.arguments.trim()) {
+      call.arguments = item.arguments;
     }
 
-    this.send({
-      type: "conversation.item.create",
-      item: {
-        type: "function_call_output",
-        call_id: item.call_id,
-        output: JSON.stringify(output),
-      },
+    this.functionCallsByCallId.set(callId, call);
+    if (call.itemId) this.functionCallsByItemId.set(call.itemId, call);
+    record?.calls.set(callId, call);
+    return call;
+  }
+
+  private findFunctionCall(payload: any): TrackedFunctionCall | null {
+    const callId = stringValue(payload.call_id);
+    const itemId = stringValue(payload.item_id);
+    return (
+      (callId ? this.functionCallsByCallId.get(callId) : undefined) ??
+      (itemId ? this.functionCallsByItemId.get(itemId) : undefined) ??
+      null
+    );
+  }
+
+  private findOrCreateFunctionCallFromArgumentEvent(payload: any): TrackedFunctionCall | null {
+    const existing = this.findFunctionCall(payload);
+    if (existing) return existing;
+
+    const responseId = stringValue(payload.response_id);
+    const callId = stringValue(payload.call_id);
+    const name = stringValue(payload.name);
+    if (!responseId || !callId || !name) return null;
+
+    return this.upsertFunctionCall(responseId, {
+      type: "function_call",
+      call_id: callId,
+      id: stringValue(payload.item_id),
+      name,
+      arguments: typeof payload.arguments === "string" ? payload.arguments : "",
     });
-    this.send({ type: "response.create" });
+  }
+
+  private invalidatePendingToolCalls(kind: string, raw?: unknown): void {
+    this.realtimeEpoch += 1;
+    let invalidated = 0;
+    for (const record of this.trackedResponses.values()) {
+      for (const call of record.calls.values()) {
+        if (!call.outputSent) {
+          call.stale = true;
+          if (call.running && call.cancel) {
+            void call.cancel().catch((error) => {
+              this.log("toolCancelFailed", `${call.name} cancellation failed.`, {
+                responseId: record.responseId,
+                callId: call.callId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+          invalidated += 1;
+        }
+      }
+    }
+    if (invalidated > 0) {
+      this.log(kind, `Invalidated ${invalidated} pending Realtime tool call${invalidated === 1 ? "" : "s"}.`, raw);
+    }
+  }
+
+  private skipFunctionCalls(record: TrackedRealtimeResponse, reason: string): void {
+    let skipped = 0;
+    for (const call of record.calls.values()) {
+      if (!call.outputSent) {
+        call.stale = true;
+        call.outputSent = true;
+        skipped += 1;
+      }
+    }
+    if (skipped > 0) this.log("toolCallsSkipped", reason, { responseId: record.responseId, skipped });
+    this.cleanupTrackedResponse(record);
+  }
+
+  private async handleFunctionCalls(record: TrackedRealtimeResponse): Promise<void> {
+    const calls = [...record.calls.values()].filter((call) => !call.outputSent);
+    if (calls.length === 0) {
+      this.cleanupTrackedResponse(record);
+      return;
+    }
+
+    const outputs: Array<{ call: TrackedFunctionCall; output: unknown }> = [];
+    for (const call of calls) {
+      if (call.stale || record.epoch !== this.realtimeEpoch) {
+        call.outputSent = true;
+        this.log("toolCallSkipped", `${call.name} skipped because the Realtime response was interrupted.`, {
+          responseId: record.responseId,
+          callId: call.callId,
+        });
+        continue;
+      }
+
+      let output: unknown;
+      const args = safeJson(call.arguments);
+      if ("pendingOutput" in call) {
+        output = call.pendingOutput;
+      } else {
+        call.running = true;
+        this.log("toolCall", `${call.name} ${JSON.stringify(args)}`, {
+          responseId: record.responseId,
+          callId: call.callId,
+          arguments: call.arguments,
+        });
+
+        try {
+          output = await callVoiceTool(call.name, args, (cancel) => {
+            call.cancel = cancel;
+          });
+        } catch (error) {
+          output = {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        } finally {
+          call.running = false;
+          call.cancel = undefined;
+        }
+        call.pendingOutput = output;
+      }
+
+      if (call.stale || record.epoch !== this.realtimeEpoch || !this.connected) {
+        call.outputSent = true;
+        await cancelStaleVoiceTool(call.name, output).catch((error) => {
+          this.log("toolCancelFailed", `${call.name} stale-result cleanup failed.`, {
+            responseId: record.responseId,
+            callId: call.callId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        this.log("toolResultDiscarded", `${call.name} completed after interruption; result was not sent to Realtime.`, {
+          responseId: record.responseId,
+          callId: call.callId,
+          output,
+        });
+        this.cleanupTrackedResponse(record);
+        return;
+      }
+
+      this.log("toolResult", `${call.name} completed.`, {
+        responseId: record.responseId,
+        name: call.name,
+        callId: call.callId,
+        arguments: args,
+        output,
+      });
+      outputs.push({ call, output });
+    }
+
+    if (outputs.length === 0 || !this.connected || record.epoch !== this.realtimeEpoch) {
+      this.cleanupTrackedResponse(record);
+      return;
+    }
+
+    try {
+      for (const { call, output } of outputs) {
+        this.send({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: call.callId,
+            output: JSON.stringify(output),
+          },
+        });
+      }
+      this.send({ type: "response.create" });
+    } catch (error) {
+      this.log("toolOutputSendFailed", "Could not send Realtime tool output.", {
+        responseId: record.responseId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (this.connected && record.epoch === this.realtimeEpoch) {
+        window.setTimeout(() => {
+          if (this.trackedResponses.has(record.responseId)) {
+            void this.handleFunctionCalls(record);
+          }
+        }, 250);
+      } else {
+        this.cleanupTrackedResponse(record);
+      }
+      return;
+    }
+
+    for (const { call } of outputs) {
+      call.outputSent = true;
+      call.pendingOutput = undefined;
+    }
+    this.cleanupTrackedResponse(record);
+  }
+
+  private cleanupTrackedResponse(record: TrackedRealtimeResponse): void {
+    this.trackedResponses.delete(record.responseId);
+    for (const call of record.calls.values()) {
+      this.functionCallsByCallId.delete(call.callId);
+      if (call.itemId) this.functionCallsByItemId.delete(call.itemId);
+    }
   }
 
   private send(payload: unknown): void {
@@ -271,6 +703,78 @@ export class RealtimeVoiceClient {
       throw new Error("Realtime data channel is not open.");
     }
     this.dc.send(JSON.stringify(payload));
+  }
+
+  private setupOutputAnalyser(stream: MediaStream): void {
+    this.teardownOutputAnalyser();
+    const AudioContextConstructor =
+      window.AudioContext ??
+      (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextConstructor) return;
+
+    try {
+      const audioContext = new AudioContextConstructor();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.12;
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      this.outputAudioContext = audioContext;
+      this.outputAudioSource = source;
+      this.outputAnalyser = analyser;
+      this.outputSamples = new Uint8Array(analyser.fftSize);
+      this.smoothedOutputLevel = 0;
+      void audioContext.resume().catch(() => undefined);
+      this.startOutputLevelLoop();
+    } catch (error) {
+      this.log("audioAnalyserError", error instanceof Error ? error.message : String(error));
+      this.teardownOutputAnalyser();
+    }
+  }
+
+  private teardownOutputAnalyser(): void {
+    if (this.outputLevelFrame !== null) {
+      window.cancelAnimationFrame(this.outputLevelFrame);
+      this.outputLevelFrame = null;
+    }
+    this.outputAudioSource?.disconnect();
+    this.outputAudioSource = null;
+    this.outputAnalyser = null;
+    this.outputSamples = null;
+    this.smoothedOutputLevel = 0;
+    const audioContext = this.outputAudioContext;
+    this.outputAudioContext = null;
+    if (audioContext && audioContext.state !== "closed") {
+      void audioContext.close().catch(() => undefined);
+    }
+    this.callbacks.onOutputLevel?.(0);
+  }
+
+  private startOutputLevelLoop(): void {
+    if (!this.outputAnalyser || !this.outputSamples || this.outputLevelFrame !== null) return;
+
+    const tick = () => {
+      if (!this.outputAnalyser || !this.outputSamples) {
+        this.outputLevelFrame = null;
+        return;
+      }
+
+      this.outputAnalyser.getByteTimeDomainData(this.outputSamples);
+      let sumSquares = 0;
+      for (const sample of this.outputSamples) {
+        const centered = (sample - 128) / 128;
+        sumSquares += centered * centered;
+      }
+      const rms = Math.sqrt(sumSquares / this.outputSamples.length);
+      const rawLevel = Math.max(0, Math.min(1, (rms - 0.012) / 0.16));
+      const smoothing = rawLevel > this.smoothedOutputLevel ? 0.36 : 0.12;
+      this.smoothedOutputLevel += (rawLevel - this.smoothedOutputLevel) * smoothing;
+      this.callbacks.onOutputLevel?.(this.isPaused ? 0 : this.smoothedOutputLevel);
+      this.outputLevelFrame = window.requestAnimationFrame(tick);
+    };
+
+    this.outputLevelFrame = window.requestAnimationFrame(tick);
   }
 
   private log(kind: string, message: string, raw?: unknown): void {
@@ -284,7 +788,12 @@ export class RealtimeVoiceClient {
   }
 }
 
-async function callVoiceTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+async function callVoiceTool(
+  name: string,
+  args: Record<string, unknown>,
+  registerCancel?: (cancel: () => Promise<void>) => void,
+): Promise<unknown> {
+  void registerCancel;
   if (name === "submit_to_codex") {
     const request = stringArg(args.request);
     const context = optionalString(args.context);
@@ -292,6 +801,7 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
     const result = await window.codexVoice.sendToCodex(
       context ? `${request}\n\nVoice conversation context:\n${context}` : request,
       chatId,
+      optionalString(args.workspacePath),
     );
     return {
       ok: true,
@@ -308,6 +818,25 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
       await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
     );
     return { ok: true, message: "Codex received the update.", ...result };
+  }
+
+  if (name === "queue_codex_request") {
+    const request = stringArg(args.request);
+    const context = optionalString(args.context);
+    const result = await window.codexVoice.queueCodexRequest(
+      context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
+      optionalString(args.workspacePath),
+    );
+    return { ok: true, ...result };
+  }
+
+  if (name === "cancel_queued_codex_request") {
+    const result = await window.codexVoice.cancelQueuedCodexRequest(
+      optionalString(args.queuedId),
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
+    );
+    return { ok: true, ...result };
   }
 
   if (name === "interrupt_codex") {
@@ -388,7 +917,7 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
   }
 
   if (name === "create_new_codex_project") {
-    const project = await window.codexVoice.createProject(optionalString(args.name));
+    const project = await window.codexVoice.createProject(optionalString(args.name), optionalString(args.workspacePath));
     return { ok: true, project };
   }
 
@@ -438,6 +967,7 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
         displayName: project.displayName,
         updatedAt: project.updatedAt,
         folderPath: project.folderPath,
+        workspacePath: project.workspacePath,
         lastSummary: project.lastSummary,
         activeChatId: project.activeChatId,
         chats: visibleChats(project.chats),
@@ -461,6 +991,19 @@ async function callVoiceTool(name: string, args: Record<string, unknown>): Promi
   throw new Error(`Unknown Realtime tool: ${name}`);
 }
 
+async function cancelStaleVoiceTool(name: string, output: unknown): Promise<void> {
+  const result = output as {
+    queued?: unknown;
+    queuedId?: unknown;
+    chatId?: unknown;
+  } | null;
+
+  if (name === "queue_codex_request" && result?.queued === true && typeof result.queuedId === "string") {
+    const chatId = typeof result.chatId === "string" ? result.chatId : undefined;
+    await window.codexVoice.cancelQueuedCodexRequest(result.queuedId, chatId);
+  }
+}
+
 function safeJson(raw: string | undefined): Record<string, unknown> {
   if (!raw) return {};
   try {
@@ -468,6 +1011,10 @@ function safeJson(raw: string | undefined): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function stringArg(value: unknown): string {
@@ -535,6 +1082,13 @@ function permissionModeArg(value: unknown): CodexPermissionMode {
   if (["default", "default-permissions", "normal"].includes(normalized)) return "default";
   if (["auto", "auto-review", "autoreview"].includes(normalized)) return "auto-review";
   if (["full", "full-access", "danger", "danger-full-access"].includes(normalized)) return "full-access";
+  if (
+    ["custom", "custom-config", "custom-config-toml", "custom-config.toml", "config", "config-toml", "config.toml"].includes(
+      normalized,
+    )
+  ) {
+    return "custom-config";
+  }
   throw new Error(`Unknown permission mode: ${mode}`);
 }
 
@@ -650,6 +1204,158 @@ function summarizePendingRequestForSpeech(request: PendingCodexRequest): Record<
   };
 }
 
+function codexCompletionUpdateText(event: AppEvent): string | null {
+  const message = event.message.trim();
+  if (!message) return null;
+  const raw = (event.raw ?? {}) as {
+    threadId?: unknown;
+    turn?: {
+      id?: unknown;
+      status?: unknown;
+      error?: { message?: unknown };
+    };
+  };
+  const turn = raw.turn ?? {};
+  const lines = [
+    "App status update from Codex, not a user request.",
+    "Codex turn completed.",
+    `Status: ${message}`,
+  ];
+  if (typeof raw.threadId === "string" && raw.threadId.trim()) {
+    lines.push(`Thread ID: ${raw.threadId}`);
+  }
+  if (typeof turn.id === "string" && turn.id.trim()) {
+    lines.push(`Turn ID: ${turn.id}`);
+  }
+  if (typeof turn.status === "string" && turn.status.trim()) {
+    lines.push(`Turn status: ${turn.status}`);
+  }
+  if (typeof turn.error?.message === "string" && turn.error.message.trim()) {
+    lines.push(`Error: ${turn.error.message}`);
+  }
+  return lines.join("\n");
+}
+
+function codexCompletionSpeechInstructions(event: AppEvent): string {
+  const raw = (event.raw ?? {}) as {
+    turn?: {
+      status?: unknown;
+    };
+  };
+  const status = raw.turn?.status;
+  const outcome =
+    status === "interrupted"
+      ? "Codex was interrupted."
+      : status === "failed"
+        ? "Codex failed."
+        : "Codex finished.";
+  return [
+    "A Codex completion status update was just added to the conversation by the app.",
+    `Briefly tell the user: ${outcome}`,
+    "Use one short natural sentence.",
+    "Do not call tools.",
+  ].join("\n");
+}
+
+function queuedCodexTransitionText(raw: unknown): { message: string; contextText: string } | null {
+  const record = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const text = typeof record.text === "string" ? record.text.trim() : "";
+  if (!text) return null;
+  const shortText = truncateTranscriptContextLine(text, 120);
+  const message = `Codex finished and is moving on to ${JSON.stringify(shortText)}.`;
+  return {
+    message,
+    contextText: [
+      "App status update from Codex, not a user request.",
+      "Codex finished the previous turn and automatically started a queued follow-up.",
+      `Queued follow-up: ${text}`,
+    ].join("\n"),
+  };
+}
+
+function chatContextKey(context: RealtimeChatContext | null): string | null {
+  return context ? `${context.projectId}:${context.chatId}:${context.threadId ?? ""}` : null;
+}
+
+type TranscriptContext = {
+  count: number;
+  fingerprint: string;
+  text: string;
+};
+
+function transcriptContextFromMessages(messages: VoiceTranscriptMessage[]): TranscriptContext {
+  const recent = messages
+    .filter((message) => message.status === "completed" && message.text.trim())
+    .slice(-32);
+
+  let remainingChars = 10_000;
+  const lines: string[] = [];
+  for (const message of recent) {
+    const label = message.role === "user" ? "User" : "Voice assistant";
+    const text = truncateTranscriptContextLine(message.text.trim(), Math.min(1_200, remainingChars));
+    if (!text) continue;
+    lines.push(`${label}: ${text}`);
+    remainingChars -= text.length;
+    if (remainingChars <= 0) break;
+  }
+
+  const text = lines.length > 0
+    ? lines.join("\n")
+    : "No prior voice transcript messages were available for this active chat.";
+  return {
+    count: lines.length,
+    fingerprint: lines.join("\n"),
+    text,
+  };
+}
+
+function activeChatContextText(
+  context: RealtimeChatContext,
+  transcriptContext: TranscriptContext | null,
+): { text: string } {
+  const transcriptLines = transcriptContext
+    ? [
+        "Messages beginning with exactly `Active chat transcript ===` followed by a newline are prior voice transcript excerpts for the active chat.",
+        "Treat the content after that marker as background context for references to earlier speech in this chat, but account for possible transcription, summarization, or routing errors.",
+        "If the user's request is ambiguous across chats, ask a concise clarification.",
+        "",
+        "Active chat transcript ===",
+        transcriptContext.text,
+      ]
+    : [
+        "Prior voice transcript excerpts for this active chat were already provided earlier in this Realtime session and have not changed.",
+        "Use the previously provided excerpts only as background context for references to earlier speech in this chat.",
+        "If the user's request is ambiguous across chats, ask a concise clarification.",
+      ];
+
+  return {
+    text: [
+      "This Realtime session will sometimes receive app-provided messages about the active Codex chat.",
+      "",
+      "The active Codex chat is now:",
+      `Project: ${context.projectName}`,
+      `Chat: ${context.chatName}`,
+      `Chat ID: ${context.chatId}`,
+      `Thread ID: ${context.threadId ?? "none"}`,
+      "",
+      "Treat this as routing and conversational context, not as a new user request.",
+      "Future tool calls should target this chat unless the user explicitly asks to move elsewhere.",
+      "The Realtime model cannot directly see the state of the project or thread unless that information is provided to it through the conversation.",
+      "",
+      ...transcriptLines,
+      "",
+      "Do not mention this convention unless it is relevant to resolving ambiguity.",
+    ].join("\n\n"),
+  };
+}
+
+function truncateTranscriptContextLine(value: string, maxLength: number): string {
+  if (maxLength <= 0) return "";
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
 function codexTurnOutputContextText(output: CodexTurnOutput): string {
   return [
     "App-provided Codex context, not a user request.",
@@ -665,6 +1371,7 @@ function codexTurnOutputContextText(output: CodexTurnOutput): string {
       completedAt: output.completedAt,
       durationMs: output.durationMs,
       errorMessage: output.errorMessage,
+      nextQueuedRequestText: output.nextQueuedRequestText,
       finalAssistantText: output.finalAssistantText,
     }),
   ].join("\n");

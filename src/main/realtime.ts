@@ -1,22 +1,47 @@
-import type { RealtimeClientSecret } from "../shared/types";
+import { app } from "electron";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import {
+  DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_REASONING_EFFORT,
+  DEFAULT_REALTIME_VOICE,
+  REALTIME_MODEL_OPTIONS,
+  REALTIME_REASONING_EFFORT_OPTIONS,
+  REALTIME_VOICE_OPTIONS,
+  type AppState,
+  type RealtimeClientSecret,
+  type RealtimeModelId,
+  type RealtimeReasoningEffort,
+  type RealtimeVoiceId,
+} from "../shared/types";
 import { getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
 
 const REALTIME_ENDPOINT = "https://api.openai.com/v1/realtime/client_secrets";
-const REALTIME_REASONING_EFFORTS = ["minimal", "low", "medium", "high"] as const;
-type RealtimeReasoningEffort = (typeof REALTIME_REASONING_EFFORTS)[number];
+const SETTINGS_FILE_NAME = "codex-voice-realtime-settings.json";
 
-export function realtimeConfig(): {
-  available: boolean;
-  model: string;
-  voice: string;
-  reasoningEffort: RealtimeReasoningEffort;
-  reason: string | null;
-  apiKeySource: "environment" | "saved" | null;
-  apiKeyEncrypted: boolean;
-} {
-  const model = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
-  const voice = process.env.OPENAI_REALTIME_VOICE || "marin";
-  const reasoningEffort = realtimeReasoningEffort(process.env.OPENAI_REALTIME_REASONING_EFFORT);
+type RealtimeSettingsFile = {
+  version: 1;
+  model?: RealtimeModelId | null;
+  voice?: RealtimeVoiceId | null;
+  reasoningEffort?: RealtimeReasoningEffort | null;
+  updatedAt?: string;
+};
+
+export function realtimeConfig(): AppState["realtime"] {
+  const saved = readRealtimeSettings();
+  const model =
+    saved.model ??
+    normalizeRealtimeModel(process.env.OPENAI_REALTIME_MODEL) ??
+    DEFAULT_REALTIME_MODEL;
+  const voice =
+    saved.voice ??
+    normalizeRealtimeVoice(process.env.OPENAI_REALTIME_VOICE) ??
+    DEFAULT_REALTIME_VOICE;
+  const selectedReasoningEffort =
+    saved.reasoningEffort ??
+    normalizeRealtimeReasoningEffort(process.env.OPENAI_REALTIME_REASONING_EFFORT) ??
+    DEFAULT_REALTIME_REASONING_EFFORT;
+  const reasoningEffort = realtimeReasoningEffort(model, selectedReasoningEffort);
   const status = getOpenAiApiKeyStatus();
   const available = status.configured;
   return {
@@ -30,6 +55,46 @@ export function realtimeConfig(): {
     apiKeySource: status.source,
     apiKeyEncrypted: status.encrypted,
   };
+}
+
+export function saveRealtimeSettings(settings: {
+  model?: RealtimeModelId | null;
+  voice?: RealtimeVoiceId | null;
+  reasoningEffort?: RealtimeReasoningEffort | null;
+}): AppState["realtime"] {
+  const current = readRealtimeSettings();
+  const next: RealtimeSettingsFile = {
+    ...current,
+    version: 1,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (settings.model !== undefined) {
+    if (settings.model === null) {
+      next.model = null;
+    } else {
+      next.model = requireRealtimeModel(settings.model);
+    }
+  }
+
+  if (settings.voice !== undefined) {
+    if (settings.voice === null) {
+      next.voice = null;
+    } else {
+      next.voice = requireRealtimeVoice(settings.voice);
+    }
+  }
+
+  if (settings.reasoningEffort !== undefined) {
+    if (settings.reasoningEffort === null) {
+      next.reasoningEffort = null;
+    } else {
+      next.reasoningEffort = requireRealtimeReasoningEffort(settings.reasoningEffort);
+    }
+  }
+
+  writeRealtimeSettings(next);
+  return realtimeConfig();
 }
 
 export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret> {
@@ -49,15 +114,24 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
       session: {
         type: "realtime",
         model: config.model,
-        reasoning: {
-          effort: config.reasoningEffort,
-        },
+        ...(config.reasoningEffort
+          ? {
+              reasoning: {
+                effort: config.reasoningEffort,
+              },
+            }
+          : {}),
         output_modalities: ["audio"],
         instructions: realtimeInstructions(),
         audio: {
           input: {
+            transcription: {
+              model: "gpt-4o-mini-transcribe",
+            },
             turn_detection: {
               type: "semantic_vad",
+              create_response: true,
+              interrupt_response: true,
             },
           },
           output: {
@@ -95,20 +169,113 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
   };
 }
 
+function normalizeRealtimeModel(value: unknown): RealtimeModelId | null {
+  if (typeof value !== "string") return null;
+  const model = value.trim();
+  const option = REALTIME_MODEL_OPTIONS.find((candidate) => candidate.model === model);
+  return option?.model ?? null;
+}
+
+function requireRealtimeModel(value: unknown): RealtimeModelId {
+  const model = normalizeRealtimeModel(value);
+  if (!model) {
+    throw new Error(
+      `Unsupported Realtime model "${String(value)}". Choose gpt-realtime-2 or gpt-realtime-1.5.`,
+    );
+  }
+  return model;
+}
+
+function normalizeRealtimeVoice(value: unknown): RealtimeVoiceId | null {
+  if (typeof value !== "string") return null;
+  const voice = value.trim();
+  const option = REALTIME_VOICE_OPTIONS.find((candidate) => candidate.voice === voice);
+  return option?.voice ?? null;
+}
+
+function requireRealtimeVoice(value: unknown): RealtimeVoiceId {
+  const voice = normalizeRealtimeVoice(value);
+  if (!voice) {
+    throw new Error(`Unsupported Realtime voice "${String(value)}".`);
+  }
+  return voice;
+}
+
+function normalizeRealtimeReasoningEffort(value: unknown): RealtimeReasoningEffort | null {
+  if (typeof value !== "string") return null;
+  const effort = value.trim();
+  return REALTIME_REASONING_EFFORT_OPTIONS.includes(effort as RealtimeReasoningEffort)
+    ? (effort as RealtimeReasoningEffort)
+    : null;
+}
+
+function requireRealtimeReasoningEffort(value: unknown): RealtimeReasoningEffort {
+  const effort = normalizeRealtimeReasoningEffort(value);
+  if (!effort) {
+    throw new Error(
+      `Unsupported Realtime reasoning effort "${String(value)}". Choose ${REALTIME_REASONING_EFFORT_OPTIONS.join(
+        ", ",
+      )}.`,
+    );
+  }
+  return effort;
+}
+
+function realtimeReasoningEffort(
+  model: RealtimeModelId,
+  selectedReasoningEffort: RealtimeReasoningEffort,
+): RealtimeReasoningEffort | null {
+  return model === "gpt-realtime-2" ? selectedReasoningEffort : null;
+}
+
+function realtimeSettingsPath(): string {
+  return path.join(app.getPath("userData"), SETTINGS_FILE_NAME);
+}
+
+function readRealtimeSettings(): RealtimeSettingsFile {
+  try {
+    const filePath = realtimeSettingsPath();
+    if (!existsSync(filePath)) return { version: 1 };
+    const settings = JSON.parse(readFileSync(filePath, "utf8")) as RealtimeSettingsFile;
+    return {
+      version: 1,
+      model: settings.model === null ? null : normalizeRealtimeModel(settings.model),
+      voice: settings.voice === null ? null : normalizeRealtimeVoice(settings.voice),
+      reasoningEffort: settings.reasoningEffort === null
+        ? null
+        : normalizeRealtimeReasoningEffort(settings.reasoningEffort),
+      updatedAt: settings.updatedAt,
+    };
+  } catch {
+    return { version: 1 };
+  }
+}
+
+function writeRealtimeSettings(settings: RealtimeSettingsFile): void {
+  const filePath = realtimeSettingsPath();
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+}
+
 function realtimeInstructions(): string {
   return [
     "# Role",
     "You are the voice communication layer for a local Codex desktop app.",
+    "Codex is OpenAI's local coding agent that can read, edit, run, and test code in the user's workspace.",
     "",
     "# Boundary",
     "- You do NOT do computer tasks yourself.",
-    "- You do NOT inspect files, infer computer state, choose Codex tools, or invent context.",
+    "- You do NOT inspect files, infer computer state, choose Codex tools, write patches, run commands, search the web, or invent context.",
     "- Codex is the actual computer-use agent. Your job is to pass the user's request to Codex.",
     "- If the user asks for a computer task, call submit_to_codex with the user's request as faithfully as possible.",
+    "- If Codex is already working and the user corrects, narrows, or adds constraints to that same work, call steer_codex.",
+    "- If Codex is already working and the user asks for a separate follow-up task, call queue_codex_request so Codex starts it after the current turn finishes.",
+    "- If the user cancels a queued follow-up, call cancel_queued_codex_request. Do not call interrupt_codex unless the user wants to stop the active Codex turn.",
     "- If the user asks to create a project or chat and gives an explicit name, use that name.",
     "- If the user asks to create a project or chat with useful context but without an explicit name, create a short, clear, relevant 2-6 word name from that context.",
     "- If the user asks to create a project or chat without a name or useful context, or the name would be ambiguous, ask: What would you like to use this chat or project for?",
-    "- Creating a project only creates the project folder. Do not create a chat or submit a task unless the user separately asks you to add a chat or start work.",
+    "- Creating a project only creates the project record. Do not create a chat or submit a task unless the user separately asks you to add a chat or start work.",
+    "- When the user names a repo, folder, cwd, or workspace path, pass it as workspacePath so Codex threads are filed under that real workspace in the Codex app.",
     "- Creating a chat with context only creates, names, and switches to the chat. Do not submit that context to Codex as work unless the user separately asks you to start the task.",
     "- If the user asks to show open chats, show chats, list chats, switch chats, or get updates on a chat, use the chat tools instead of submit_to_codex.",
     "- Only add context that came from the current live voice conversation.",
@@ -116,7 +283,7 @@ function realtimeInstructions(): string {
     "",
     "# Reasoning",
     "- For greetings, direct status checks, approval answers, and short confirmations, respond quickly.",
-    "- For multi-step user requests, chat routing, task handoff, or possible ambiguity, reason briefly before speaking or calling a tool.",
+    "- For multi-step user requests, chat routing, or possible ambiguity, reason briefly before speaking or calling a tool.",
     "- Do not spend extra reasoning effort trying to reconstruct unclear audio.",
     "",
     "# Preambles",
@@ -179,6 +346,11 @@ function realtimeTools(): unknown[] {
             type: "string",
             description: "Optional target chat name when the user explicitly names an existing chat.",
           },
+          workspacePath: {
+            type: "string",
+            description:
+              "Optional real workspace/repo directory for this Codex task, such as ~/workspace/codex-voice. Use when the user names a path or repo so the thread appears under that workspace in Codex.",
+          },
         },
         required: ["request"],
       },
@@ -186,7 +358,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "steer_codex",
-      description: "Append an update, correction, or extra instruction to the currently running Codex turn.",
+      description: "Append an update, correction, or extra instruction to a running Codex turn. Use chatId or chatName when several chats are active.",
       parameters: {
         type: "object",
         properties: {
@@ -195,6 +367,51 @@ function realtimeTools(): unknown[] {
           chatName: { type: "string" },
         },
         required: ["message"],
+      },
+    },
+    {
+      type: "function",
+      name: "queue_codex_request",
+      description:
+        "Queue a separate follow-up request for Codex to start after the current running Codex turn finishes. Use steer_codex instead for corrections or constraints that should affect the current turn.",
+      parameters: {
+        type: "object",
+        properties: {
+          request: {
+            type: "string",
+            description: "The follow-up task to run after the current Codex turn finishes.",
+          },
+          context: {
+            type: "string",
+            description: "Brief relevant context from the current voice conversation only.",
+          },
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+          workspacePath: {
+            type: "string",
+            description:
+              "Optional real workspace/repo directory for this queued Codex task, such as ~/workspace/codex-voice.",
+          },
+        },
+        required: ["request"],
+      },
+    },
+    {
+      type: "function",
+      name: "cancel_queued_codex_request",
+      description:
+        "Cancel a queued future Codex request without interrupting the active Codex turn. Use this when the user cancels, removes, or withdraws a queued follow-up.",
+      parameters: {
+        type: "object",
+        properties: {
+          queuedId: {
+            type: "string",
+            description:
+              "Optional queued request id returned by queue_codex_request. If omitted, the latest queued request for the selected or active chat is cancelled.",
+          },
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+        },
       },
     },
     {
@@ -311,13 +528,13 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "set_codex_permissions",
       description:
-        "Set the Codex permission mode for the current chat, or next turn only if the user explicitly asks. Default permissions asks when Codex decides approval is needed; auto-review runs automatically inside the workspace sandbox; full access runs without approval prompts or filesystem sandboxing.",
+        "Set the Codex permission mode for the current chat, or next turn only if the user explicitly asks. Default permissions asks when Codex decides approval is needed; auto-review routes eligible approval prompts through Codex auto-review; full access runs without approval prompts or filesystem sandboxing; custom config.toml defers approval and sandbox settings to the active Codex config.",
       parameters: {
         type: "object",
         properties: {
           permissionMode: {
             type: "string",
-            enum: ["default", "auto-review", "full-access"],
+            enum: ["default", "auto-review", "full-access", "custom-config"],
           },
           scope: {
             type: "string",
@@ -332,11 +549,16 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "create_new_codex_project",
       description:
-        "Create a new Codex voice project with a fresh Documents workspace folder, without creating a chat/thread or submitting work. Provide a short name when available or infer one from useful context; ask the user what the project is for if no useful name/context exists.",
+        "Create a new Codex voice project record, without creating a chat/thread or submitting work. Provide a short name when available or infer one from useful context; pass workspacePath when the user names a real repo/folder so future Codex threads appear under that workspace.",
       parameters: {
         type: "object",
         properties: {
           name: { type: "string" },
+          workspacePath: {
+            type: "string",
+            description:
+              "Optional real workspace/repo directory, such as ~/workspace/codex-voice. Omit only when the user wants a blank scratch voice project.",
+          },
         },
       },
     },
@@ -344,7 +566,7 @@ function realtimeTools(): unknown[] {
       type: "function",
       name: "create_new_codex_chat",
       description:
-        "Create a new chat/thread inside the current Codex voice project, make it active, and do not submit work to Codex. Requires a short clear name; ask the user what the chat is for if no useful name/context exists.",
+        "Create a new chat/thread inside the current Codex voice project for a distinct workstream, make it active, and do not submit work to Codex. Requires a short clear name; ask the user what the chat is for if no useful name/context exists.",
       parameters: {
         type: "object",
         properties: {
@@ -433,14 +655,4 @@ function realtimeTools(): unknown[] {
       },
     },
   ];
-}
-
-function realtimeReasoningEffort(value: string | undefined): RealtimeReasoningEffort {
-  if (!value) return "low";
-  if (REALTIME_REASONING_EFFORTS.includes(value as RealtimeReasoningEffort)) {
-    return value as RealtimeReasoningEffort;
-  }
-  throw new Error(
-    `Unknown OPENAI_REALTIME_REASONING_EFFORT "${value}". Use one of: ${REALTIME_REASONING_EFFORTS.join(", ")}.`,
-  );
 }

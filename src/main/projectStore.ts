@@ -14,6 +14,10 @@ import {
   type ReasoningEffort,
   type VoiceChat,
   type VoiceProject,
+  type VoiceTranscriptMessage,
+  type VoiceTranscriptMessageRole,
+  type VoiceTranscriptMessageSource,
+  type VoiceTranscriptMessageStatus,
 } from "../shared/types";
 
 type ProjectIndex = {
@@ -27,6 +31,8 @@ type ListProjectsOptions = {
 
 const INDEX_FILE = ".codex-voice-projects.json";
 const PROJECT_FILE = ".codex-voice-project.json";
+const TRANSCRIPT_FOLDER = ".codex-voice-transcripts";
+const MAX_TRANSCRIPT_MESSAGES = 5_000;
 
 export class ProjectStore {
   readonly baseFolder: string;
@@ -79,7 +85,7 @@ export class ProjectStore {
     return projects[0] ?? null;
   }
 
-  async createProject(displayName?: string): Promise<VoiceProject> {
+  async createProject(displayName?: string, workspacePath?: string | null): Promise<VoiceProject> {
     const now = new Date();
     const id = randomUUID();
     const safeName = sanitizeProjectName(displayName || "Voice Project");
@@ -92,6 +98,7 @@ export class ProjectStore {
       id,
       displayName: displayName?.trim() || "Voice Project",
       folderPath,
+      workspacePath: normalizeStoredPath(workspacePath, folderPath),
       activeChatId: null,
       chats: [],
       codexThreadId: null,
@@ -255,6 +262,50 @@ export class ProjectStore {
     });
   }
 
+  async listTranscriptMessages(projectId: string, chatId: string): Promise<VoiceTranscriptMessage[]> {
+    const project = await this.getProject(projectId, { includeArchived: true });
+    if (!project) {
+      throw new Error(`Unknown voice project: ${projectId}`);
+    }
+    if (!project.chats.some((chat) => chat.id === chatId)) {
+      throw new Error(`Unknown chat: ${chatId}`);
+    }
+    return this.readTranscriptMessagesFile(this.transcriptPath(project, chatId), chatId);
+  }
+
+  async upsertTranscriptMessage(
+    projectId: string,
+    chatId: string,
+    message: VoiceTranscriptMessage,
+  ): Promise<VoiceTranscriptMessage | null> {
+    return this.enqueueMutation(async () => {
+      const project = await this.getProject(projectId, { includeArchived: true });
+      if (!project) {
+        throw new Error(`Unknown voice project: ${projectId}`);
+      }
+      const chat = project.chats.find((candidate) => candidate.id === chatId);
+      if (!chat) {
+        throw new Error(`Unknown chat: ${chatId}`);
+      }
+
+      const normalized = normalizeTranscriptMessage(message, chat.id, chat.codexThreadId);
+      if (!normalized) return null;
+
+      const filePath = this.transcriptPath(project, chat.id);
+      const existingMessages = await this.readTranscriptMessagesFile(filePath, chat.id);
+      const byId = new Map(existingMessages.map((existing) => [existing.id, existing]));
+      const existing = byId.get(normalized.id);
+      byId.set(normalized.id, mergeTranscriptMessage(existing, normalized));
+      const messages = [...byId.values()]
+        .sort(compareTranscriptMessages)
+        .slice(-MAX_TRANSCRIPT_MESSAGES);
+
+      await mkdir(path.dirname(filePath), { recursive: true });
+      await this.writeTextAtomic(filePath, `${messages.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+      return normalized;
+    });
+  }
+
   private async setChatArchived(
     projectId: string,
     chatId: string,
@@ -355,9 +406,13 @@ export class ProjectStore {
   }
 
   private async writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
+    await this.writeTextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
+  }
+
+  private async writeTextAtomic(filePath: string, text: string): Promise<void> {
     const tempPath = `${filePath}.${process.pid}.${Date.now()}-${randomUUID()}.tmp`;
     try {
-      await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+      await writeFile(tempPath, text);
       await rename(tempPath, filePath);
     } catch (error) {
       try {
@@ -365,6 +420,33 @@ export class ProjectStore {
       } catch {
         // Best-effort cleanup; preserve the original error.
       }
+      throw error;
+    }
+  }
+
+  private transcriptPath(project: VoiceProject, chatId: string): string {
+    return path.join(project.folderPath, TRANSCRIPT_FOLDER, `${safeTranscriptFileName(chatId)}.jsonl`);
+  }
+
+  private async readTranscriptMessagesFile(filePath: string, chatId: string): Promise<VoiceTranscriptMessage[]> {
+    try {
+      const raw = await readFile(filePath, "utf8");
+      return raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return normalizeTranscriptMessage(JSON.parse(line), chatId);
+          } catch {
+            return null;
+          }
+        })
+        .filter((message): message is VoiceTranscriptMessage => Boolean(message))
+        .sort(compareTranscriptMessages)
+        .slice(-MAX_TRANSCRIPT_MESSAGES);
+    } catch (error) {
+      if (isErrorWithCode(error, "ENOENT")) return [];
       throw error;
     }
   }
@@ -459,6 +541,7 @@ function normalizeProject(value: unknown): VoiceProject {
     createdAt,
     updatedAt,
     archivedAt: stringOrNull(project.archivedAt),
+    workspacePath: normalizeStoredPath((project as { workspacePath?: unknown }).workspacePath, project.folderPath),
     activeChatId,
     chats,
     codexThreadId: activeChat?.codexThreadId ?? null,
@@ -517,6 +600,7 @@ function normalizeCodexTurnOutput(value: unknown): CodexTurnOutput | null {
     turnId: output.turnId,
     status: output.status,
     finalAssistantText: output.finalAssistantText,
+    ...(Array.isArray(output.items) ? { items: output.items } : {}),
     startedAt: numberOrNull(output.startedAt),
     completedAt: numberOrNull(output.completedAt),
     durationMs: numberOrNull(output.durationMs),
@@ -524,8 +608,102 @@ function normalizeCodexTurnOutput(value: unknown): CodexTurnOutput | null {
   };
 }
 
+function normalizeTranscriptMessage(
+  value: unknown,
+  fallbackChatId: string,
+  fallbackThreadId: string | null = null,
+): VoiceTranscriptMessage | null {
+  const message = value as Partial<VoiceTranscriptMessage> | null | undefined;
+  if (!message || typeof message !== "object") return null;
+  const id = stringOrNull(message.id);
+  const text = stringOrNull(message.text);
+  const chatId = stringOrNull(message.chatId) ?? fallbackChatId;
+  const source = transcriptSourceOrNull(message.source);
+  const role = transcriptRoleOrNull(message.role);
+  const status = transcriptStatusOrNull(message.status);
+  const turnId = stringOrNull(message.turnId);
+  const responseId = stringOrNull(message.responseId);
+  const itemId = stringOrNull(message.itemId);
+  if (!id || !text || !chatId || !source || !role || !status) return null;
+  const metadata =
+    message.metadata && typeof message.metadata === "object" && !Array.isArray(message.metadata)
+      ? (message.metadata as Record<string, unknown>)
+      : undefined;
+
+  return {
+    id,
+    chatId,
+    threadId: stringOrNull(message.threadId) ?? fallbackThreadId,
+    source,
+    role,
+    text,
+    createdAt: stringOrNow(message.createdAt),
+    completedAt: stringOrNull(message.completedAt),
+    status,
+    ...(turnId ? { turnId } : {}),
+    ...(responseId ? { responseId } : {}),
+    ...(itemId ? { itemId } : {}),
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+function mergeTranscriptMessage(
+  existing: VoiceTranscriptMessage | undefined,
+  incoming: VoiceTranscriptMessage,
+): VoiceTranscriptMessage {
+  if (!existing) return incoming;
+  if (incoming.status !== "streaming") {
+    return {
+      ...incoming,
+      createdAt: existing.createdAt,
+    };
+  }
+  if (existing.status !== "streaming") return existing;
+  return {
+    ...incoming,
+    text: `${existing.text}${incoming.text}`,
+    createdAt: existing.createdAt,
+    metadata: {
+      ...(existing.metadata ?? {}),
+      ...(incoming.metadata ?? {}),
+    },
+  };
+}
+
+function compareTranscriptMessages(left: VoiceTranscriptMessage, right: VoiceTranscriptMessage): number {
+  const leftTime = dateMs(left.createdAt) ?? 0;
+  const rightTime = dateMs(right.createdAt) ?? 0;
+  if (leftTime !== rightTime) return leftTime - rightTime;
+  return left.id.localeCompare(right.id);
+}
+
+function transcriptSourceOrNull(value: unknown): VoiceTranscriptMessageSource | null {
+  return typeof value === "string" && ["realtime", "codex", "app"].includes(value)
+    ? (value as VoiceTranscriptMessageSource)
+    : null;
+}
+
+function transcriptRoleOrNull(value: unknown): VoiceTranscriptMessageRole | null {
+  return typeof value === "string" && ["user", "assistant"].includes(value)
+    ? (value as VoiceTranscriptMessageRole)
+    : null;
+}
+
+function transcriptStatusOrNull(value: unknown): VoiceTranscriptMessageStatus | null {
+  return typeof value === "string" && ["completed", "streaming", "interrupted", "error"].includes(value)
+    ? (value as VoiceTranscriptMessageStatus)
+    : null;
+}
+
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function normalizeStoredPath(value: unknown, fallback: string): string {
+  const raw = stringOrNull(value);
+  if (!raw) return fallback;
+  const expanded = raw === "~" ? process.env.HOME ?? raw : raw.startsWith("~/") ? path.join(process.env.HOME ?? "~", raw.slice(2)) : raw;
+  return path.resolve(expanded);
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -543,7 +721,7 @@ function serviceTierOrNull(value: unknown): CodexServiceTier | null {
 }
 
 function permissionModeOrDefault(value: unknown, fallback = DEFAULT_CODEX_PERMISSION_MODE): CodexPermissionMode {
-  return typeof value === "string" && ["default", "auto-review", "full-access"].includes(value)
+  return typeof value === "string" && ["default", "auto-review", "full-access", "custom-config"].includes(value)
     ? (value as CodexPermissionMode)
     : fallback;
 }
@@ -558,6 +736,16 @@ function isErrorWithCode(error: unknown, code: string): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function dateMs(value: unknown): number | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function safeTranscriptFileName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]/g, "_") || "chat";
 }
 
 function sanitizeProjectName(name: string): string {
