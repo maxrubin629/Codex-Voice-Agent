@@ -92,13 +92,21 @@ type ChatContext = {
   recovered?: boolean;
 };
 
-const CODEX_VOICE_DEVELOPER_INSTRUCTIONS = [
-  "This request came through a local Realtime voice interface.",
-  "Codex owns the actual planning, computer use, tool use, browser use, and execution.",
-  "For requests that may require controlling desktop apps, use tool_search to discover computer-use before choosing an approach; do this only once per new tool or plugin requested by the user.",
-  "If the user's request mentions the Computer Use plugin, satisfy that request by discovering and using the actual computer-use plugin. Do not replace it with shell commands, open -a, AppleScript via terminal, or other terminal workarounds.",
-  "Ask for clarification or approval when needed, and keep final status concise enough to relay by voice.",
+const CODEX_VOICE_BRIDGE_PROMPT = [
+  "This thread will sometimes receive messages from a voice interface.",
+  "",
+  "Codex (you) owns the actual planning, computer use, tool use, browser use, and execution.",
+  "",
+  "For requests that may require controlling desktop apps or browser state, use tool_search to discover relevant tools such as computer-use or Chrome before choosing an approach. Ask for clarification or approval when needed, and keep final outputs clear, with the right amount of detail to be relayed by voice.",
+  "",
+  "Messages beginning with exactly `Voice ===` followed by a newline are mediated by the Realtime model. Treat the content after that marker as the user's intended request, but account for possible transcription, summarization, or routing errors. The Realtime model cannot directly see the state of the project or thread unless that information is provided to it through the conversation. If the request is ambiguous, ask a concise clarification.",
+  "",
+  "Messages that do not begin with that marker are normal text-based messages from the user and should be treated normally.",
+  "",
+  "Do not mention this convention unless it is relevant to resolving ambiguity.",
 ].join("\n");
+const CODEX_VOICE_MARKER = "Voice ===\n";
+const CODEX_VOICE_BRIDGE_PROMPT_PATTERN = new RegExp(escapeRegExp(CODEX_VOICE_BRIDGE_PROMPT));
 
 type ReviewTarget =
   | { type: "uncommittedChanges" }
@@ -407,6 +415,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     const turnSettings = this.resolveTurnSettings(project, chat);
     const cwd = projectWorkspacePath(project);
+    const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(chat.codexThreadId);
     const result = (await this.codex.request("turn/start", {
       threadId: chat.codexThreadId,
       cwd,
@@ -418,7 +427,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       input: [
         {
           type: "text",
-          text: codexTurnText(trimmed),
+          text: codexVoiceTurnText(trimmed, bridgeAlreadyInjected),
           text_elements: [],
         },
       ],
@@ -1108,6 +1117,14 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return { project, chat };
   }
 
+  private async threadHasVoiceBridgePrompt(threadId: string): Promise<boolean> {
+    const response = (await this.codex.request("thread/read", {
+      threadId,
+      includeTurns: true,
+    })) as ThreadReadResponse;
+    return threadTurnsHaveVoiceBridgePrompt(response.thread?.turns);
+  }
+
   private async resumeChatThread(project: VoiceProject, chat: VoiceChat): Promise<ChatContext> {
     if (!chat.codexThreadId) {
       throw new Error(`Chat "${chat.displayName}" does not have a Codex thread id.`);
@@ -1119,7 +1136,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         threadId: chat.codexThreadId,
         cwd: projectWorkspacePath(project),
         ...threadPermissionParams(chatSettings.permissionMode),
-        developerInstructions: CODEX_VOICE_DEVELOPER_INSTRUCTIONS,
         personality: "friendly",
         excludeTurns: true,
         ...(chatSettings.model ? { model: chatSettings.model } : {}),
@@ -1136,7 +1152,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       ...(chatSettings.model ? { model: chatSettings.model } : {}),
       ...(chatSettings.serviceTier ? { serviceTier: chatSettings.serviceTier } : {}),
       ...threadPermissionParams(chatSettings.permissionMode),
-      developerInstructions: CODEX_VOICE_DEVELOPER_INSTRUCTIONS,
       personality: "friendly",
       serviceName: "codex_voice",
     })) as { thread?: { id?: string } };
@@ -1168,7 +1183,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       ...(chatSettings.model ? { model: chatSettings.model } : {}),
       ...(chatSettings.serviceTier ? { serviceTier: chatSettings.serviceTier } : {}),
       ...threadPermissionParams(chatSettings.permissionMode),
-      developerInstructions: CODEX_VOICE_DEVELOPER_INSTRUCTIONS,
       personality: "friendly",
       serviceName: "codex_voice",
     })) as { thread?: { id?: string } };
@@ -3957,6 +3971,18 @@ function samePath(left: string, right: string): boolean {
   return path.resolve(left) === path.resolve(right);
 }
 
-function codexTurnText(userText: string): string {
-  return userText;
+function codexVoiceTurnText(userText: string, bridgeAlreadyInjected: boolean): string {
+  const voiceRequest = `${CODEX_VOICE_MARKER}${userText}`;
+  return bridgeAlreadyInjected ? voiceRequest : `${CODEX_VOICE_BRIDGE_PROMPT}\n\n${voiceRequest}`;
+}
+
+function threadTurnsHaveVoiceBridgePrompt(turns: CodexThreadTurn[] | undefined): boolean {
+  return (turns ?? []).some((turn) => {
+    const userText = userTextFromTurn(turn);
+    return userText ? CODEX_VOICE_BRIDGE_PROMPT_PATTERN.test(userText) : false;
+  });
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
