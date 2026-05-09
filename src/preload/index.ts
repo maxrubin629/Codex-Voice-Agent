@@ -8,11 +8,7 @@ import type {
   CodexServiceTier,
   CodexVoiceApi,
   ReasoningEffort,
-  RightPanelOpenTarget,
-  RightPanelPreviewRequest,
   ToolQuestionAnswer,
-  VoiceExecCommandArgs,
-  VoiceWriteStdinArgs,
   WindowChromeState,
 } from "../shared/types";
 
@@ -20,6 +16,8 @@ const api: CodexVoiceApi = {
   getState: () => ipcRenderer.invoke("app:getState"),
   openVoiceWindow: () => ipcRenderer.invoke("app:openVoiceWindow"),
   getWindowChromeState: () => ipcRenderer.invoke("app:getWindowChromeState"),
+  expandVoiceWindowForRightPane: () => ipcRenderer.invoke("app:expandVoiceWindowForRightPane"),
+  collapseVoiceWindowFromRightPane: () => ipcRenderer.invoke("app:collapseVoiceWindowFromRightPane"),
   openDebugWindow: () => ipcRenderer.invoke("app:openDebugWindow"),
   getEvents: () => ipcRenderer.invoke("app:getEvents"),
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
@@ -47,6 +45,10 @@ const api: CodexVoiceApi = {
   sendToCodex: (text: string, chatId?: string, workspacePath?: string | null) =>
     ipcRenderer.invoke("codex:send", { text, chatId, workspacePath }),
   steerCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:steer", { text, chatId }),
+  queueCodexRequest: (text: string, chatId?: string, workspacePath?: string | null) =>
+    ipcRenderer.invoke("codex:queue", { text, chatId, workspacePath }),
+  cancelQueuedCodexRequest: (queuedId?: string | null, chatId?: string) =>
+    ipcRenderer.invoke("codex:cancelQueued", { queuedId, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
   setCodexSettings: (
@@ -66,18 +68,6 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
   getTranscriptMessages: (chatId?: string) =>
     ipcRenderer.invoke("rightPanel:getTranscriptMessages", { chatId }),
-  getGitChangeSummary: (workspacePath?: string | null) =>
-    ipcRenderer.invoke("rightPanel:getGitChangeSummary", { workspacePath }),
-  previewRightPanelTarget: (target: RightPanelPreviewRequest) =>
-    ipcRenderer.invoke("rightPanel:previewTarget", target),
-  openRightPanelTarget: (target: RightPanelOpenTarget) =>
-    ipcRenderer.invoke("rightPanel:openTarget", target),
-  execCommand: (args: VoiceExecCommandArgs) => ipcRenderer.invoke("voiceTools:execCommand", args),
-  writeStdin: (args: VoiceWriteStdinArgs) => ipcRenderer.invoke("voiceTools:writeStdin", args),
-  terminateExecSession: (sessionId: number) => ipcRenderer.invoke("voiceTools:terminateExecSession", { sessionId }),
-  applyPatch: (input: string) => ipcRenderer.invoke("voiceTools:applyPatch", { input }),
-  webSearch: (args) => ipcRenderer.invoke("voiceTools:webSearch", args),
-  cancelWebSearch: (requestId: string) => ipcRenderer.invoke("voiceTools:cancelWebSearch", { requestId }),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),

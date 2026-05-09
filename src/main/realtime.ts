@@ -13,18 +13,11 @@ import {
   type RealtimeModelId,
   type RealtimeReasoningEffort,
   type RealtimeVoiceId,
-  type VoiceWebSearchAction,
-  type VoiceWebSearchArgs,
-  type VoiceWebSearchResult,
-  type VoiceWebSearchSource,
 } from "../shared/types";
 import { getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
 
 const REALTIME_ENDPOINT = "https://api.openai.com/v1/realtime/client_secrets";
-const RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 const SETTINGS_FILE_NAME = "codex-voice-realtime-settings.json";
-const DEFAULT_REALTIME_WEB_SEARCH_MODEL = "gpt-5.4-mini";
-const webSearchControllers = new Map<string, AbortController>();
 
 type RealtimeSettingsFile = {
   version: 1;
@@ -176,175 +169,6 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
   };
 }
 
-export async function searchWebForRealtime(args: VoiceWebSearchArgs): Promise<VoiceWebSearchResult> {
-  const apiKey = getOpenAiApiKey();
-  if (!apiKey) {
-    throw new Error("Add an OpenAI API key to use web search.");
-  }
-
-  const query = requireSearchQuery(args?.query);
-  const context = optionalSearchContext(args?.context);
-  const model = realtimeWebSearchModel();
-  const requestId = optionalRequestId(args?.requestId);
-  const controller = requestId ? new AbortController() : null;
-  if (requestId && controller) {
-    webSearchControllers.set(requestId, controller);
-  }
-  const input = [
-    "Search the web for the voice assistant's user.",
-    "Return a concise, source-backed answer suitable for a spoken follow-up.",
-    "Do not include markdown footnote syntax; include source URLs in the answer when they are important.",
-    "",
-    `Query: ${query}`,
-    context ? `Conversation context: ${context}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  try {
-    const response = await fetch(RESPONSES_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      signal: controller?.signal,
-      body: JSON.stringify({
-        model,
-        tools: [{ type: "web_search" }],
-        input,
-        max_output_tokens: 900,
-      }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Web search failed: ${response.status} ${text}`);
-    }
-
-    const data = (await response.json()) as Record<string, unknown>;
-    const answer = responseOutputText(data) || "The web search completed, but no answer text was returned.";
-
-    return {
-      query,
-      answer,
-      sources: responseUrlCitations(data),
-      actions: responseWebSearchActions(data),
-      model,
-    };
-  } catch (error) {
-    if (controller?.signal.aborted) {
-      throw new Error("Web search canceled.");
-    }
-    throw error;
-  } finally {
-    if (requestId) {
-      webSearchControllers.delete(requestId);
-    }
-  }
-}
-
-export function cancelWebSearchForRealtime(requestId: string): void {
-  const controller = webSearchControllers.get(requestId);
-  if (!controller) return;
-  controller.abort();
-  webSearchControllers.delete(requestId);
-}
-
-function realtimeWebSearchModel(): string {
-  const configured = process.env.OPENAI_REALTIME_WEB_SEARCH_MODEL?.trim();
-  return configured || DEFAULT_REALTIME_WEB_SEARCH_MODEL;
-}
-
-function requireSearchQuery(value: unknown): string {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error("web_search requires a non-empty query.");
-  }
-  return value.trim().slice(0, 1000);
-}
-
-function optionalSearchContext(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim().slice(0, 1600) : null;
-}
-
-function optionalRequestId(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim().slice(0, 120) : null;
-}
-
-function responseOutputText(data: Record<string, unknown>): string {
-  const direct = stringFromUnknown(data.output_text);
-  if (direct) return direct;
-
-  const chunks: string[] = [];
-  for (const item of arrayRecords(data.output)) {
-    if (stringFromUnknown(item.type) !== "message") continue;
-    for (const content of arrayRecords(item.content)) {
-      const text = stringFromUnknown(content.text);
-      if (text) chunks.push(text);
-    }
-  }
-  return chunks.join("\n\n").trim();
-}
-
-function responseUrlCitations(data: Record<string, unknown>): VoiceWebSearchSource[] {
-  const sources = new Map<string, VoiceWebSearchSource>();
-  for (const item of arrayRecords(data.output)) {
-    if (stringFromUnknown(item.type) !== "message") continue;
-    for (const content of arrayRecords(item.content)) {
-      for (const annotation of arrayRecords(content.annotations)) {
-        if (stringFromUnknown(annotation.type) !== "url_citation") continue;
-        const url = stringFromUnknown(annotation.url);
-        if (!url || sources.has(url)) continue;
-        sources.set(url, {
-          url,
-          title: stringFromUnknown(annotation.title),
-        });
-      }
-    }
-  }
-  return [...sources.values()].slice(0, 8);
-}
-
-function responseWebSearchActions(data: Record<string, unknown>): VoiceWebSearchAction[] {
-  const actions: VoiceWebSearchAction[] = [];
-  for (const item of arrayRecords(data.output)) {
-    if (stringFromUnknown(item.type) !== "web_search_call") continue;
-    const action = recordFromUnknown(item.action);
-    if (!action) continue;
-    const type = stringFromUnknown(action.type) ?? "search";
-    const query = stringFromUnknown(action.query);
-    const queries = arrayStrings(action.queries);
-    actions.push({
-      type,
-      ...(query ? { query } : {}),
-      ...(queries.length > 0 ? { queries } : {}),
-    });
-  }
-  return actions.slice(0, 12);
-}
-
-function arrayRecords(value: unknown): Array<Record<string, unknown>> {
-  return Array.isArray(value)
-    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
-    : [];
-}
-
-function arrayStrings(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value
-        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-        .map((item) => item.trim())
-    : [];
-}
-
-function recordFromUnknown(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-
-function stringFromUnknown(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
 function normalizeRealtimeModel(value: unknown): RealtimeModelId | null {
   if (typeof value !== "string") return null;
   const model = value.trim();
@@ -437,21 +261,16 @@ function realtimeInstructions(): string {
   return [
     "# Role",
     "You are the voice communication layer for a local Codex desktop app.",
+    "Codex is OpenAI's local coding agent that can read, edit, run, and test code in the user's workspace.",
     "",
     "# Boundary",
-    "- Codex is the primary computer-use agent. Use submit_to_codex for substantial, ambiguous, or multi-step coding work.",
-    "- You may inspect/search files and run focused local commands with exec_command when that helps you answer or triage quickly.",
-    "- You have a web_search tool for current public web information. Use it when the user asks for latest/current facts or explicitly asks you to search the web.",
-    "- You may edit files with apply_patch for small, clear, well-scoped changes. Larger changes should be handed to Codex.",
-    "- Multi-file edits are not a separate tool. They are just repeated apply_patch calls, or one patch that contains several file sections.",
-    "- Do not invent hard tool-side size, risk, or file-count limits. Use judgment in guidance: inspect first, edit deliberately, and delegate bigger work to Codex.",
-    "- The active Codex permission mode also governs your file/command tools. Full access means no filesystem sandbox; custom config follows Codex config when available.",
-    "- Prefer rg for search, read files before editing them, keep workdir explicit when it matters, and verify edits with targeted commands when reasonable.",
-    "- Reading project docs, plan files, AGENTS.md, README files, tests, and nearby source is often the best use of your file tools before deciding what to do.",
-    "- A strong voice workflow is to turn the user's live thinking into a concise plan file, then ask Codex to implement that plan. Use apply_patch for the plan file when the plan is clear, and submit_to_codex when implementation begins.",
-    "- When several Codex chats are running at once, act as the coordinator: create or switch chats, read or update per-workstream plan files, submit focused tasks to the right chat, steer running chats with new context, and use get_codex_chat_status before summarizing progress.",
-    "- Keep plan files practical: current goal, relevant files, decisions, open questions, and the next concrete Codex task. Do not bloat them with generic process text.",
-    "- If the user asks for a computer task beyond a small direct inspection or edit, call submit_to_codex with the user's request as faithfully as possible.",
+    "- You do NOT do computer tasks yourself.",
+    "- You do NOT inspect files, infer computer state, choose Codex tools, write patches, run commands, search the web, or invent context.",
+    "- Codex is the actual computer-use agent. Your job is to pass the user's request to Codex.",
+    "- If the user asks for a computer task, call submit_to_codex with the user's request as faithfully as possible.",
+    "- If Codex is already working and the user corrects, narrows, or adds constraints to that same work, call steer_codex.",
+    "- If Codex is already working and the user asks for a separate follow-up task, call queue_codex_request so Codex starts it after the current turn finishes.",
+    "- If the user cancels a queued follow-up, call cancel_queued_codex_request. Do not call interrupt_codex unless the user wants to stop the active Codex turn.",
     "- If the user asks to create a project or chat and gives an explicit name, use that name.",
     "- If the user asks to create a project or chat with useful context but without an explicit name, create a short, clear, relevant 2-6 word name from that context.",
     "- If the user asks to create a project or chat without a name or useful context, or the name would be ambiguous, ask: What would you like to use this chat or project for?",
@@ -464,7 +283,7 @@ function realtimeInstructions(): string {
     "",
     "# Reasoning",
     "- For greetings, direct status checks, approval answers, and short confirmations, respond quickly.",
-    "- For multi-step user requests, chat routing, task handoff, or possible ambiguity, reason briefly before speaking or calling a tool.",
+    "- For multi-step user requests, chat routing, or possible ambiguity, reason briefly before speaking or calling a tool.",
     "- Do not spend extra reasoning effort trying to reconstruct unclear audio.",
     "",
     "# Preambles",
@@ -480,7 +299,6 @@ function realtimeInstructions(): string {
     "# Tool Behavior",
     "- Use only tools explicitly provided in the current tool list.",
     "- Do not invent, rename, simulate, or claim to use unavailable tools.",
-    "- When web_search succeeds, ground your spoken answer in its result and mention source URLs only when they are useful to the user.",
     "- Only say Codex completed or changed something after the relevant tool result confirms it.",
     "- If a tool fails, explain the failure briefly in user-friendly language and offer the next useful step.",
     "",
@@ -502,21 +320,13 @@ function realtimeInstructions(): string {
   ].join("\n");
 }
 
-const APPLY_PATCH_DESCRIPTION = [
-  "Use the apply_patch tool to edit files. Pass the patch text in the input field.",
-  "The patch must start with *** Begin Patch and end with *** End Patch.",
-  "Supported operations are *** Add File, *** Delete File, and *** Update File.",
-  "For updates, use @@ hunks with enough surrounding context to identify the lines. File paths are relative to the active project working directory.",
-  "A patch may touch more than one file; multi-file edits do not require a separate tool.",
-].join("\n");
-
 function realtimeTools(): unknown[] {
   return [
     {
       type: "function",
       name: "submit_to_codex",
       description:
-        "Pass the user's spoken request to Codex, the actual computer-use agent. Use for implementation work, and target a named chat when coordinating parallel workstreams.",
+        "Pass the user's spoken request to Codex, the actual computer-use agent. Use for nearly all requests to do something on the computer.",
       parameters: {
         type: "object",
         properties: {
@@ -526,7 +336,7 @@ function realtimeTools(): unknown[] {
           },
           context: {
             type: "string",
-            description: "Brief relevant context from the current voice conversation only. Include plan file paths or workstream names when they matter.",
+            description: "Brief relevant context from the current voice conversation only.",
           },
           chatId: {
             type: "string",
@@ -561,6 +371,51 @@ function realtimeTools(): unknown[] {
     },
     {
       type: "function",
+      name: "queue_codex_request",
+      description:
+        "Queue a separate follow-up request for Codex to start after the current running Codex turn finishes. Use steer_codex instead for corrections or constraints that should affect the current turn.",
+      parameters: {
+        type: "object",
+        properties: {
+          request: {
+            type: "string",
+            description: "The follow-up task to run after the current Codex turn finishes.",
+          },
+          context: {
+            type: "string",
+            description: "Brief relevant context from the current voice conversation only.",
+          },
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+          workspacePath: {
+            type: "string",
+            description:
+              "Optional real workspace/repo directory for this queued Codex task, such as ~/workspace/codex-voice.",
+          },
+        },
+        required: ["request"],
+      },
+    },
+    {
+      type: "function",
+      name: "cancel_queued_codex_request",
+      description:
+        "Cancel a queued future Codex request without interrupting the active Codex turn. Use this when the user cancels, removes, or withdraws a queued follow-up.",
+      parameters: {
+        type: "object",
+        properties: {
+          queuedId: {
+            type: "string",
+            description:
+              "Optional queued request id returned by queue_codex_request. If omitted, the latest queued request for the selected or active chat is cancelled.",
+          },
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
       name: "interrupt_codex",
       description: "Interrupt the active Codex turn when the user says to stop, cancel, or never mind.",
       parameters: {
@@ -580,107 +435,6 @@ function realtimeTools(): unknown[] {
       parameters: {
         type: "object",
         properties: {},
-      },
-    },
-    {
-      type: "function",
-      name: "web_search",
-      description:
-        "Search the live web for current public information, recent facts, news, pricing, docs, or anything the user explicitly asks to look up. Returns a concise answer and source URLs.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "The search query or user question to answer from the web.",
-          },
-          context: {
-            type: "string",
-            description: "Optional short context from the current voice conversation that helps disambiguate the query.",
-          },
-        },
-        required: ["query"],
-      },
-    },
-    {
-      type: "function",
-      name: "exec_command",
-      description: "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
-      parameters: {
-        type: "object",
-        properties: {
-          cmd: {
-            type: "string",
-            description: "Shell command to execute.",
-          },
-          workdir: {
-            type: "string",
-            description: "Optional working directory to run the command in; defaults to the active project's workspace.",
-          },
-          shell: {
-            type: "string",
-            description: "Shell binary to launch. Defaults to the user's default shell.",
-          },
-          tty: {
-            type: "boolean",
-            description: "Whether to allocate a TTY for the command. Defaults to false.",
-          },
-          login: {
-            type: "boolean",
-            description: "Whether to run the shell with login-shell semantics. Defaults to true.",
-          },
-          yield_time_ms: {
-            type: "number",
-            description: "How long to wait in milliseconds for output before yielding.",
-          },
-          max_output_tokens: {
-            type: "number",
-            description: "Maximum number of approximate tokens to return. Excess output will be truncated.",
-          },
-        },
-        required: ["cmd"],
-      },
-    },
-    {
-      type: "function",
-      name: "write_stdin",
-      description: "Writes characters to an existing exec_command session and returns recent output.",
-      parameters: {
-        type: "object",
-        properties: {
-          session_id: {
-            type: "number",
-            description: "Identifier of the running exec_command session.",
-          },
-          chars: {
-            type: "string",
-            description: "Bytes to write to stdin. Omit or pass an empty string to poll.",
-          },
-          yield_time_ms: {
-            type: "number",
-            description: "How long to wait in milliseconds for output before yielding.",
-          },
-          max_output_tokens: {
-            type: "number",
-            description: "Maximum number of approximate tokens to return. Excess output will be truncated.",
-          },
-        },
-        required: ["session_id"],
-      },
-    },
-    {
-      type: "function",
-      name: "apply_patch",
-      description: APPLY_PATCH_DESCRIPTION,
-      parameters: {
-        type: "object",
-        properties: {
-          input: {
-            type: "string",
-            description: "Patch text using the Codex apply_patch format.",
-          },
-        },
-        required: ["input"],
       },
     },
     {
@@ -849,7 +603,7 @@ function realtimeTools(): unknown[] {
     {
       type: "function",
       name: "get_codex_chat_status",
-      description: "Get updates/status for one chat or all chats in the current project. Use this before coordinating or summarizing parallel Codex work.",
+      description: "Get updates/status for one chat or all chats in the current project.",
       parameters: {
         type: "object",
         properties: {
