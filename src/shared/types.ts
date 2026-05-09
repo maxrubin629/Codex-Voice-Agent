@@ -186,6 +186,7 @@ export type CodexTurnOutput = {
   turnId: string;
   status: string;
   finalAssistantText: string;
+  nextQueuedRequestText?: string;
   items?: unknown[];
   startedAt: number | null;
   completedAt: number | null;
@@ -265,61 +266,6 @@ export type ActiveThreadSummary = {
   referencedFiles: ThreadArtifactCandidate[];
   turns: ThreadSummaryTurn[];
   rawUnknownItems: unknown[];
-};
-
-export type RightPanelPreviewRequest = {
-  kind: "file" | "url";
-  path?: string;
-  url?: string;
-  workspacePath?: string | null;
-};
-
-export type RightPanelPreviewResult = {
-  status: "ready" | "empty" | "too_large" | "unsupported" | "external" | "error";
-  kind: "text" | "markdown" | "code" | "image" | "iframe" | "external" | "unsupported" | "empty";
-  title: string;
-  subtitle: string | null;
-  path?: string;
-  url?: string;
-  mimeType?: string | null;
-  sizeBytes?: number | null;
-  text?: string;
-  dataUrl?: string;
-  truncated?: boolean;
-  errorMessage?: string;
-};
-
-export type RightPanelOpenTarget = {
-  kind: "file" | "folder" | "url";
-  path?: string;
-  url?: string;
-  workspacePath?: string | null;
-};
-
-export type GitPullRequestSummary = {
-  number: number;
-  title: string;
-  url: string;
-  state: string;
-  headRefName?: string | null;
-  baseRefName?: string | null;
-};
-
-export type GitChangeSummary = {
-  status: "ready" | "empty" | "not_git" | "error";
-  workspacePath: string | null;
-  gitRoot: string | null;
-  branch: string | null;
-  upstream: string | null;
-  ahead: number | null;
-  behind: number | null;
-  dirtyCount: number;
-  changedFiles: string[];
-  diffStat: string | null;
-  stagedDiffStat: string | null;
-  recentCommits: Array<{ sha: string; title: string; decorated: string }>;
-  pullRequest: GitPullRequestSummary | null;
-  errorMessage?: string;
 };
 
 export type VoiceChat = {
@@ -477,6 +423,27 @@ export type CodexActionResult = {
   chat: VoiceChat | null;
 };
 
+export type QueuedCodexRequestResult = {
+  queued: boolean;
+  queuedId: string | null;
+  message: string;
+  chatId: string | null;
+  turnId: string | null;
+  position: number;
+  text: string;
+  started?: CodexActionResult;
+};
+
+export type CancelQueuedCodexRequestResult = {
+  cancelled: boolean;
+  queuedId: string;
+  message: string;
+  chatId: string | null;
+  threadId: string | null;
+  remaining: number;
+  text: string;
+};
+
 export type AppEvent = {
   at: string;
   source: "app" | "codex" | "realtime";
@@ -524,61 +491,12 @@ export type RealtimeClientSecret = {
   reasoningEffort: RealtimeReasoningEffort | null;
 };
 
-export type VoiceExecCommandArgs = {
-  cmd: string;
-  workdir?: string | null;
-  shell?: string | null;
-  tty?: boolean | null;
-  login?: boolean | null;
-  yield_time_ms?: number | null;
-  max_output_tokens?: number | null;
-};
-
-export type VoiceWriteStdinArgs = {
-  session_id: number;
-  chars?: string | null;
-  yield_time_ms?: number | null;
-  max_output_tokens?: number | null;
-};
-
-export type VoiceWebSearchArgs = {
-  query: string;
-  context?: string | null;
-  requestId?: string | null;
-};
-
-export type VoiceWebSearchSource = {
-  title: string | null;
-  url: string;
-};
-
-export type VoiceWebSearchAction = {
-  type: string;
-  query?: string;
-  queries?: string[];
-};
-
-export type VoiceWebSearchResult = {
-  query: string;
-  answer: string;
-  sources: VoiceWebSearchSource[];
-  actions: VoiceWebSearchAction[];
-  model: string;
-};
-
-export type VoiceExecCommandResult = {
-  chunk_id?: string;
-  wall_time_seconds: number;
-  exit_code?: number;
-  session_id?: number;
-  original_token_count?: number;
-  output: string;
-};
-
 export type CodexVoiceApi = {
   getState(): Promise<AppState>;
   openVoiceWindow(): Promise<void>;
   getWindowChromeState(): Promise<WindowChromeState>;
+  expandVoiceWindowForRightPane(): Promise<boolean>;
+  collapseVoiceWindowFromRightPane(): Promise<boolean>;
   openDebugWindow(): Promise<void>;
   getEvents(): Promise<AppEvent[]>;
   clearEvents(): Promise<void>;
@@ -598,6 +516,15 @@ export type CodexVoiceApi = {
   summarizeProject(projectId?: string, chatId?: string): Promise<string>;
   sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult>;
   steerCodex(text: string, chatId?: string): Promise<{ turnId: string }>;
+  queueCodexRequest(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+  ): Promise<QueuedCodexRequestResult>;
+  cancelQueuedCodexRequest(
+    queuedId?: string | null,
+    chatId?: string,
+  ): Promise<CancelQueuedCodexRequestResult>;
   interruptCodex(chatId?: string): Promise<void>;
   getChatStatus(chatId?: string): Promise<CodexChatRuntime[]>;
   setCodexSettings(
@@ -613,15 +540,6 @@ export type CodexVoiceApi = {
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
   getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary>;
   getTranscriptMessages(chatId?: string): Promise<VoiceTranscriptMessage[]>;
-  getGitChangeSummary(workspacePath?: string | null): Promise<GitChangeSummary>;
-  previewRightPanelTarget(target: RightPanelPreviewRequest): Promise<RightPanelPreviewResult>;
-  openRightPanelTarget(target: RightPanelOpenTarget): Promise<void>;
-  execCommand(args: VoiceExecCommandArgs): Promise<VoiceExecCommandResult>;
-  writeStdin(args: VoiceWriteStdinArgs): Promise<VoiceExecCommandResult>;
-  terminateExecSession(sessionId: number): Promise<void>;
-  applyPatch(input: string): Promise<VoiceExecCommandResult>;
-  webSearch(args: VoiceWebSearchArgs): Promise<VoiceWebSearchResult>;
-  cancelWebSearch(requestId: string): Promise<void>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;
