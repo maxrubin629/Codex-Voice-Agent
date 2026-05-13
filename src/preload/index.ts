@@ -64,6 +64,12 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:answerApproval", { requestId, decision }),
   answerToolQuestion: (requestId: string | number, answers: ToolQuestionAnswer[]) =>
     ipcRenderer.invoke("codex:answerToolQuestion", { requestId, answers }),
+  listMcpOkGrants: () => ipcRenderer.invoke("mcpOkGrants:list"),
+  revokeMcpOkGrant: (server: string, tool: string) =>
+    ipcRenderer.invoke("mcpOkGrants:revoke", { server, tool }),
+  steerCodexThread: (threadId: string, text: string) =>
+    ipcRenderer.invoke("codex:steerThread", { threadId, text }),
+  getThreadSummary: (threadId: string) => ipcRenderer.invoke("rightPanel:getThreadSummary", { threadId }),
   getActiveThreadSummary: (chatId?: string) =>
     ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
   getTranscriptMessages: (chatId?: string) =>
@@ -72,6 +78,8 @@ const api: CodexVoiceApi = {
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),
   setRealtimeSettings: (settings) => ipcRenderer.invoke("realtime:setSettings", { settings }),
+  setPhoneSettings: (settings) => ipcRenderer.invoke("phone:setSettings", { settings }),
+  hangupPhoneCall: () => ipcRenderer.invoke("phone:hangup"),
   onWindowChromeState: (listener: (state: WindowChromeState) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, state: WindowChromeState) => listener(state);
     ipcRenderer.on("app:windowChromeState", handler);

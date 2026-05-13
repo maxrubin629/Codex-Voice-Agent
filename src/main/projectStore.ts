@@ -191,6 +191,7 @@ export class ProjectStore {
       id: randomUUID(),
       displayName: displayName.trim() || "New chat",
       codexThreadId,
+      voiceBridgePromptInjectedAt: null,
       model,
       reasoningEffort,
       serviceTier,
@@ -246,7 +247,20 @@ export class ProjectStore {
     let activeThreadId = existing.codexThreadId;
     const chats = existing.chats.map((chat) => {
       if (chat.id !== chatId) return chat;
-      const updated = { ...chat, ...patch, updatedAt: now };
+      const nextThreadId = patch.codexThreadId !== undefined ? patch.codexThreadId : chat.codexThreadId;
+      const threadChanged = nextThreadId !== chat.codexThreadId;
+      const updated = {
+        ...chat,
+        ...patch,
+        codexThreadId: nextThreadId,
+        voiceBridgePromptInjectedAt:
+          patch.voiceBridgePromptInjectedAt !== undefined
+            ? patch.voiceBridgePromptInjectedAt
+            : threadChanged
+              ? null
+              : chat.voiceBridgePromptInjectedAt,
+        updatedAt: now,
+      };
       if (existing.activeChatId === chatId) activeThreadId = updated.codexThreadId;
       return updated;
     });
@@ -571,6 +585,7 @@ function normalizeChat(
     id: String(chat.id ?? randomUUID()),
     displayName: String(chat.displayName ?? "New chat"),
     codexThreadId: stringOrNull(chat.codexThreadId),
+    voiceBridgePromptInjectedAt: stringOrNull(chat.voiceBridgePromptInjectedAt),
     model: stringOrNull(chat.model) ?? fallbackModel,
     reasoningEffort: reasoningEffortOrNull(chat.reasoningEffort) ?? fallbackReasoningEffort,
     serviceTier: hasStoredServiceTier ? serviceTierOrNull(chat.serviceTier) : fallbackServiceTier,

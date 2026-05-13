@@ -98,13 +98,6 @@ export type CodexPermissionProfile = {
   sandbox: CodexSandboxMode | null;
 };
 
-export type McpOkGrant = {
-  server: string;
-  tool: string;
-  grantedAt: string;
-  updatedAt: string;
-};
-
 export const DEFAULT_CODEX_MODEL = "gpt-5.5";
 export const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = "medium";
 export const DEFAULT_CODEX_SERVICE_TIER: CodexServiceTier | null = null;
@@ -186,6 +179,32 @@ export type CodexSettings = {
   defaultServiceTier: CodexServiceTier | null;
   defaultPermissionMode: CodexPermissionMode;
   models: CodexModelSummary[];
+};
+
+export type McpOkGrant = {
+  server: string;
+  tool: string;
+  grantedAt: string;
+  updatedAt: string;
+};
+
+export type CodexTodoStatus = "pending" | "in_progress" | "completed";
+
+export type CodexTodoItem = {
+  id: string;
+  text: string;
+  status: CodexTodoStatus;
+  raw: unknown;
+};
+
+export type VoiceSubagentThread = {
+  id: string;
+  displayName: string;
+  threadId: string;
+  status: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  raw?: unknown;
 };
 
 export type CodexTurnOutput = {
@@ -275,10 +294,14 @@ export type ActiveThreadSummary = {
   rawUnknownItems: unknown[];
 };
 
+export const CODEX_TEXT_INGRESS_MARKER = "Codex ===\n";
+
 export type VoiceChat = {
   id: string;
   displayName: string;
   codexThreadId: string | null;
+  voiceBridgePromptInjectedAt: string | null;
+  subagents?: VoiceSubagentThread[];
   model: string | null;
   reasoningEffort: ReasoningEffort | null;
   serviceTier: CodexServiceTier | null;
@@ -320,6 +343,7 @@ export type CodexChatRuntime = {
   chatId: string;
   threadId: string | null;
   displayName: string;
+  todos: CodexTodoItem[];
   activeTurnId: string | null;
   status: string;
   threadStatus: string | null;
@@ -411,6 +435,7 @@ export type AppState = {
   activeProject: VoiceProject | null;
   runtime: CodexRuntimeState;
   codexSettings: CodexSettings;
+  mcpOkGrants: McpOkGrant[];
   realtime: {
     available: boolean;
     model: RealtimeModelId;
@@ -420,6 +445,7 @@ export type AppState = {
     apiKeySource: "environment" | "saved" | null;
     apiKeyEncrypted: boolean;
   };
+  phone: PhoneStatus;
 };
 
 export type PhoneSettings = {
@@ -586,6 +612,10 @@ export type CodexVoiceApi = {
   ): Promise<CodexSettings>;
   answerApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
+  listMcpOkGrants(): Promise<McpOkGrant[]>;
+  revokeMcpOkGrant(server: string, tool: string): Promise<McpOkGrant[]>;
+  steerCodexThread(threadId: string, text: string): Promise<{ turnId: string }>;
+  getThreadSummary(threadId: string): Promise<ActiveThreadSummary>;
   getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary>;
   getTranscriptMessages(chatId?: string): Promise<VoiceTranscriptMessage[]>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
@@ -596,6 +626,8 @@ export type CodexVoiceApi = {
     voice?: RealtimeVoiceId | null;
     reasoningEffort?: RealtimeReasoningEffort | null;
   }): Promise<AppState["realtime"]>;
+  setPhoneSettings(settings: PhoneSettingsUpdate): Promise<PhoneStatus>;
+  hangupPhoneCall(): Promise<PhoneStatus>;
   onWindowChromeState(listener: (state: WindowChromeState) => void): () => void;
   onAppState(listener: (state: AppState) => void): () => void;
   onAppEvent(listener: (event: AppEvent) => void): () => void;

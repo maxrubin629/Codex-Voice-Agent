@@ -4,7 +4,9 @@ import { clearOpenAiApiKey, saveOpenAiApiKey } from "./apiKeyStore";
 import appIcon from "./assets/app-icon.png?asset";
 import { CodexBridge } from "./codexBridge";
 import { VoiceCodexOrchestrator } from "./orchestrator";
+import { PhoneController } from "./phone";
 import { ProjectStore } from "./projectStore";
+import { createVoiceToolHandler } from "./voiceToolHandler";
 import { appendBufferedEvent } from "../shared/eventBuffer";
 import type {
   ApprovalDecision,
@@ -14,6 +16,7 @@ import type {
   RealtimeModelId,
   RealtimeReasoningEffort,
   RealtimeVoiceId,
+  PhoneSettingsUpdate,
   ReasoningEffort,
   ToolQuestionAnswer,
   WindowChromeState,
@@ -22,10 +25,12 @@ import type {
 const appName = "Codex Voice";
 const voiceCompactWindowWidth = 444;
 const voiceExpandedRightPaneWidth = 874;
+const voiceWindowMinHeight = 640;
 
 let voiceWindow: BrowserWindow | null = null;
 let debugWindow: BrowserWindow | null = null;
 let orchestrator: VoiceCodexOrchestrator | null = null;
+let phoneController: PhoneController | null = null;
 let bufferedEvents: AppEvent[] = [];
 
 type RendererWindowKind = "voice" | "debug";
@@ -49,8 +54,8 @@ function createVoiceWindow(): void {
   const window = new BrowserWindow({
     width: voiceCompactWindowWidth,
     height: 661,
-    minWidth: 410,
-    minHeight: 640,
+    minWidth: voiceCompactWindowWidth,
+    minHeight: voiceWindowMinHeight,
     title: "Codex Voice",
     ...(process.platform === "darwin"
       ? {
@@ -67,6 +72,7 @@ function createVoiceWindow(): void {
     },
   });
   voiceWindow = window;
+  lockVoiceWindowCompactWidth(window);
 
   loadRenderer(window, "voice");
   window.webContents.setZoomFactor(0.85);
@@ -78,8 +84,24 @@ function createVoiceWindow(): void {
   });
 }
 
+function lockVoiceWindowCompactWidth(window: BrowserWindow | null): void {
+  if (!window || window.isDestroyed() || window.isFullScreen()) return;
+  const { workArea } = screen.getDisplayMatching(window.getBounds());
+  window.setMinimumSize(voiceCompactWindowWidth, voiceWindowMinHeight);
+  window.setMaximumSize(voiceCompactWindowWidth, workArea.height);
+}
+
+function unlockVoiceWindowRightPaneWidth(window: BrowserWindow | null): void {
+  if (!window || window.isDestroyed() || window.isFullScreen()) return;
+  const bounds = window.getBounds();
+  const { workArea } = screen.getDisplayMatching(bounds);
+  window.setMinimumSize(voiceCompactWindowWidth, voiceWindowMinHeight);
+  window.setMaximumSize(workArea.width, workArea.height);
+}
+
 function expandVoiceWindowForRightPane(window: BrowserWindow | null): boolean {
   if (!window || window.isDestroyed() || window.isFullScreen()) return false;
+  unlockVoiceWindowRightPaneWidth(window);
   const bounds = window.getBounds();
   if (bounds.width >= voiceExpandedRightPaneWidth) return false;
 
@@ -95,9 +117,13 @@ function expandVoiceWindowForRightPane(window: BrowserWindow | null): boolean {
 function collapseVoiceWindowFromRightPane(window: BrowserWindow | null): boolean {
   if (!window || window.isDestroyed() || window.isFullScreen()) return false;
   const bounds = window.getBounds();
-  if (bounds.width <= voiceCompactWindowWidth) return false;
+  if (bounds.width <= voiceCompactWindowWidth) {
+    lockVoiceWindowCompactWidth(window);
+    return false;
+  }
 
   window.setBounds({ ...bounds, width: voiceCompactWindowWidth }, process.platform === "darwin");
+  lockVoiceWindowCompactWidth(window);
   return true;
 }
 
@@ -194,18 +220,29 @@ function normalizeAppEvent(payload: AppEvent): AppEvent {
 async function boot(): Promise<void> {
   const store = new ProjectStore();
   const codex = new CodexBridge();
-  orchestrator = new VoiceCodexOrchestrator(store, codex);
+  orchestrator = new VoiceCodexOrchestrator(store, codex, () => requirePhoneController().status());
+  phoneController = new PhoneController(undefined, { toolHandler: createVoiceToolHandler(orchestrator) });
 
   orchestrator.on("state", (state) => broadcastToAppWindows("app:state", state));
   orchestrator.on("event", (event) => publishEvent(normalizeAppEvent(event)));
+  phoneController.on("state", () => {
+    void orchestrator?.state().then((state) => broadcastToAppWindows("app:state", state));
+  });
+  phoneController.on("event", (event) => publishEvent(normalizeAppEvent(event as AppEvent)));
 
   createVoiceWindow();
   await orchestrator.initialize();
+  await phoneController.initialize();
 }
 
 function requireOrchestrator(): VoiceCodexOrchestrator {
   if (!orchestrator) throw new Error("App is still starting.");
   return orchestrator;
+}
+
+function requirePhoneController(): PhoneController {
+  if (!phoneController) throw new Error("Phone controller is still starting.");
+  return phoneController;
 }
 
 function registerIpcHandler(
@@ -234,6 +271,7 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   orchestrator?.shutdown();
+  void phoneController?.shutdown();
 });
 
 function registerIpc(): void {
@@ -381,9 +419,21 @@ function registerIpc(): void {
     (_event, payload: { requestId: string | number; answers: ToolQuestionAnswer[] }) =>
       requireOrchestrator().answerToolQuestion(payload.requestId, payload.answers),
   );
+  registerIpcHandler("codex:steerThread", (_event, payload: { threadId: string; text: string }) =>
+    requireOrchestrator().steerCodexThread(payload.threadId, payload.text),
+  );
+  registerIpcHandler("mcpOkGrants:list", () => requireOrchestrator().listMcpOkGrants());
+  registerIpcHandler(
+    "mcpOkGrants:revoke",
+    (_event, payload: { server: string; tool: string }) =>
+      requireOrchestrator().revokeMcpOkGrant(payload.server, payload.tool),
+  );
   registerIpcHandler(
     "rightPanel:getActiveThreadSummary",
     (_event, payload?: { chatId?: string }) => requireOrchestrator().getActiveThreadSummary(payload?.chatId),
+  );
+  registerIpcHandler("rightPanel:getThreadSummary", (_event, payload: { threadId: string }) =>
+    requireOrchestrator().getThreadSummary(payload.threadId),
   );
   registerIpcHandler(
     "rightPanel:getTranscriptMessages",
@@ -412,4 +462,10 @@ function registerIpc(): void {
     ) =>
       requireOrchestrator().setRealtimeSettings(payload.settings),
   );
+  registerIpcHandler(
+    "phone:setSettings",
+    (_event, payload: { settings: PhoneSettingsUpdate }) =>
+      requirePhoneController().updateSettings(payload.settings),
+  );
+  registerIpcHandler("phone:hangup", () => requirePhoneController().hangupActiveCall());
 }
