@@ -422,6 +422,47 @@ export type AppState = {
   };
 };
 
+export type PhoneSettings = {
+  enabled: boolean;
+  webhookPath: string;
+  localPort: number;
+  publicUrl: string | null;
+  allowUnsignedDevWebhooks: boolean;
+  webhookSecretConfigured: boolean;
+  allowedCallerNumbers: string[];
+};
+
+export type PhoneSettingsUpdate = Partial<Omit<PhoneSettings, "webhookSecretConfigured">> & {
+  webhookSecret?: string | null;
+};
+
+export type PhoneCallLogEntry = {
+  id: string;
+  callId: string | null;
+  from: string | null;
+  at: string;
+  status: "accepted" | "rejected" | "ended" | "error";
+  reason: string;
+};
+
+export type ActivePhoneCall = {
+  callId: string;
+  from: string | null;
+  startedAt: string;
+  status: "accepting" | "active" | "ending";
+};
+
+export type PhoneStatus = {
+  settings: PhoneSettings;
+  listener: {
+    running: boolean;
+    url: string | null;
+    error: string | null;
+  };
+  activeCall: ActivePhoneCall | null;
+  logs: PhoneCallLogEntry[];
+};
+
 export type CodexActionResult = {
   kind: "turn" | "command";
   message: string;
