@@ -10,6 +10,7 @@
     "predev": "node scripts/prepare-dev-electron.mjs",
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
+    "test": "vitest run",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit"
   },
@@ -17,14 +18,17 @@
     "@vitejs/plugin-react": "^5.1.0",
     "electron-vite": "^4.0.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
     "electron": "^39.2.3",
     "typescript": "^5.9.3",
-    "vite": "^7.2.4"
+    "vite": "^7.2.4",
+    "vitest": "^4.1.6"
   }
 }

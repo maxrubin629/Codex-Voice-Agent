@@ -1,27 +1,26 @@
 import React, { useEffect, useState } from "react";
 import { transcriptMessageFromEvent } from "../../shared/transcriptMessages";
 import type {
+  ActiveThreadSummary,
   AppEvent,
   AppState,
+  CodexTodoItem,
   PendingCodexRequest,
   PendingRequestQuestion,
+  ThreadProgressItem,
   ToolQuestionAnswer,
   VoiceChat,
   VoiceTranscriptMessage,
 } from "../../shared/types";
 
-type RightPanelTabId = "transcript" | "approvals";
-
-const tabs: Array<{ id: RightPanelTabId; title: string }> = [
-  { id: "transcript", title: "Transcript" },
-  { id: "approvals", title: "Approvals" },
-];
+type RightPanelTabId = "transcript" | "approvals" | "todos";
 
 export function RightPanel({
   open,
   state,
   events,
   activateTranscriptRequest,
+  inspectedThread,
   onClose,
   onAction,
 }: {
@@ -29,14 +28,26 @@ export function RightPanel({
   state: AppState;
   events: AppEvent[];
   activateTranscriptRequest: number;
+  inspectedThread: { threadId: string; label: string } | null;
   onClose: () => void;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
 }): React.ReactElement {
   const [activeTabId, setActiveTabId] = useState<RightPanelTabId>("transcript");
   const [messages, setMessages] = useState<VoiceTranscriptMessage[]>([]);
+  const [threadSummary, setThreadSummary] = useState<ActiveThreadSummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeChat = activeChatForState(state);
+  const todos = todosForActiveChat(state, activeChat);
+  const inspectedRequests = inspectedThread
+    ? state.runtime.pendingRequests.filter((request) => request.threadId === inspectedThread.threadId)
+    : state.runtime.pendingRequests;
+  const inspectedProgress = inspectedThread ? threadSummary?.progress ?? [] : [];
+  const tabs: Array<{ id: RightPanelTabId; title: string; count?: number }> = [
+    { id: "transcript", title: "Transcript" },
+    { id: "approvals", title: "Approvals", count: inspectedRequests.length },
+    { id: "todos", title: inspectedThread ? "Progress" : "Todos", count: inspectedThread ? inspectedProgress.length : todos.length },
+  ];
 
   useEffect(() => {
     if (!open || activateTranscriptRequest === 0) return;
@@ -83,6 +94,25 @@ export function RightPanel({
     };
   }, [activeChat?.id, open]);
 
+  useEffect(() => {
+    if (!open || !inspectedThread) {
+      setThreadSummary(null);
+      return;
+    }
+    let cancelled = false;
+    void window.codexVoice
+      .getThreadSummary(inspectedThread.threadId)
+      .then((summary) => {
+        if (!cancelled) setThreadSummary(summary);
+      })
+      .catch(() => {
+        if (!cancelled) setThreadSummary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectedThread?.threadId, open]);
+
   function activateRelativeTab(offset: number): void {
     const index = tabs.findIndex((tab) => tab.id === activeTabId);
     const nextIndex = (Math.max(0, index) + offset + tabs.length) % tabs.length;
@@ -127,6 +157,7 @@ export function RightPanel({
                 >
                   <PanelIcon />
                   <span>{tab.title}</span>
+                  {tab.count ? <b>{tab.count}</b> : null}
                 </button>
               </div>
             ))}
@@ -139,20 +170,136 @@ export function RightPanel({
           id={`voice-right-panel-${activeTabId}`}
           aria-labelledby={`voice-right-tab-${activeTabId}`}
         >
-          {activeTabId === "transcript" ? (
-            <TranscriptTab
-              chatId={activeChat?.id ?? null}
-              events={events}
-              loading={loading}
-              error={error}
-              messages={messages}
-            />
-          ) : (
-            <ApprovalsTab requests={state.runtime.pendingRequests} onAction={onAction} />
+          {inspectedThread && (
+            <ThreadInspectBanner inspectedThread={inspectedThread} summary={threadSummary} />
+          )}
+          {activeTabId === "transcript" && (
+            inspectedThread ? (
+              <ThreadSummaryTranscript summary={threadSummary} label={inspectedThread.label} />
+            ) : (
+              <TranscriptTab
+                chatId={activeChat?.id ?? null}
+                events={events}
+                loading={loading}
+                error={error}
+                messages={messages}
+              />
+            )
+          )}
+          {activeTabId === "approvals" && (
+            <ApprovalsTab requests={inspectedRequests} onAction={onAction} />
+          )}
+          {activeTabId === "todos" && (
+            inspectedThread ? (
+              <ThreadProgressTab progress={inspectedProgress} label={inspectedThread.label} />
+            ) : (
+              <TodosTab todos={todos} chatName={activeChat?.displayName ?? null} />
+            )
           )}
         </section>
       </div>
     </aside>
+  );
+}
+
+function ThreadInspectBanner({
+  inspectedThread,
+  summary,
+}: {
+  inspectedThread: { threadId: string; label: string };
+  summary: ActiveThreadSummary | null;
+}): React.ReactElement {
+  return (
+    <div className="voice-thread-inspect">
+      <span>
+        <small>Inspecting</small>
+        <strong>{inspectedThread.label}</strong>
+      </span>
+      <code>{summary?.latestTurnStatus ?? summary?.status ?? inspectedThread.threadId}</code>
+    </div>
+  );
+}
+
+function ThreadSummaryTranscript({
+  summary,
+  label,
+}: {
+  summary: ActiveThreadSummary | null;
+  label: string;
+}): React.ReactElement {
+  if (!summary) {
+    return <RightPanelEmpty title="Loading thread" detail={`Loading ${label}.`} />;
+  }
+  if (summary.status !== "ready") {
+    return <RightPanelEmpty title="Thread unavailable" detail={summary.errorMessage ?? "Could not load this thread."} />;
+  }
+  const entries = summary.turns.flatMap((turn) => [
+    ...(turn.userText ? [{ id: `${turn.id}:user`, role: "user" as const, text: turn.userText }] : []),
+    ...(turn.assistantText ? [{ id: `${turn.id}:assistant`, role: "assistant" as const, text: turn.assistantText }] : []),
+  ]);
+  if (entries.length === 0) {
+    return <RightPanelEmpty title="No thread messages" detail={`${label} has no readable messages yet.`} />;
+  }
+  return (
+    <div className="voice-transcript-list">
+      {entries.map((message) => (
+        <article key={message.id} className={`voice-transcript-entry ${message.role}`}>
+          <span>{message.role === "user" ? "User" : "Codex"}</span>
+          <p>{message.text}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function TodosTab({
+  todos,
+  chatName,
+}: {
+  todos: CodexTodoItem[];
+  chatName: string | null;
+}): React.ReactElement {
+  if (todos.length === 0) {
+    return (
+      <RightPanelEmpty
+        title="No live todos"
+        detail={chatName ? `App-server todos for ${chatName} will appear here.` : "Select a chat with live todos."}
+      />
+    );
+  }
+  return (
+    <div className="voice-todo-list">
+      {todos.map((todo) => (
+        <article key={todo.id} className={`voice-todo-row ${todo.status}`}>
+          <span aria-hidden="true" />
+          <p>{todo.text}</p>
+          <small>{todo.status.replace("_", " ")}</small>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function ThreadProgressTab({
+  progress,
+  label,
+}: {
+  progress: ThreadProgressItem[];
+  label: string;
+}): React.ReactElement {
+  if (progress.length === 0) {
+    return <RightPanelEmpty title="No thread progress" detail={`${label} has no live progress items.`} />;
+  }
+  return (
+    <div className="voice-todo-list">
+      {progress.map((item) => (
+        <article key={item.id} className={`voice-todo-row ${progressTodoClass(item.status)}`}>
+          <span aria-hidden="true" />
+          <p>{item.detail ? `${item.label}: ${item.detail}` : item.label}</p>
+          <small>{item.status.replace("_", " ")}</small>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -410,6 +557,18 @@ function activeChatForState(state: AppState): VoiceChat | null {
     chats[0] ??
     null
   );
+}
+
+function todosForActiveChat(state: AppState, activeChat: VoiceChat | null): CodexTodoItem[] {
+  if (!activeChat) return [];
+  const runtime = state.runtime.chats.find((chat) => chat.chatId === activeChat.id);
+  return runtime?.todos ?? [];
+}
+
+function progressTodoClass(status: ThreadProgressItem["status"]): CodexTodoItem["status"] {
+  if (status === "completed") return "completed";
+  if (status === "in_progress") return "in_progress";
+  return "pending";
 }
 
 function fallbackQuestions(request: PendingCodexRequest): PendingRequestQuestion[] {

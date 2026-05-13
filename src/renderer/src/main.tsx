@@ -12,13 +12,16 @@ import {
   REALTIME_MODEL_OPTIONS,
   REALTIME_REASONING_EFFORT_OPTIONS,
   REALTIME_VOICE_OPTIONS,
+  type ActiveThreadSummary,
   type AppEvent,
   type AppState,
   type CodexModelSummary,
   type CodexPermissionMode,
   type CodexServiceTier,
+  type CodexTodoItem,
   type CodexThreadTokenUsage,
   type CodexTurnOutput,
+  type McpOkGrant,
   type PendingCodexRequest,
   type PendingRequestQuestion,
   type ReasoningEffort,
@@ -71,6 +74,7 @@ const emptyState: AppState = {
     defaultPermissionMode: DEFAULT_CODEX_PERMISSION_MODE,
     models: [],
   },
+  mcpOkGrants: [],
   realtime: {
     available: false,
     model: DEFAULT_REALTIME_MODEL,
@@ -79,6 +83,24 @@ const emptyState: AppState = {
     reason: null,
     apiKeySource: null,
     apiKeyEncrypted: false,
+  },
+  phone: {
+    settings: {
+      enabled: false,
+      webhookPath: "",
+      localPort: 0,
+      publicUrl: null,
+      allowUnsignedDevWebhooks: false,
+      webhookSecretConfigured: false,
+      allowedCallerNumbers: [],
+    },
+    listener: {
+      running: false,
+      url: null,
+      error: null,
+    },
+    activeCall: null,
+    logs: [],
   },
 };
 
@@ -96,6 +118,7 @@ type VoiceOrbCustomization = {
 
 const voiceOrbCustomizationStorageKey = "codexVoice.orbCustomization";
 const dualPaneLayoutMediaQuery = "(min-width: 780px)";
+const rightPaneResizeCloseDurationMs = 240;
 const compactWindowWidth = 444;
 const rendererZoomFactor = 0.85;
 const defaultVoiceOrbCustomization: VoiceOrbCustomization = {
@@ -646,6 +669,7 @@ function VoiceHome({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [futureOpen, setFutureOpenState] = useState(false);
   const [futureVisible, setFutureVisible] = useState(false);
+  const [futureResizeClosing, setFutureResizeClosing] = useState(false);
   const [rightPaneRevealWidth, setRightPaneRevealWidth] = useState(0);
   const [transcriptActivationRequest, setTranscriptActivationRequest] = useState(0);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
@@ -664,9 +688,13 @@ function VoiceHome({
   const [newName, setNewName] = useState("");
   const [newChatName, setNewChatName] = useState("");
   const [query, setQuery] = useState("");
+  const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
+  const [inspectedThread, setInspectedThread] = useState<{ threadId: string; label: string } | null>(null);
   const paneTogglePointerActivationRef = useRef(false);
   const futureOpenRef = useRef(false);
   const futureVisibleRef = useRef(false);
+  const futureResizeClosingRef = useRef(false);
+  const futureResizeCloseTimerRef = useRef<number | null>(null);
   const rightPaneRevealWidthRef = useRef(0);
   const rightPaneSyncFrameRef = useRef<number | null>(null);
   const rightPaneLastViewportWidthRef = useRef(viewportWidth());
@@ -729,6 +757,7 @@ function VoiceHome({
   });
   const voiceState = voiceStateLabel(state, voiceConnected, voiceConnecting, voicePaused);
   const voiceOrbLabel = voiceOrbAriaLabel(state, voiceConnected, voiceConnecting, voicePaused);
+  const selectedSubagent = selectedSubagentForSummaries(projectChats, selectedSubagentId);
 
   useEffect(() => {
     saveVoiceOrbCustomization(orbCustomization);
@@ -736,6 +765,7 @@ function VoiceHome({
 
   useEffect(() => {
     const handleResize = () => {
+      if (futureResizeClosingRef.current) return;
       if (!futureVisibleRef.current && !futureOpenRef.current) {
         setRightPaneReveal(0);
         return;
@@ -748,6 +778,7 @@ function VoiceHome({
     window.addEventListener("resize", handleResize);
     return () => {
       window.removeEventListener("resize", handleResize);
+      clearFutureResizeCloseTimer();
       stopRightPaneSyncLoop();
     };
   }, []);
@@ -760,7 +791,7 @@ function VoiceHome({
       canShowBothPanesRef.current = nextCanShowBothPanes;
       setCanShowBothPanes(nextCanShowBothPanes);
       if (wasShowingBothPanes && !nextCanShowBothPanes && futureOpenRef.current) {
-        closeFuturePane();
+        closeFuturePaneFromResize();
       }
     };
 
@@ -794,6 +825,8 @@ function VoiceHome({
 
   useEffect(() => {
     setChatsOpen(false);
+    setSelectedSubagentId(null);
+    setInspectedThread(null);
   }, [activeProject?.id]);
 
   useEffect(() => {
@@ -862,9 +895,17 @@ function VoiceHome({
   async function switchChat(chatId: string): Promise<void> {
     await onAction(async () => {
       await window.codexVoice.switchChat(chatId);
+      setSelectedSubagentId(null);
+      setInspectedThread(null);
       setSwitchChatOpen(false);
       setChatsOpen(true);
     });
+  }
+
+  function inspectSubagent(subagent: ChatSubagentSummary): void {
+    setSelectedSubagentId(subagent.id);
+    setInspectedThread({ threadId: subagent.threadId, label: subagent.title });
+    openFuturePane();
   }
 
   function openProjectContextMenu(
@@ -962,6 +1003,8 @@ function VoiceHome({
   }
 
   function openFuturePane(): void {
+    clearFutureResizeCloseTimer();
+    setFutureResizeClosingState(false);
     futureOpenRef.current = true;
     futureVisibleRef.current = true;
     setFutureOpenState(true);
@@ -979,6 +1022,8 @@ function VoiceHome({
   }
 
   function closeFuturePane(): void {
+    clearFutureResizeCloseTimer();
+    setFutureResizeClosingState(false);
     futureOpenRef.current = false;
     setFutureOpenState(false);
     syncRightPaneRevealWidth();
@@ -993,6 +1038,56 @@ function VoiceHome({
       .catch(() => {
         if (!futureOpenRef.current) finishRightPaneClose();
       });
+  }
+
+  function closeFuturePaneFromResize(): void {
+    if (futureResizeClosingRef.current) return;
+
+    const startWidth = syncRightPaneRevealWidth();
+    if (startWidth <= 1) {
+      closeFuturePane();
+      return;
+    }
+
+    clearFutureResizeCloseTimer();
+    stopRightPaneSyncLoop();
+    futureOpenRef.current = false;
+    futureVisibleRef.current = true;
+    setFutureOpenState(false);
+    setFutureVisible(true);
+    setFutureResizeClosingState(true);
+    setRightPaneReveal(startWidth);
+
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (!futureResizeClosingRef.current || futureOpenRef.current) return;
+        setRightPaneReveal(0);
+      });
+    });
+
+    futureResizeCloseTimerRef.current = window.setTimeout(() => {
+      futureResizeCloseTimerRef.current = null;
+      if (futureOpenRef.current) return;
+      void window.codexVoice
+        .collapseVoiceWindowFromRightPane()
+        .then(() => {
+          if (!futureOpenRef.current) finishRightPaneClose();
+        })
+        .catch(() => {
+          if (!futureOpenRef.current) finishRightPaneClose();
+        });
+    }, rightPaneResizeCloseDurationMs + 40);
+  }
+
+  function setFutureResizeClosingState(next: boolean): void {
+    futureResizeClosingRef.current = next;
+    setFutureResizeClosing(next);
+  }
+
+  function clearFutureResizeCloseTimer(): void {
+    if (futureResizeCloseTimerRef.current === null) return;
+    window.clearTimeout(futureResizeCloseTimerRef.current);
+    futureResizeCloseTimerRef.current = null;
   }
 
   function setRightPaneReveal(width: number): void {
@@ -1015,6 +1110,7 @@ function VoiceHome({
   function finishRightPaneClose(): void {
     futureVisibleRef.current = false;
     setFutureVisible(false);
+    setFutureResizeClosingState(false);
     setRightPaneReveal(0);
     stopRightPaneSyncLoop();
   }
@@ -1025,6 +1121,11 @@ function VoiceHome({
     rightPaneStableFrameCountRef.current = 0;
 
     const syncFrame = () => {
+      if (futureResizeClosingRef.current) {
+        rightPaneSyncFrameRef.current = null;
+        return;
+      }
+
       const currentViewportWidth = viewportWidth();
       const revealWidth = syncRightPaneRevealWidth();
       finishRightPaneCloseIfCollapsed(revealWidth);
@@ -1082,6 +1183,8 @@ function VoiceHome({
   return (
     <main
       className={`voice-home ${futureVisible ? "future-open" : ""} ${
+        futureResizeClosing ? "future-resize-closing" : ""
+      } ${
         windowChromeState.isFullScreen ? "window-fullscreen" : ""
       }`}
       style={{
@@ -1106,6 +1209,11 @@ function VoiceHome({
         <div className="voice-home-content">
         <header className="voice-home-header">
           <h1>Codex Voice</h1>
+          {selectedSubagent && (
+            <p className="voice-header-breadcrumb">
+              {activeProject?.displayName ?? "Project"} / {selectedSubagent.parentTitle} / {selectedSubagent.title}
+            </p>
+          )}
         </header>
 
         <div className="voice-home-scroll">
@@ -1256,7 +1364,11 @@ function VoiceHome({
                 onNewChat={() => setNewChatOpen(true)}
                 onSwitchChat={() => setSwitchChatOpen(true)}
                 onSelectChat={switchChat}
+                selectedSubagentId={selectedSubagentId}
+                onSelectSubagent={setSelectedSubagentId}
+                onInspectSubagent={inspectSubagent}
                 onOpenChatMenu={openChatContextMenu}
+                onAction={onAction}
               />
             ) : (
               <div className="voice-actions">
@@ -1352,6 +1464,7 @@ function VoiceHome({
           state={state}
           events={events}
           activateTranscriptRequest={transcriptActivationRequest}
+          inspectedThread={inspectedThread}
           onClose={closeFuturePane}
           onAction={onAction}
         />
@@ -1585,6 +1698,7 @@ function VoiceSettingsPane({
   onClose: () => void;
 }): React.ReactElement {
   const [activeTab, setActiveTab] = useState<VoiceSettingsTab>("general");
+  const [phoneWebhookSecret, setPhoneWebhookSecret] = useState("");
   const health = realtimeHealth(state.realtime, realtimeIssue);
   const activeProject = state.activeProject;
   const workspace = activeProject?.workspacePath ?? activeProject?.folderPath ?? "No active project";
@@ -1603,7 +1717,10 @@ function VoiceSettingsPane({
   ];
 
   useEffect(() => {
-    if (open) setActiveTab("general");
+    if (open) {
+      setActiveTab("general");
+      setPhoneWebhookSecret("");
+    }
   }, [open]);
 
   async function changeRealtimeModel(model: RealtimeModelId): Promise<void> {
@@ -1643,6 +1760,51 @@ function VoiceSettingsPane({
       }
     });
     if (updated && voiceConnected) await onRestartVoice();
+  }
+
+  async function revokeMcpOkGrant(server: string, tool: string): Promise<void> {
+    await onAction(() => window.codexVoice.revokeMcpOkGrant(server, tool));
+  }
+
+  async function togglePhoneMode(enabled: boolean): Promise<void> {
+    await onAction(() => window.codexVoice.setPhoneSettings({ enabled }));
+  }
+
+  async function updatePhonePublicUrl(value: string): Promise<void> {
+    await onAction(() => window.codexVoice.setPhoneSettings({ publicUrl: value.trim() || null }));
+  }
+
+  async function updatePhoneWebhookPath(value: string): Promise<void> {
+    await onAction(() => window.codexVoice.setPhoneSettings({ webhookPath: value.trim() || "/phone/realtime-webhook" }));
+  }
+
+  async function updatePhonePort(value: string): Promise<void> {
+    const localPort = Number(value);
+    if (!Number.isInteger(localPort)) return;
+    await onAction(() => window.codexVoice.setPhoneSettings({ localPort }));
+  }
+
+  async function updatePhoneAllowlist(value: string): Promise<void> {
+    await onAction(() =>
+      window.codexVoice.setPhoneSettings({
+        allowedCallerNumbers: value
+          .split(/[,\n]/)
+          .map((entry) => entry.trim())
+          .filter(Boolean),
+      }),
+    );
+  }
+
+  async function savePhoneWebhookSecret(): Promise<void> {
+    const webhookSecret = phoneWebhookSecret.trim();
+    if (!webhookSecret) return;
+    await onAction(() => window.codexVoice.setPhoneSettings({ webhookSecret }));
+    setPhoneWebhookSecret("");
+  }
+
+  async function clearPhoneWebhookSecret(): Promise<void> {
+    await onAction(() => window.codexVoice.setPhoneSettings({ webhookSecret: null }));
+    setPhoneWebhookSecret("");
   }
 
   return (
@@ -1765,6 +1927,34 @@ function VoiceSettingsPane({
                   )}
                 </div>
               </section>
+
+              <section className="voice-settings-section">
+                <h3>MCP OK grants</h3>
+                <div className="voice-settings-card action-settings-card">
+                  {state.mcpOkGrants.length === 0 ? (
+                    <div className="voice-settings-permission-note">
+                      <strong>No saved MCP tool grants</strong>
+                      <small>Accepted app-server MCP tool approvals will appear here.</small>
+                    </div>
+                  ) : (
+                    state.mcpOkGrants.map((grant) => (
+                      <div key={`${grant.server}:${grant.tool}`} className="voice-settings-grant">
+                        <span>
+                          <strong>{grant.tool}</strong>
+                          <small>{grant.server}</small>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void revokeMcpOkGrant(grant.server, grant.tool)}
+                          aria-label={`Revoke MCP OK grant for ${grant.server}.${grant.tool}`}
+                        >
+                          Revoke
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
             </>
           )}
 
@@ -1776,9 +1966,10 @@ function VoiceSettingsPane({
           )}
 
           {activeTab === "configuration" && (
-            <section className="voice-settings-section">
-              <h3>Realtime voice</h3>
-              <div className="voice-settings-card">
+            <>
+              <section className="voice-settings-section">
+                <h3>Realtime voice</h3>
+                <div className="voice-settings-card">
                 <label className="voice-settings-field">
                   Model
                   <span className="voice-settings-select-wrap">
@@ -1845,8 +2036,122 @@ function VoiceSettingsPane({
                     <DownIcon />
                   </span>
                 </label>
-              </div>
-            </section>
+                </div>
+              </section>
+
+              <section className="voice-settings-section">
+                <h3>Phone mode</h3>
+                <div className="voice-settings-card">
+                  <div className="voice-settings-row">
+                    <span>
+                      <strong>{state.phone.settings.enabled ? "Enabled" : "Disabled"}</strong>
+                      <small>
+                        {state.phone.listener.running
+                          ? state.phone.listener.url ?? "Phone listener running"
+                          : state.phone.listener.error ?? "Phone listener is not running"}
+                      </small>
+                    </span>
+                    <button
+                      type="button"
+                      className="voice-settings-mini-button"
+                      onClick={() => void togglePhoneMode(!state.phone.settings.enabled)}
+                    >
+                      {state.phone.settings.enabled ? "Turn off" : "Turn on"}
+                    </button>
+                  </div>
+                  <label className="voice-settings-field">
+                    Public URL
+                    <input
+                      defaultValue={state.phone.settings.publicUrl ?? ""}
+                      placeholder="https://example.ngrok-free.app"
+                      onBlur={(event) => void updatePhonePublicUrl(event.currentTarget.value)}
+                    />
+                  </label>
+                  <div className="voice-settings-split">
+                    <label className="voice-settings-field">
+                      Local port
+                      <input
+                        type="number"
+                        min={1}
+                        max={65535}
+                        defaultValue={state.phone.settings.localPort || ""}
+                        onBlur={(event) => void updatePhonePort(event.currentTarget.value)}
+                      />
+                    </label>
+                    <label className="voice-settings-field">
+                      Webhook path
+                      <input
+                        defaultValue={state.phone.settings.webhookPath}
+                        onBlur={(event) => void updatePhoneWebhookPath(event.currentTarget.value)}
+                      />
+                    </label>
+                  </div>
+                  <label className="voice-settings-field">
+                    Allowed callers
+                    <textarea
+                      defaultValue={state.phone.settings.allowedCallerNumbers.join("\n")}
+                      placeholder="+15551234567"
+                      onBlur={(event) => void updatePhoneAllowlist(event.currentTarget.value)}
+                    />
+                  </label>
+                  <label className="voice-settings-field">
+                    Webhook secret
+                    <input
+                      type="password"
+                      value={phoneWebhookSecret}
+                      placeholder={state.phone.settings.webhookSecretConfigured ? "Secret configured" : "whsec_..."}
+                      autoComplete="off"
+                      spellCheck={false}
+                      onChange={(event) => setPhoneWebhookSecret(event.target.value)}
+                    />
+                  </label>
+                  <div className="voice-settings-actions inline">
+                    <button
+                      type="button"
+                      onClick={() => void clearPhoneWebhookSecret()}
+                      disabled={!state.phone.settings.webhookSecretConfigured && !phoneWebhookSecret.trim()}
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void savePhoneWebhookSecret()}
+                      disabled={!phoneWebhookSecret.trim()}
+                    >
+                      Save
+                    </button>
+                  </div>
+                  <label className="voice-settings-checkrow">
+                    <input
+                      type="checkbox"
+                      checked={state.phone.settings.allowUnsignedDevWebhooks}
+                      onChange={(event) =>
+                        void onAction(() =>
+                          window.codexVoice.setPhoneSettings({
+                            allowUnsignedDevWebhooks: event.currentTarget.checked,
+                          }),
+                        )
+                      }
+                    />
+                    <span>Allow unsigned local webhooks</span>
+                  </label>
+                  {state.phone.activeCall && (
+                    <button
+                      type="button"
+                      className="voice-settings-action"
+                      onClick={() => void onAction(() => window.codexVoice.hangupPhoneCall())}
+                    >
+                      <PowerIcon />
+                      <span>
+                        <strong>Hang up</strong>
+                        <small>{state.phone.activeCall.from ?? state.phone.activeCall.callId}</small>
+                      </span>
+                    </button>
+                  )}
+                </div>
+              </section>
+            </>
           )}
 
           {activeTab === "archive" && (
@@ -2630,6 +2935,16 @@ type ChatSummary = {
   detail: string;
   tone: "active" | "waiting" | "idle";
   active: boolean;
+  subagents: ChatSubagentSummary[];
+};
+
+type ChatSubagentSummary = {
+  id: string;
+  parentTitle: string;
+  title: string;
+  threadId: string;
+  detail: string;
+  tone: "active" | "waiting" | "idle";
 };
 
 function ProjectChatsPanel({
@@ -2637,13 +2952,21 @@ function ProjectChatsPanel({
   onNewChat,
   onSwitchChat,
   onSelectChat,
+  selectedSubagentId,
+  onSelectSubagent,
+  onInspectSubagent,
   onOpenChatMenu,
+  onAction,
 }: {
   chats: ChatSummary[];
   onNewChat: () => void;
   onSwitchChat: () => void;
   onSelectChat: (chatId: string) => Promise<void>;
+  selectedSubagentId: string | null;
+  onSelectSubagent: (subagentId: string) => void;
+  onInspectSubagent: (subagent: ChatSubagentSummary) => void;
   onOpenChatMenu: (event: React.MouseEvent<HTMLElement>, chat: ChatSummary) => void;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
 }): React.ReactElement {
   const activeChat = chats.find((chat) => chat.active) ?? null;
   return (
@@ -2661,23 +2984,34 @@ function ProjectChatsPanel({
       </div>
       <div className="project-chat-list">
         {chats.map((chat) => (
-          <button
-            key={chat.id}
-            className={`project-chat-row ${chat.active ? "active" : ""}`}
-            onClick={() => void onSelectChat(chat.id)}
-            onContextMenu={(event) => onOpenChatMenu(event, chat)}
-          >
-            <span className={`chat-status-dot ${chat.tone}`} />
-            <span className="project-chat-copy">
-              <strong>{chat.title}</strong>
-              <small>{chat.detail}</small>
-            </span>
-            {chat.active && (
-              <span className="project-chat-trailing">
-                <span className="active-chat-pill">Active</span>
+          <React.Fragment key={chat.id}>
+            <button
+              className={`project-chat-row ${chat.active ? "active" : ""}`}
+              onClick={() => void onSelectChat(chat.id)}
+              onContextMenu={(event) => onOpenChatMenu(event, chat)}
+            >
+              <span className={`chat-status-dot ${chat.tone}`} />
+              <span className="project-chat-copy">
+                <strong>{chat.title}</strong>
+                <small>{chat.detail}</small>
               </span>
-            )}
-          </button>
+              {chat.active && (
+                <span className="project-chat-trailing">
+                  <span className="active-chat-pill">Active</span>
+                </span>
+              )}
+            </button>
+            {chat.active && chat.subagents.map((subagent) => (
+              <SubagentRow
+                key={subagent.id}
+                subagent={subagent}
+                selected={subagent.id === selectedSubagentId}
+                onSelect={() => onSelectSubagent(subagent.id)}
+                onInspect={() => onInspectSubagent(subagent)}
+                onAction={onAction}
+              />
+            ))}
+          </React.Fragment>
         ))}
       </div>
       <div className="voice-actions chat-actions">
@@ -2690,6 +3024,61 @@ function ProjectChatsPanel({
           <span>Switch chat</span>
         </button>
       </div>
+    </div>
+  );
+}
+
+function SubagentRow({
+  subagent,
+  selected,
+  onSelect,
+  onInspect,
+  onAction,
+}: {
+  subagent: ChatSubagentSummary;
+  selected: boolean;
+  onSelect: () => void;
+  onInspect: () => void;
+  onAction: (action: () => Promise<unknown>) => Promise<void>;
+}): React.ReactElement {
+  const [steerText, setSteerText] = useState("");
+  const canSteer = Boolean(steerText.trim());
+  return (
+    <div className={`project-subagent-row ${selected ? "selected" : ""}`}>
+      <button type="button" className="project-subagent-main" onClick={onSelect}>
+        <span className={`chat-status-dot ${subagent.tone}`} />
+        <span className="project-chat-copy">
+          <strong>{subagent.title}</strong>
+          <small>{subagent.detail}</small>
+        </span>
+      </button>
+      {selected && (
+        <div className="project-subagent-actions">
+          <button type="button" onClick={onInspect}>
+            Inspect
+          </button>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              const text = steerText.trim();
+              if (!text) return;
+              void onAction(async () => {
+                await window.codexVoice.steerCodexThread(subagent.threadId, text);
+                setSteerText("");
+              });
+            }}
+          >
+            <input
+              value={steerText}
+              onChange={(event) => setSteerText(event.target.value)}
+              placeholder="Steer child thread"
+            />
+            <button type="submit" disabled={!canSteer}>
+              Steer
+            </button>
+          </form>
+        </div>
+      )}
     </div>
   );
 }
@@ -3103,8 +3492,79 @@ function chatSummariesForProject(project: VoiceProject | null, state: AppState):
       detail: runtime?.status ?? chat.lastStatus ?? "Idle",
       tone: waiting ? "waiting" : working ? "active" : "idle",
       active: chat.id === state.runtime.activeChatId,
+      subagents: subagentsForChat(chat),
     };
   });
+}
+
+function subagentsForChat(chat: VoiceChat): ChatSubagentSummary[] {
+  const summaries = new Map<string, ChatSubagentSummary>();
+
+  for (const subagent of chat.subagents ?? []) {
+    summaries.set(subagent.threadId, {
+      id: subagent.id,
+      parentTitle: chat.displayName,
+      title: subagent.displayName,
+      threadId: subagent.threadId,
+      detail: subagent.status ?? "Child thread",
+      tone: subagentTone(subagent.status),
+    });
+  }
+
+  for (const item of chat.lastTurnOutput?.items ?? []) {
+    const record = recordFromUnknown(item);
+    if (!record || !isSubagentItem(record)) continue;
+    const threadId =
+      stringFromUnknown(record.newThreadId) ??
+      stringFromUnknown(record.receiverThreadId) ??
+      stringFromUnknown(record.threadId);
+    if (!threadId || summaries.has(threadId)) continue;
+    const status = stringFromUnknown(record.agentStatus) ?? stringFromUnknown(record.status);
+    summaries.set(threadId, {
+      id: stringFromUnknown(record.id) ?? `subagent:${threadId}`,
+      parentTitle: chat.displayName,
+      title: stringFromUnknown(record.name) ?? stringFromUnknown(record.agentName) ?? "Subagent",
+      threadId,
+      detail: status ?? stringFromUnknown(record.prompt) ?? "Child thread",
+      tone: subagentTone(status),
+    });
+  }
+
+  return [...summaries.values()];
+}
+
+function isSubagentItem(record: Record<string, unknown>): boolean {
+  const type = stringFromUnknown(record.type)
+    ?.replace(/([a-z])([A-Z])/g, "$1-$2")
+    .replace(/_/g, "-")
+    .toLowerCase();
+  return [
+    "collab-agent-tool-call",
+    "collab-tool-call",
+    "multi-agent-action",
+    "remote-task-created",
+    "worked-for",
+    "sub-agent",
+  ].includes(type ?? "");
+}
+
+function subagentTone(status: string | null): ChatSubagentSummary["tone"] {
+  const normalized = status?.toLowerCase() ?? "";
+  if (normalized.includes("waiting") || normalized.includes("pending")) return "waiting";
+  if (normalized.includes("active") || normalized.includes("running") || normalized.includes("working")) return "active";
+  return "idle";
+}
+
+function selectedSubagentForSummaries(
+  chats: ChatSummary[],
+  selectedSubagentId: string | null,
+): ChatSubagentSummary | null {
+  if (!selectedSubagentId) return null;
+  for (const chat of chats) {
+    const subagent = chat.subagents.find((candidate) => candidate.id === selectedSubagentId);
+    if (subagent) return subagent;
+  }
+  return null;
 }
 
 function archivedChatsForProjects(projects: VoiceProject[]): ArchivedChat[] {

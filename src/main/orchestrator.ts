@@ -14,6 +14,7 @@ import type {
   CodexChatRuntime,
   CodexModelSummary,
   CodexPermissionMode,
+  CodexTodoItem,
   VoiceChat,
   CodexSettings,
   CodexSettingsScope,
@@ -22,10 +23,12 @@ import type {
   CodexThreadTokenUsage,
   CodexTurnOutput,
   CodexRuntimeState,
+  McpOkGrant,
   PendingRequestDetail,
   PendingRequestQuestion,
   PendingRequestQuestionOption,
   PendingCodexRequest,
+  PhoneStatus,
   QueuedCodexRequestResult,
   RealtimeReasoningEffort,
   ReasoningEffort,
@@ -50,6 +53,8 @@ import { transcriptMessageFromEvent } from "../shared/transcriptMessages";
 import { CodexBridge, type CodexJsonMessage } from "./codexBridge";
 import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
 import { ProjectStore } from "./projectStore";
+import { McpOkGrantStore } from "./mcpOkGrants";
+import { defaultPhoneStatus as createDefaultPhoneStatus } from "./phone";
 
 type TurnWaiter = {
   text: string;
@@ -66,7 +71,7 @@ type ThreadReadResponse = {
   };
 };
 
-type CodexThreadTurn = {
+export type CodexThreadTurn = {
   id?: string;
   status?: string;
   items?: CodexThreadItem[];
@@ -77,7 +82,7 @@ type CodexThreadTurn = {
   [key: string]: unknown;
 };
 
-type CodexThreadItem = {
+export type CodexThreadItem = {
   type?: string;
   text?: string;
   phase?: string | null;
@@ -147,16 +152,19 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private threadByTurn = new Map<string, string>();
   private tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
   private threadStatusByThread = new Map<string, string>();
+  private todosByThread = new Map<string, CodexTodoItem[]>();
   private queuedRequestsByThread = new Map<string, QueuedCodexRequest[]>();
   private drainingQueuedThreads = new Set<string>();
+  private readonly mcpOkGrants = new McpOkGrantStore();
 
   constructor(
     private readonly store: ProjectStore,
     private readonly codex: CodexBridge,
+    private readonly phoneStatus: () => PhoneStatus = createDefaultPhoneStatus,
   ) {
     super();
     this.codex.on("notification", (message) => this.handleNotification(message as CodexJsonMessage));
-    this.codex.on("serverRequest", (message) => this.handleServerRequest(message as CodexJsonMessage));
+    this.codex.on("serverRequest", (message) => void this.handleServerRequest(message as CodexJsonMessage));
     this.codex.on("stderr", (text) => this.emitEvent("codex", "stderr", text));
     this.codex.on("exit", (info) => {
       this.status = "Codex app-server exited.";
@@ -167,6 +175,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
   async initialize(): Promise<void> {
     await this.store.ensureReady();
+    await this.mcpOkGrants.ensureReady();
     await this.codex.start();
     await this.refreshModels();
     this.status = "Ready.";
@@ -196,7 +205,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       activeProject,
       runtime: this.runtimeState(activeProject, projects),
       codexSettings: this.codexSettings(activeProject),
+      mcpOkGrants: await this.mcpOkGrants.list(),
       realtime: realtimeConfig(),
+      phone: this.phoneStatus(),
     };
   }
 
@@ -382,7 +393,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     const turnSettings = this.resolveTurnSettings(project, chat);
     const cwd = projectWorkspacePath(project);
-    const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(chat.codexThreadId);
+    const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(project.id, chat);
+    const voiceBridgePromptInjectedAt =
+      chat.voiceBridgePromptInjectedAt ?? (bridgeAlreadyInjected ? new Date().toISOString() : null);
     const result = (await this.codex.request("turn/start", {
       threadId: chat.codexThreadId,
       cwd,
@@ -416,6 +429,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.status = `${chat.displayName}: Codex is working.`;
     const updated = await this.store.updateChat(project.id, chat.id, {
       lastStatus: "Codex is working.",
+      voiceBridgePromptInjectedAt: voiceBridgePromptInjectedAt ?? new Date().toISOString(),
     });
     this.emitEvent("app", "turnStarted", `Sent request to "${chat.displayName}".`, { turnId, chatId: chat.id, text: trimmed });
     this.emitState();
@@ -453,6 +467,26 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     await this.store.updateChat(project.id, chat.id, { lastStatus: "Steered active turn." });
     this.status = `Steered "${chat.displayName}".`;
     this.emitEvent("app", "turnSteered", `Steered "${chat.displayName}".`, { text, chatId: chat.id });
+    this.emitState();
+    return { turnId };
+  }
+
+  async steerCodexThread(threadId: string, text: string): Promise<{ turnId: string }> {
+    const turnId = this.activeTurnByThread.get(threadId) ?? null;
+    if (!turnId) throw new Error("There is no active Codex turn to steer.");
+    await this.codex.request("turn/steer", {
+      threadId,
+      expectedTurnId: turnId,
+      input: [
+        {
+          type: "text",
+          text: text.trim(),
+          text_elements: [],
+        },
+      ],
+    });
+    this.status = "Steered child thread.";
+    this.emitEvent("app", "turnSteered", "Steered child thread.", { text, threadId });
     this.emitState();
     return { turnId };
   }
@@ -678,6 +712,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const request = this.pendingRequests.get(String(requestId));
     if (!request) throw new Error(`Unknown pending request: ${requestId}`);
 
+    if (request.method === "item/tool/call" && isAcceptDecision(decision)) {
+      await this.saveMcpOkGrantForRequest(request);
+    }
     const response = await this.responseForDecision(request, decision);
     if (response.kind === "error") {
       this.codex.rejectRequest(requestId, response.message);
@@ -694,6 +731,18 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       decision,
     });
     this.emitState();
+  }
+
+  async listMcpOkGrants(): Promise<McpOkGrant[]> {
+    return this.mcpOkGrants.list();
+  }
+
+  async revokeMcpOkGrant(server: string, tool: string): Promise<McpOkGrant[]> {
+    const grants = await this.mcpOkGrants.revoke(server, tool);
+    const message = `Revoked MCP OK grant for ${server}.${tool}.`;
+    this.emitEvent("app", "mcpOkGrantRevoked", message, { server, tool });
+    this.emitState();
+    return grants;
   }
 
   private async responseForDecision(
@@ -885,6 +934,31 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         includeTurns: true,
       })) as ThreadReadResponse;
       return activeThreadSummaryFromRead(project, chat, response);
+    } catch (error) {
+      return emptyActiveThreadSummary({
+        status: "error",
+        project,
+        chat,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async getThreadSummary(threadId: string): Promise<ActiveThreadSummary> {
+    const context = await this.findChatByThread(threadId);
+    const project = context?.project ?? null;
+    const chat = context?.chat ?? null;
+    try {
+      const response = (await this.codex.request("thread/read", {
+        threadId,
+        includeTurns: true,
+      })) as ThreadReadResponse;
+      if (project && chat) return activeThreadSummaryFromRead(project, chat, response);
+      return activeThreadSummaryFromRead(
+        emptyProjectForThread(threadId),
+        emptyChatForThread(threadId),
+        response,
+      );
     } catch (error) {
       return emptyActiveThreadSummary({
         status: "error",
@@ -1110,12 +1184,21 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return { project, chat };
   }
 
-  private async threadHasVoiceBridgePrompt(threadId: string): Promise<boolean> {
+  private async threadHasVoiceBridgePrompt(projectId: string, chat: VoiceChat): Promise<boolean> {
+    if (chat.voiceBridgePromptInjectedAt) return true;
+    if (!chat.codexThreadId) return false;
+
     const response = (await this.codex.request("thread/read", {
-      threadId,
+      threadId: chat.codexThreadId,
       includeTurns: true,
     })) as ThreadReadResponse;
-    return threadTurnsHaveVoiceBridgePrompt(response.thread?.turns);
+    const hasLegacyPrompt = threadTurnsHaveVoiceBridgePrompt(response.thread?.turns);
+    if (hasLegacyPrompt) {
+      await this.store.updateChat(projectId, chat.id, {
+        voiceBridgePromptInjectedAt: new Date().toISOString(),
+      });
+    }
+    return hasLegacyPrompt;
   }
 
   private async resumeChatThread(project: VoiceProject, chat: VoiceChat): Promise<ChatContext> {
@@ -1155,6 +1238,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     const updatedProject = await this.store.updateChat(project.id, chat.id, {
       codexThreadId,
+      voiceBridgePromptInjectedAt: null,
       lastStatus: "Started a fresh Codex thread.",
     });
     const updatedChat = updatedProject.chats.find((candidate) => candidate.id === chat.id);
@@ -1197,9 +1281,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     }
   }
 
-  private handleServerRequest(message: CodexJsonMessage): void {
+  private async handleServerRequest(message: CodexJsonMessage): Promise<void> {
     if (message.id === undefined || !message.method) return;
     const pending = describeServerRequest(message);
+    if (await this.tryAutoApproveMcpToolCall(pending)) return;
     this.pendingRequests.set(String(message.id), pending);
     this.status = pending.title;
     this.emitEvent("codex", "serverRequest", pending.title, pending);
@@ -1207,6 +1292,39 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       this.updateChatForThread(pending.threadId, { lastStatus: pending.title });
     }
     this.emitState();
+  }
+
+  private async tryAutoApproveMcpToolCall(request: PendingCodexRequest): Promise<boolean> {
+    if (request.method !== "item/tool/call") return false;
+    const grant = mcpToolGrantFromRequest(request);
+    if (!grant) return false;
+    if (!(await this.mcpOkGrants.has(grant.server, grant.tool))) return false;
+
+    const response = await this.responseForDynamicToolCall(request, "accept");
+    if (response.kind === "error") {
+      this.codex.rejectRequest(request.requestId, response.message);
+    } else {
+      this.codex.respond(request.requestId, response.result);
+    }
+
+    const message = `Auto-approved MCP tool ${grant.server}.${grant.tool}.`;
+    this.emitEvent("app", "mcpToolAutoApproved", message, {
+      requestId: request.requestId,
+      threadId: request.threadId,
+      ...grant,
+    });
+    if (request.threadId) {
+      this.updateChatForThread(request.threadId, { lastStatus: message });
+    }
+    this.emitState();
+    return true;
+  }
+
+  private async saveMcpOkGrantForRequest(request: PendingCodexRequest): Promise<void> {
+    const grant = mcpToolGrantFromRequest(request);
+    if (!grant) return;
+    const saved = await this.mcpOkGrants.save(grant.server, grant.tool);
+    this.emitEvent("app", "mcpOkGrantSaved", `Saved MCP OK grant for ${saved.server}.${saved.tool}.`, saved);
   }
 
   private handleNotification(message: CodexJsonMessage): void {
@@ -1253,6 +1371,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       if (usageParams.threadId && usageParams.tokenUsage) {
         this.tokenUsageByThread.set(usageParams.threadId, usageParams.tokenUsage);
       }
+    }
+
+    if (method === "turn/plan/updated" && threadId) {
+      this.todosByThread.set(threadId, todoItemsFromPlanNotification(params));
     }
 
     if (method === "item/agentMessage/delta") {
@@ -1526,6 +1648,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
         chatId: chat.id,
         threadId,
         displayName: chat.displayName,
+        todos: threadId ? this.todosByThread.get(threadId) ?? [] : [],
         activeTurnId,
         status: pendingRequests[0]?.title ?? (activeTurnId ? "Codex is working." : chat.lastStatus ?? "Idle"),
         threadStatus: threadId ? this.threadStatusByThread.get(threadId) ?? null : null,
@@ -2215,7 +2338,7 @@ function summarizeThreadItem(item: CodexThreadItem, turnId: string, itemIndex: n
   };
 }
 
-function progressItemsFromThread(
+export function progressItemsFromThread(
   turns: CodexThreadTurn[],
   rawItems: CodexThreadItem[],
 ): ThreadProgressItem[] {
@@ -2225,7 +2348,7 @@ function progressItemsFromThread(
     const status = normalizeProgressStatus(item.status ?? item.phase);
     if (type === "todo-list") {
       const tasks = taskRecords(item);
-      const completed = tasks.filter((task) => normalizeProgressStatus(task.status) === "completed").length;
+      const completed = tasks.filter((task) => todoTaskCompleted(task)).length;
       progress.push({
         id: itemId(item, `progress-${index}`),
         label: "To do list",
@@ -2629,7 +2752,7 @@ function rawThreadItemType(item: CodexThreadItem): string {
   return String(item.type ?? "unknown");
 }
 
-function normalizeThreadItemType(itemOrType: CodexThreadItem | string | null | undefined): string {
+export function normalizeThreadItemType(itemOrType: CodexThreadItem | string | null | undefined): string {
   const raw = typeof itemOrType === "string" ? itemOrType : itemOrType?.type;
   if (!raw) return "unknown";
   const normalized = raw
@@ -2773,6 +2896,11 @@ function taskRecords(item: CodexThreadItem): Array<Record<string, unknown>> {
     }
   }
   return [];
+}
+
+function todoTaskCompleted(task: Record<string, unknown>): boolean {
+  if (typeof task.completed === "boolean") return task.completed;
+  return normalizeProgressStatus(task.status) === "completed";
 }
 
 function reasoningSummary(item: CodexThreadItem): string | null {
@@ -3483,6 +3611,20 @@ function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+export function mcpToolGrantFromRequest(request: PendingCodexRequest): Pick<McpOkGrant, "server" | "tool"> | null {
+  if (request.method !== "item/tool/call") return null;
+  const raw = request.raw as {
+    params?: {
+      namespace?: unknown;
+      tool?: unknown;
+    };
+  };
+  const server = stringField(raw.params?.namespace)?.trim();
+  const tool = stringField(raw.params?.tool)?.trim();
+  if (!server || !tool) return null;
+  return { server, tool };
+}
+
 function activeChatForProject(project: VoiceProject): VoiceChat | null {
   const chats = project.chats.filter((chat) => !chat.archivedAt);
   return (
@@ -3940,12 +4082,94 @@ function samePath(left: string, right: string): boolean {
   return path.resolve(left) === path.resolve(right);
 }
 
-function codexVoiceTurnText(userText: string, bridgeAlreadyInjected: boolean): string {
+export function todoItemsFromPlanNotification(params: Record<string, unknown> | undefined): CodexTodoItem[] {
+  const rawPlan = params?.plan;
+  const plan = recordFromUnknown(rawPlan) ?? params ?? {};
+  const items = Array.isArray(rawPlan)
+    ? rawPlan
+    : arrayField(plan, "items") ?? arrayField(plan, "steps") ?? arrayField(plan, "todos") ?? [];
+  return items
+    .map((item, index): CodexTodoItem | null => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const record = item as Record<string, unknown>;
+      const text =
+        firstStringField(record, ["step", "text", "title", "label", "description"]) ?? `Todo ${index + 1}`;
+      return {
+        id: firstStringField(record, ["id", "todoId", "stepId"]) ?? `todo-${index + 1}`,
+        text,
+        status: todoStatusFromUnknown(record.status),
+        raw: item,
+      };
+    })
+    .filter((item): item is CodexTodoItem => item !== null);
+}
+
+function todoStatusFromUnknown(value: unknown): CodexTodoItem["status"] {
+  const normalized = typeof value === "string" ? value.toLowerCase().replace(/[- ]/g, "_") : "";
+  if (normalized === "completed" || normalized === "complete" || normalized === "done") return "completed";
+  if (normalized === "in_progress" || normalized === "inprogress" || normalized === "active" || normalized === "running") {
+    return "in_progress";
+  }
+  return "pending";
+}
+
+function arrayField(record: Record<string, unknown>, field: string): unknown[] | null {
+  const value = record[field];
+  return Array.isArray(value) ? value : null;
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function emptyProjectForThread(threadId: string): VoiceProject {
+  const now = new Date().toISOString();
+  return {
+    id: `thread:${threadId}`,
+    displayName: "Child thread",
+    folderPath: "",
+    workspacePath: "",
+    activeChatId: `thread:${threadId}`,
+    chats: [emptyChatForThread(threadId)],
+    codexThreadId: threadId,
+    model: null,
+    reasoningEffort: null,
+    serviceTier: null,
+    permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+    createdAt: now,
+    updatedAt: now,
+    archivedAt: null,
+    lastSummary: null,
+    lastStatus: null,
+  };
+}
+
+function emptyChatForThread(threadId: string): VoiceChat {
+  const now = new Date().toISOString();
+  return {
+    id: `thread:${threadId}`,
+    displayName: "Child thread",
+    codexThreadId: threadId,
+    voiceBridgePromptInjectedAt: null,
+    model: null,
+    reasoningEffort: null,
+    serviceTier: null,
+    permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+    createdAt: now,
+    updatedAt: now,
+    archivedAt: null,
+    lastSummary: null,
+    lastStatus: null,
+    lastTurnOutput: null,
+  };
+}
+
+export function codexVoiceTurnText(userText: string, bridgeAlreadyInjected: boolean): string {
   const voiceRequest = `${CODEX_VOICE_MARKER}${userText}`;
   return bridgeAlreadyInjected ? voiceRequest : `${CODEX_VOICE_BRIDGE_PROMPT}\n\n${voiceRequest}`;
 }
 
-function threadTurnsHaveVoiceBridgePrompt(turns: CodexThreadTurn[] | undefined): boolean {
+export function threadTurnsHaveVoiceBridgePrompt(turns: CodexThreadTurn[] | undefined): boolean {
   return (turns ?? []).some((turn) => {
     const userText = userTextFromTurn(turn);
     return userText ? CODEX_VOICE_BRIDGE_PROMPT_PATTERN.test(userText) : false;
