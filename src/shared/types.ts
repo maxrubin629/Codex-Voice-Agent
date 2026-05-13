@@ -98,6 +98,13 @@ export type CodexPermissionProfile = {
   sandbox: CodexSandboxMode | null;
 };
 
+export type McpOkGrant = {
+  server: string;
+  tool: string;
+  grantedAt: string;
+  updatedAt: string;
+};
+
 export const DEFAULT_CODEX_MODEL = "gpt-5.5";
 export const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = "medium";
 export const DEFAULT_CODEX_SERVICE_TIER: CodexServiceTier | null = null;
