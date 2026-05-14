@@ -6,4 +6,8 @@ dist/
 .env
 .env.*
 !.env.example
-.codex/
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/realtime-project-orientation/
+!.codex/skills/realtime-project-orientation/**
