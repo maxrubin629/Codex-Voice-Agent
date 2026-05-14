@@ -2002,8 +2002,13 @@ code {
   padding: 0 11px;
 }
 
-.voice-permission-trigger.full-access,
 .voice-permission-trigger.auto-review {
+  border-color: rgba(168, 218, 255, 0.34);
+  background: rgba(168, 218, 255, 0.1);
+  color: #a8daff;
+}
+
+.voice-permission-trigger.full-access {
   color: #ff8649;
 }
 
@@ -2070,6 +2075,15 @@ code {
 .voice-permission-menu button:hover,
 .voice-permission-menu button.selected {
   background: rgba(255, 255, 255, 0.08);
+}
+
+.voice-permission-menu button.auto-review {
+  color: #a8daff;
+}
+
+.voice-permission-menu button.auto-review:hover,
+.voice-permission-menu button.auto-review.selected {
+  background: rgba(168, 218, 255, 0.12);
 }
 
 .voice-permission-menu button span {

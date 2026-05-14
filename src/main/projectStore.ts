@@ -14,6 +14,7 @@ import {
   type ReasoningEffort,
   type VoiceChat,
   type VoiceProject,
+  type VoiceSubagentThread,
   type VoiceTranscriptMessage,
   type VoiceTranscriptMessageRole,
   type VoiceTranscriptMessageSource,
@@ -30,8 +31,9 @@ type ListProjectsOptions = {
 };
 
 const INDEX_FILE = ".codex-voice-projects.json";
-const PROJECT_FILE = ".codex-voice-project.json";
-const TRANSCRIPT_FOLDER = ".codex-voice-transcripts";
+const AGENT_FOLDER = ".codex-voice-agent";
+const PROJECT_FILE = "project.json";
+const TRANSCRIPT_FOLDER = "transcripts";
 const MAX_TRANSCRIPT_MESSAGES = 5_000;
 
 export class ProjectStore {
@@ -126,7 +128,9 @@ export class ProjectStore {
         nextProject,
         ...index.projects.filter((existing) => existing.id !== project.id),
       ];
-      await this.writeJsonAtomic(path.join(project.folderPath, PROJECT_FILE), nextProject);
+      const projectPath = this.projectPath(project.folderPath);
+      await mkdir(path.dirname(projectPath), { recursive: true });
+      await this.writeJsonAtomic(projectPath, nextProject);
       await this.writeIndex({ version: 1, projects: nextProjects });
       return nextProject;
     });
@@ -407,7 +411,7 @@ export class ProjectStore {
     const projects: VoiceProject[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      const projectPath = path.join(this.baseFolder, entry.name, PROJECT_FILE);
+      const projectPath = this.projectPath(path.join(this.baseFolder, entry.name));
       if (!existsSync(projectPath)) continue;
       try {
         const project = normalizeProject(JSON.parse(await readFile(projectPath, "utf8")));
@@ -438,8 +442,12 @@ export class ProjectStore {
     }
   }
 
+  private projectPath(projectFolderPath: string): string {
+    return path.join(projectFolderPath, AGENT_FOLDER, PROJECT_FILE);
+  }
+
   private transcriptPath(project: VoiceProject, chatId: string): string {
-    return path.join(project.folderPath, TRANSCRIPT_FOLDER, `${safeTranscriptFileName(chatId)}.jsonl`);
+    return path.join(project.folderPath, AGENT_FOLDER, TRANSCRIPT_FOLDER, `${safeTranscriptFileName(chatId)}.jsonl`);
   }
 
   private async readTranscriptMessagesFile(filePath: string, chatId: string): Promise<VoiceTranscriptMessage[]> {
@@ -581,11 +589,17 @@ function normalizeChat(
     permissionMode?: CodexPermissionMode;
   };
   const hasStoredServiceTier = Object.prototype.hasOwnProperty.call(chat, "serviceTier");
+  const subagents = Array.isArray(chat.subagents)
+    ? chat.subagents
+        .map(normalizeSubagentThread)
+        .filter((subagent): subagent is VoiceSubagentThread => Boolean(subagent))
+    : undefined;
   return {
     id: String(chat.id ?? randomUUID()),
     displayName: String(chat.displayName ?? "New chat"),
     codexThreadId: stringOrNull(chat.codexThreadId),
     voiceBridgePromptInjectedAt: stringOrNull(chat.voiceBridgePromptInjectedAt),
+    ...(subagents ? { subagents } : {}),
     model: stringOrNull(chat.model) ?? fallbackModel,
     reasoningEffort: reasoningEffortOrNull(chat.reasoningEffort) ?? fallbackReasoningEffort,
     serviceTier: hasStoredServiceTier ? serviceTierOrNull(chat.serviceTier) : fallbackServiceTier,
@@ -596,6 +610,22 @@ function normalizeChat(
     lastSummary: chat.lastSummary ?? null,
     lastStatus: chat.lastStatus ?? null,
     lastTurnOutput: normalizeCodexTurnOutput(chat.lastTurnOutput),
+  };
+}
+
+function normalizeSubagentThread(value: unknown): VoiceSubagentThread | null {
+  const subagent = value as Partial<VoiceSubagentThread> & Record<string, unknown>;
+  const threadId = stringOrNull(subagent.threadId);
+  if (!threadId) return null;
+  const raw = subagent.raw;
+  return {
+    id: stringOrNull(subagent.id) ?? `subagent:${threadId}`,
+    displayName: stringOrNull(subagent.displayName) ?? "Subagent",
+    threadId,
+    status: stringOrNull(subagent.status),
+    ...(stringOrNull(subagent.createdAt) ? { createdAt: stringOrNull(subagent.createdAt) } : {}),
+    ...(stringOrNull(subagent.updatedAt) ? { updatedAt: stringOrNull(subagent.updatedAt) } : {}),
+    ...(raw !== undefined ? { raw } : {}),
   };
 }
 

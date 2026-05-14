@@ -271,6 +271,8 @@ function realtimeInstructions(): string {
     "- If the user asks for a computer task, call submit_to_codex with the user's request as faithfully as possible.",
     "- If the user explicitly asks Codex to use subagents, submit that natural request to Codex. Do not spawn, simulate, or infer subagent work from keywords.",
     "- If Codex is already working and the user corrects, narrows, or adds constraints to that same work, call steer_codex.",
+    "- If the user asks about visible child subagent work, use list_codex_subagents or inspect_codex_subagent. If the target is ambiguous, ask a short clarification.",
+    "- If the user asks to update, correct, or steer a visible child subagent, use steer_codex_subagent with a semantic target like its name, role, status, or ordinal. Do not invent or freehand raw thread ids.",
     "- If Codex is already working and the user asks for a separate follow-up task, call queue_codex_request so Codex starts it after the current turn finishes.",
     "- If the user cancels a queued follow-up, call cancel_queued_codex_request. Do not call interrupt_codex unless the user wants to stop the active Codex turn.",
     "- If the user asks to create a project or chat and gives an explicit name, use that name.",
@@ -440,6 +442,60 @@ export function realtimeTools(): unknown[] {
       parameters: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      type: "function",
+      name: "list_codex_subagents",
+      description:
+        "List visible child subagents for the selected or active Codex chat. Use before inspecting or steering child work when the user has not clearly identified one child.",
+      parameters: {
+        type: "object",
+        properties: {
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
+      name: "inspect_codex_subagent",
+      description:
+        "Inspect progress/status for one visible child subagent in the selected or active chat. Target by semantic label, role, status, ordinal, or omit target only when exactly one child is visible.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: {
+            type: "string",
+            description:
+              "Semantic target such as 'tests', 'the worker checking auth', 'first', or the displayed subagent name. Not an arbitrary thread id.",
+          },
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+        },
+      },
+    },
+    {
+      type: "function",
+      name: "steer_codex_subagent",
+      description:
+        "Send an update/correction to one visible child subagent in the selected or active chat. Use only for child subagent work; use steer_codex for the active parent turn.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: {
+            type: "string",
+            description:
+              "Semantic target such as 'tests', 'second', 'the UI worker', or the displayed subagent name. Leave empty only if exactly one child is visible.",
+          },
+          message: {
+            type: "string",
+            description: "The user's update for that child subagent, preserved faithfully.",
+          },
+          chatId: { type: "string" },
+          chatName: { type: "string" },
+        },
+        required: ["message"],
       },
     },
     {

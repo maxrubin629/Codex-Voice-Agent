@@ -394,6 +394,15 @@ function registerIpc(): void {
   registerIpcHandler("codex:interrupt", (_event, payload?: { chatId?: string }) =>
     requireOrchestrator().interruptCodex(payload?.chatId),
   );
+  registerIpcHandler("codex:listSubagents", (_event, payload?: { chatId?: string }) =>
+    requireOrchestrator().listSubagents(payload?.chatId),
+  );
+  registerIpcHandler("codex:inspectSubagent", (_event, payload?: { target?: string; chatId?: string }) =>
+    requireOrchestrator().inspectSubagent(payload?.target, payload?.chatId),
+  );
+  registerIpcHandler("codex:steerSubagent", (_event, payload: { target?: string; text: string; chatId?: string }) =>
+    requireOrchestrator().steerSubagent(payload.target, payload.text, payload.chatId),
+  );
   registerIpcHandler(
     "codex:setSettings",
     (

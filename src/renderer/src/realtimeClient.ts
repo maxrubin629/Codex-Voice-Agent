@@ -2,6 +2,7 @@ import type {
   AppEvent,
   ApprovalDecision,
   AppState,
+  ActiveThreadSummary,
   CodexPermissionMode,
   CodexSettingsScope,
   CodexTurnOutput,
@@ -856,6 +857,30 @@ async function callVoiceTool(
     };
   }
 
+  if (name === "list_codex_subagents") {
+    const result = await window.codexVoice.listSubagents(
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
+    );
+    return { ok: true, ...result };
+  }
+
+  if (name === "inspect_codex_subagent") {
+    const result = await window.codexVoice.inspectSubagent(
+      optionalString(args.target),
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
+    );
+    return { ok: true, ...summarizeSubagentInspection(result) };
+  }
+
+  if (name === "steer_codex_subagent") {
+    const result = await window.codexVoice.steerSubagent(
+      optionalString(args.target),
+      stringArg(args.message),
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
+    );
+    return { ok: true, message: "Child subagent received the update.", ...result };
+  }
+
   if (name === "answer_codex_approval") {
     const state = await window.codexVoice.getState();
     const request = findPendingRequest(
@@ -1015,6 +1040,25 @@ function safeJson(raw: string | undefined): Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function summarizeSubagentInspection(result: { subagent: unknown; summary: ActiveThreadSummary }): Record<string, unknown> {
+  const summary = result.summary;
+  return {
+    subagent: result.subagent,
+    summary: {
+      status: summary.status,
+      latestTurnStatus: summary.latestTurnStatus,
+      latestAssistantText: summary.latestAssistantText,
+      turnCount: summary.turnCount,
+      progress: summary.progress.slice(-8).map((item) => ({
+        label: item.label,
+        detail: item.detail,
+        status: item.status,
+        sourceType: item.sourceType,
+      })),
+    },
+  };
 }
 
 function stringArg(value: unknown): string {

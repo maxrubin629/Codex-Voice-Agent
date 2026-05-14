@@ -39,6 +39,11 @@ import type {
   ThreadSummaryTurn,
   ToolQuestionAnswer,
   VoiceProject,
+  VoiceSubagentThread,
+  VoiceSubagentInspectResult,
+  VoiceSubagentListResult,
+  VoiceSubagentSteerResult,
+  VoiceSubagentSummary,
   VoiceTranscriptMessage,
 } from "../shared/types";
 import {
@@ -889,6 +894,38 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return chatId ? runtimes.filter((runtime) => runtime.chatId === chatId) : runtimes;
   }
 
+  async listSubagents(chatId?: string): Promise<VoiceSubagentListResult> {
+    const { chat } = await this.requireChatContext(chatId);
+    return {
+      chatId: chat.id,
+      chatName: chat.displayName,
+      subagents: this.enrichSubagents(visibleSubagentsForChat(chat)),
+    };
+  }
+
+  async inspectSubagent(target?: string, chatId?: string): Promise<VoiceSubagentInspectResult> {
+    const { chat } = await this.requireChatContext(chatId);
+    const subagent = resolveVisibleSubagentTarget(this.enrichSubagents(visibleSubagentsForChat(chat)), target);
+    return {
+      subagent,
+      summary: await this.getThreadSummary(subagent.threadId),
+    };
+  }
+
+  async steerSubagent(
+    target: string | undefined,
+    text: string,
+    chatId?: string,
+  ): Promise<VoiceSubagentSteerResult> {
+    const { chat } = await this.requireChatContext(chatId);
+    const subagent = resolveVisibleSubagentTarget(this.enrichSubagents(visibleSubagentsForChat(chat)), target);
+    const result = await this.steerCodexThread(subagent.threadId, text);
+    return {
+      subagent,
+      turnId: result.turnId,
+    };
+  }
+
   async getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary> {
     let project: VoiceProject | null = null;
     let chat: VoiceChat | null = null;
@@ -1375,6 +1412,13 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     if (method === "turn/plan/updated" && threadId) {
       this.todosByThread.set(threadId, todoItemsFromPlanNotification(params));
+    }
+
+    if ((method === "item/started" || method === "item/completed") && threadId) {
+      const item = recordFromUnknown(params?.item);
+      if (item && normalizeThreadItemType(item as CodexThreadItem) === "sub-agent") {
+        void this.rememberSubagentFromItem(threadId, item);
+      }
     }
 
     if (method === "item/agentMessage/delta") {
@@ -2221,6 +2265,48 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return null;
   }
 
+  private async rememberSubagentFromItem(parentThreadId: string, item: Record<string, unknown>): Promise<void> {
+    const childThreadId =
+      firstStringField(item, ["newThreadId", "receiverThreadId", "threadId", "childThreadId"]) ?? null;
+    if (!childThreadId || childThreadId === parentThreadId) return;
+
+    const context = await this.findChatByThread(parentThreadId);
+    if (!context) return;
+
+    const now = new Date().toISOString();
+    const existing = context.chat.subagents ?? [];
+    const current = existing.find((subagent) => subagent.threadId === childThreadId) ?? null;
+    const status = firstStringField(item, ["agentStatus", "status", "phase"]);
+    const displayName =
+      firstStringField(item, ["name", "agentName", "displayName", "title", "label", "tool"]) ??
+      current?.displayName ??
+      "Subagent";
+    const nextSubagent: VoiceSubagentThread = {
+      id: current?.id ?? firstStringField(item, ["id", "itemId", "taskId"]) ?? `subagent:${childThreadId}`,
+      displayName,
+      threadId: childThreadId,
+      status: status ?? current?.status ?? null,
+      createdAt: current?.createdAt ?? now,
+      updatedAt: now,
+      raw: item,
+    };
+
+    const subagents = [
+      ...existing.filter((subagent) => subagent.threadId !== childThreadId),
+      nextSubagent,
+    ];
+    await this.store.updateChat(context.project.id, context.chat.id, { subagents });
+    this.emitState();
+  }
+
+  private enrichSubagents(subagents: VoiceSubagentSummary[]): VoiceSubagentSummary[] {
+    return subagents.map((subagent) => ({
+      ...subagent,
+      activeTurnId: this.activeTurnByThread.get(subagent.threadId) ?? null,
+      threadStatus: this.threadStatusByThread.get(subagent.threadId) ?? null,
+    }));
+  }
+
   private emitState(): void {
     void this.state().then((state) => this.emit("state", state));
   }
@@ -2417,6 +2503,136 @@ export function progressItemsFromThread(
   }
 
   return progress.slice(-18);
+}
+
+export function visibleSubagentsForChat(chat: VoiceChat): VoiceSubagentSummary[] {
+  const summaries = new Map<string, VoiceSubagentSummary>();
+
+  for (const subagent of chat.subagents ?? []) {
+    summaries.set(subagent.threadId, {
+      id: subagent.id,
+      parentChatId: chat.id,
+      parentChatName: chat.displayName,
+      title: subagent.displayName,
+      threadId: subagent.threadId,
+      detail: subagent.status ?? "Child thread",
+      status: subagent.status,
+      activeTurnId: null,
+      threadStatus: null,
+      source: "stored",
+    });
+  }
+
+  for (const item of chat.lastTurnOutput?.items ?? []) {
+    const record = recordFromUnknown(item);
+    if (!record || normalizeThreadItemType(record as CodexThreadItem) !== "sub-agent") continue;
+
+    const threadId =
+      firstStringField(record, ["newThreadId", "receiverThreadId", "threadId", "childThreadId"]) ?? null;
+    if (!threadId) continue;
+
+    const status = firstStringField(record, ["agentStatus", "status", "phase"]);
+    const prompt = firstStringField(record, ["prompt", "description", "detail", "summary"]);
+    const existing = summaries.get(threadId);
+    if (existing) {
+      summaries.set(threadId, {
+        ...existing,
+        detail: status ?? prompt ?? existing.detail,
+        status: status ?? existing.status,
+      });
+      continue;
+    }
+
+    summaries.set(threadId, {
+      id: firstStringField(record, ["id", "itemId", "taskId"]) ?? `subagent:${threadId}`,
+      parentChatId: chat.id,
+      parentChatName: chat.displayName,
+      title: firstStringField(record, ["name", "agentName", "displayName", "title", "label", "tool"]) ?? "Subagent",
+      threadId,
+      detail: status ?? prompt ?? "Child thread",
+      status,
+      activeTurnId: null,
+      threadStatus: null,
+      source: "turn-output",
+    });
+  }
+
+  return [...summaries.values()];
+}
+
+export function resolveVisibleSubagentTarget(
+  subagents: VoiceSubagentSummary[],
+  target?: string,
+): VoiceSubagentSummary {
+  const visible = subagents.filter((subagent) => subagent.threadId);
+  if (visible.length === 0) {
+    throw new Error("There are no visible child subagents for the selected chat.");
+  }
+
+  const rawTarget = target?.trim() ?? "";
+  if (!rawTarget) {
+    if (visible.length === 1) return visible[0];
+    throw new Error(`More than one child subagent is visible: ${subagentChoices(visible)}.`);
+  }
+
+  const ordinal = ordinalIndex(rawTarget);
+  if (ordinal !== null) {
+    const subagent = visible[ordinal];
+    if (subagent) return subagent;
+    throw new Error(`No visible child subagent matched "${rawTarget}". Available: ${subagentChoices(visible)}.`);
+  }
+
+  const needle = normalizeSubagentTarget(rawTarget);
+  const exact = visible.filter((subagent) =>
+    subagentTargetFields(subagent).some((field) => normalizeSubagentTarget(field) === needle),
+  );
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new Error(`More than one child subagent matched "${rawTarget}": ${subagentChoices(exact)}.`);
+  }
+
+  const partial = visible.filter((subagent) =>
+    subagentTargetFields(subagent).some((field) => normalizeSubagentTarget(field).includes(needle)),
+  );
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    throw new Error(`More than one child subagent matched "${rawTarget}": ${subagentChoices(partial)}.`);
+  }
+
+  throw new Error(`No visible child subagent matched "${rawTarget}". Available: ${subagentChoices(visible)}.`);
+}
+
+function subagentTargetFields(subagent: VoiceSubagentSummary): string[] {
+  return [
+    subagent.id,
+    subagent.title,
+    subagent.detail,
+    subagent.status,
+    subagent.threadStatus,
+    subagent.threadId,
+  ].filter((value): value is string => Boolean(value));
+}
+
+function subagentChoices(subagents: VoiceSubagentSummary[]): string {
+  return subagents
+    .map((subagent, index) => {
+      const status = subagent.status ?? subagent.threadStatus ?? subagent.detail;
+      return `${index + 1}. ${subagent.title}${status ? ` (${status})` : ""}`;
+    })
+    .join("; ");
+}
+
+function ordinalIndex(value: string): number | null {
+  const normalized = value.trim().toLowerCase();
+  if (/^\d+$/.test(normalized)) return Number(normalized) - 1;
+  if (["first", "1st", "one"].includes(normalized)) return 0;
+  if (["second", "2nd", "two"].includes(normalized)) return 1;
+  if (["third", "3rd", "three"].includes(normalized)) return 2;
+  return null;
+}
+
+function normalizeSubagentTarget(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
 function artifactCandidatesFromTurn(turn: CodexThreadTurn, index: number): ThreadArtifactCandidate[] {

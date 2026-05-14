@@ -51,6 +51,11 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:cancelQueued", { queuedId, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
+  listSubagents: (chatId?: string) => ipcRenderer.invoke("codex:listSubagents", { chatId }),
+  inspectSubagent: (target?: string, chatId?: string) =>
+    ipcRenderer.invoke("codex:inspectSubagent", { target, chatId }),
+  steerSubagent: (target: string | undefined, text: string, chatId?: string) =>
+    ipcRenderer.invoke("codex:steerSubagent", { target, text, chatId }),
   setCodexSettings: (
     settings: {
       model?: string | null;

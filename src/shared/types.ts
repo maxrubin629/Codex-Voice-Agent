@@ -102,7 +102,7 @@ export const DEFAULT_CODEX_MODEL = "gpt-5.5";
 export const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = "medium";
 export const DEFAULT_CODEX_SERVICE_TIER: CodexServiceTier | null = null;
 export const FAST_CODEX_SERVICE_TIER: CodexServiceTier = "priority";
-export const DEFAULT_CODEX_PERMISSION_MODE: CodexPermissionMode = "default";
+export const DEFAULT_CODEX_PERMISSION_MODE: CodexPermissionMode = "auto-review";
 
 export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
   {
@@ -205,6 +205,35 @@ export type VoiceSubagentThread = {
   createdAt?: string | null;
   updatedAt?: string | null;
   raw?: unknown;
+};
+
+export type VoiceSubagentSummary = {
+  id: string;
+  parentChatId: string;
+  parentChatName: string;
+  title: string;
+  threadId: string;
+  detail: string;
+  status: string | null;
+  activeTurnId: string | null;
+  threadStatus: string | null;
+  source: "stored" | "turn-output";
+};
+
+export type VoiceSubagentListResult = {
+  chatId: string;
+  chatName: string;
+  subagents: VoiceSubagentSummary[];
+};
+
+export type VoiceSubagentInspectResult = {
+  subagent: VoiceSubagentSummary;
+  summary: ActiveThreadSummary;
+};
+
+export type VoiceSubagentSteerResult = {
+  subagent: VoiceSubagentSummary;
+  turnId: string;
 };
 
 export type CodexTurnOutput = {
@@ -601,6 +630,9 @@ export type CodexVoiceApi = {
   ): Promise<CancelQueuedCodexRequestResult>;
   interruptCodex(chatId?: string): Promise<void>;
   getChatStatus(chatId?: string): Promise<CodexChatRuntime[]>;
+  listSubagents(chatId?: string): Promise<VoiceSubagentListResult>;
+  inspectSubagent(target?: string, chatId?: string): Promise<VoiceSubagentInspectResult>;
+  steerSubagent(target: string | undefined, text: string, chatId?: string): Promise<VoiceSubagentSteerResult>;
   setCodexSettings(
     settings: {
       model?: string | null;

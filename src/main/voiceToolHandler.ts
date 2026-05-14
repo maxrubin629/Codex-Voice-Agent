@@ -5,6 +5,7 @@ import type {
   CodexRuntimeState,
   CodexSettings,
   CodexSettingsScope,
+  ActiveThreadSummary,
   CodexActionResult,
   PendingCodexRequest,
   QueuedCodexRequestResult,
@@ -26,6 +27,9 @@ type VoiceToolApi = {
   ): Promise<QueuedCodexRequestResult>;
   cancelQueuedCodexRequest(queuedId?: string | null, chatId?: string): Promise<unknown>;
   interruptCodex(chatId?: string): Promise<void>;
+  listSubagents(chatId?: string): Promise<unknown>;
+  inspectSubagent(target?: string, chatId?: string): Promise<unknown>;
+  steerSubagent(target: string | undefined, text: string, chatId?: string): Promise<unknown>;
   answerApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
   answerToolQuestion(requestId: string | number, answers: ToolQuestionAnswer[]): Promise<void>;
   setCodexSettings(
@@ -107,6 +111,26 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
         runtime: state.runtime,
         codexSettings: state.codexSettings,
       };
+    }
+
+    if (name === "list_codex_subagents") {
+      const chatId = await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName), true);
+      const result = objectFromUnknown(await api.listSubagents(chatId));
+      return { ok: true, ...result };
+    }
+
+    if (name === "inspect_codex_subagent") {
+      const chatId = await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName), true);
+      const result = objectFromUnknown(await api.inspectSubagent(optionalString(args.target), chatId));
+      return { ok: true, ...summarizeSubagentInspection(result) };
+    }
+
+    if (name === "steer_codex_subagent") {
+      const chatId = await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName), true);
+      const result = objectFromUnknown(
+        await api.steerSubagent(optionalString(args.target), stringArg(args.message), chatId),
+      );
+      return { ok: true, message: "Child subagent received the update.", ...result };
     }
 
     if (name === "answer_codex_approval") {
@@ -262,6 +286,29 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
 
 function objectFromUnknown(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function summarizeSubagentInspection(result: Record<string, unknown>): Record<string, unknown> {
+  const summary = objectFromUnknown(result.summary);
+  return {
+    subagent: result.subagent,
+    summary: {
+      status: summary.status,
+      latestTurnStatus: summary.latestTurnStatus,
+      latestAssistantText: summary.latestAssistantText,
+      turnCount: summary.turnCount,
+      progress: progressForVoice(summary as Partial<ActiveThreadSummary>),
+    },
+  };
+}
+
+function progressForVoice(summary: Partial<ActiveThreadSummary>): unknown[] {
+  return (summary.progress ?? []).slice(-8).map((item) => ({
+    label: item.label,
+    detail: item.detail,
+    status: item.status,
+    sourceType: item.sourceType,
+  }));
 }
 
 function stringArg(value: unknown): string {
