@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type {
   AppEvent,
@@ -160,6 +160,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private todosByThread = new Map<string, CodexTodoItem[]>();
   private queuedRequestsByThread = new Map<string, QueuedCodexRequest[]>();
   private drainingQueuedThreads = new Set<string>();
+  private subagentLogSyncAtByThread = new Map<string, number>();
   private readonly mcpOkGrants = new McpOkGrantStore();
 
   constructor(
@@ -193,11 +194,15 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 
   async state(): Promise<AppState> {
-    const projects = await this.store.listProjects();
+    let projects = await this.store.listProjects();
     const archivedProjects = await this.store.listArchivedProjects();
     let activeProject = this.activeProjectId
       ? projects.find((project) => project.id === this.activeProjectId) ?? null
       : null;
+    if (activeProject && await this.syncProjectSubagentsFromSessionLogs(activeProject)) {
+      projects = await this.store.listProjects();
+      activeProject = projects.find((project) => project.id === this.activeProjectId) ?? null;
+    }
     if (this.activeProjectId && !activeProject) {
       this.activeProjectId = null;
       this.showProjectChatsFlag = false;
@@ -895,7 +900,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 
   async listSubagents(chatId?: string): Promise<VoiceSubagentListResult> {
-    const { chat } = await this.requireChatContext(chatId);
+    const { chat } = await this.requireSyncedChatContext(chatId);
     return {
       chatId: chat.id,
       chatName: chat.displayName,
@@ -904,7 +909,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 
   async inspectSubagent(target?: string, chatId?: string): Promise<VoiceSubagentInspectResult> {
-    const { chat } = await this.requireChatContext(chatId);
+    const { chat } = await this.requireSyncedChatContext(chatId);
     const subagent = resolveVisibleSubagentTarget(this.enrichSubagents(visibleSubagentsForChat(chat)), target);
     return {
       subagent,
@@ -917,7 +922,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     text: string,
     chatId?: string,
   ): Promise<VoiceSubagentSteerResult> {
-    const { chat } = await this.requireChatContext(chatId);
+    const { chat } = await this.requireSyncedChatContext(chatId);
     const subagent = resolveVisibleSubagentTarget(this.enrichSubagents(visibleSubagentsForChat(chat)), target);
     const result = await this.steerCodexThread(subagent.threadId, text);
     return {
@@ -1200,6 +1205,11 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const chat = activeChatForProject(project);
     if (!chat) throw new Error("Active project does not have an active chat.");
     return { project, chat };
+  }
+
+  private async requireSyncedChatContext(chatId?: string): Promise<ChatContext> {
+    const context = await this.requireChatContext(chatId);
+    return await this.syncChatSubagentsFromSessionLog(context, true) ?? context;
   }
 
   private async requireChatContextForPrompt(text: string, chatId?: string): Promise<ChatContext> {
@@ -2265,6 +2275,40 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return null;
   }
 
+  private async syncProjectSubagentsFromSessionLogs(project: VoiceProject): Promise<boolean> {
+    let changed = false;
+    for (const chat of project.chats) {
+      if (chat.archivedAt || !chat.codexThreadId) continue;
+      const synced = await this.syncChatSubagentsFromSessionLog({ project, chat }, false);
+      changed ||= Boolean(synced);
+    }
+    return changed;
+  }
+
+  private async syncChatSubagentsFromSessionLog(
+    context: ChatContext,
+    force: boolean,
+  ): Promise<ChatContext | null> {
+    const threadId = context.chat.codexThreadId;
+    if (!threadId) return null;
+
+    const nowMs = Date.now();
+    const lastSyncAt = this.subagentLogSyncAtByThread.get(threadId) ?? 0;
+    if (!force && nowMs - lastSyncAt < 2_000) return null;
+    this.subagentLogSyncAtByThread.set(threadId, nowMs);
+
+    const logPath = await findCodexSessionLogPath(threadId);
+    if (!logPath) return null;
+
+    const subagents = subagentsFromSessionLogText(threadId, await readFile(logPath, "utf8"));
+    if (subagents.length === 0 || sameSubagents(context.chat.subagents, subagents)) return null;
+
+    const updatedProject = await this.store.updateChat(context.project.id, context.chat.id, { subagents });
+    const updatedChat = updatedProject.chats.find((candidate) => candidate.id === context.chat.id) ?? null;
+    if (!updatedChat) return null;
+    return { project: updatedProject, chat: updatedChat };
+  }
+
   private async rememberSubagentFromItem(parentThreadId: string, item: Record<string, unknown>): Promise<void> {
     const childThreadId =
       firstStringField(item, ["newThreadId", "receiverThreadId", "threadId", "childThreadId"]) ?? null;
@@ -2558,6 +2602,166 @@ export function visibleSubagentsForChat(chat: VoiceChat): VoiceSubagentSummary[]
   }
 
   return [...summaries.values()];
+}
+
+export function subagentsFromSessionLogText(parentThreadId: string, text: string): VoiceSubagentThread[] {
+  const spawnCalls = new Map<string, { message: string; createdAt: string | null }>();
+  const subagents = new Map<string, VoiceSubagentThread>();
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const entry = parseJsonRecord(line);
+    const timestamp = firstStringField(entry, ["timestamp"]);
+    const payload = recordField(entry, "payload");
+    if (!payload || entry.type !== "response_item") continue;
+
+    if (payload.type === "function_call") {
+      const name = firstStringField(payload, ["name"]);
+      if (name === "spawn_agent") {
+        const callId = firstStringField(payload, ["call_id", "callId", "id"]);
+        if (callId) {
+          spawnCalls.set(callId, {
+            message: spawnMessageFromArguments(firstStringField(payload, ["arguments"])),
+            createdAt: timestamp,
+          });
+        }
+        continue;
+      }
+
+      if (name === "close_agent") {
+        const target = targetAgentFromArguments(firstStringField(payload, ["arguments"]));
+        if (target) {
+          const current = subagents.get(target);
+          if (current) {
+            subagents.set(target, {
+              ...current,
+              status: "closed",
+              updatedAt: timestamp ?? current.updatedAt,
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (payload.type !== "function_call_output") continue;
+    const callId = firstStringField(payload, ["call_id", "callId"]);
+    const output = firstStringField(payload, ["output"]);
+    if (!callId || !output) continue;
+
+    const spawn = spawnCalls.get(callId);
+    if (spawn) {
+      const outputRecord = parseJsonRecord(output);
+      const childThreadId = firstStringField(outputRecord, ["agent_id", "agentId", "threadId"]);
+      if (!childThreadId || childThreadId === parentThreadId) continue;
+      const nickname = firstStringField(outputRecord, ["nickname", "name", "agentName"]);
+      subagents.set(childThreadId, {
+        id: childThreadId,
+        displayName: nickname ?? titleFromSpawnMessage(spawn.message),
+        threadId: childThreadId,
+        status: "running",
+        createdAt: spawn.createdAt ?? timestamp ?? undefined,
+        updatedAt: timestamp ?? undefined,
+        raw: { callId, message: spawn.message, output: outputRecord },
+      });
+      continue;
+    }
+
+    const outputRecord = parseJsonRecord(output);
+    const status = recordField(outputRecord, "status");
+    if (!status) continue;
+    for (const [childThreadId, value] of Object.entries(status)) {
+      const current = subagents.get(childThreadId);
+      if (!current || !value || typeof value !== "object" || Array.isArray(value)) continue;
+      const childStatus = value as Record<string, unknown>;
+      const label = firstStringField(childStatus, ["completed"])
+        ? "completed"
+        : firstStringField(childStatus, ["failed"])
+          ? "failed"
+          : firstStringField(childStatus, ["status"]) ?? current.status;
+      subagents.set(childThreadId, {
+        ...current,
+        status: label,
+        updatedAt: timestamp ?? current.updatedAt,
+      });
+    }
+  }
+
+  return [...subagents.values()];
+}
+
+function spawnMessageFromArguments(value: string | null): string {
+  if (!value) return "";
+  return firstStringField(parseJsonRecord(value), ["message", "task", "prompt"]) ?? "";
+}
+
+function targetAgentFromArguments(value: string | null): string | null {
+  if (!value) return null;
+  return firstStringField(parseJsonRecord(value), ["target", "agent_id", "agentId", "threadId"]);
+}
+
+function titleFromSpawnMessage(message: string): string {
+  const firstLine = message.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+  const role = firstLine.match(/^Role:\s*(.+)$/i)?.[1]?.trim();
+  if (role) return role.slice(0, 64);
+  const worker = firstLine.match(/^You are ([^.]+)\./i)?.[1]?.trim();
+  if (worker) return worker.slice(0, 64);
+  return "Subagent";
+}
+
+function sameSubagents(left: VoiceSubagentThread[] | undefined, right: VoiceSubagentThread[]): boolean {
+  return JSON.stringify((left ?? []).map(stableSubagentForCompare)) ===
+    JSON.stringify(right.map(stableSubagentForCompare));
+}
+
+function stableSubagentForCompare(subagent: VoiceSubagentThread): Record<string, string | null> {
+  return {
+    id: subagent.id,
+    displayName: subagent.displayName,
+    threadId: subagent.threadId,
+    status: subagent.status,
+  };
+}
+
+async function findCodexSessionLogPath(threadId: string): Promise<string | null> {
+  const home = process.env.HOME;
+  if (!home) return null;
+  return findFileUnder(path.join(home, ".codex", "sessions"), (filePath) =>
+    filePath.endsWith(".jsonl") && path.basename(filePath).includes(threadId),
+  );
+}
+
+async function findFileUnder(
+  folderPath: string,
+  predicate: (filePath: string) => boolean,
+): Promise<string | null> {
+  let entries;
+  try {
+    entries = await readdir(folderPath, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of entries) {
+    const entryPath = path.join(folderPath, entry.name);
+    if (entry.isFile() && predicate(entryPath)) return entryPath;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const match = await findFileUnder(path.join(folderPath, entry.name), predicate);
+    if (match) return match;
+  }
+
+  return null;
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  try {
+    return recordFromUnknown(JSON.parse(value)) ?? {};
+  } catch {
+    return {};
+  }
 }
 
 export function resolveVisibleSubagentTarget(

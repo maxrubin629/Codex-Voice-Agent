@@ -12,6 +12,7 @@ import {
   normalizeThreadItemType,
   progressItemsFromThread,
   resolveVisibleSubagentTarget,
+  subagentsFromSessionLogText,
   threadTurnsHaveVoiceBridgePrompt,
   todoItemsFromPlanNotification,
   visibleSubagentsForChat,
@@ -224,6 +225,59 @@ describe("subagent item parsing", () => {
       /No visible child subagent matched/,
     );
     expect(() => resolveVisibleSubagentTarget(subagents)).toThrow(/More than one child subagent is visible/);
+  });
+
+  it("extracts spawned child agents from local session log records", () => {
+    const log = [
+      {
+        timestamp: "2026-05-14T05:49:10.448Z",
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "spawn_agent",
+          call_id: "call_spawn",
+          arguments: JSON.stringify({
+            message: "Role: Data Center Research. Gather sources.",
+          }),
+        },
+      },
+      {
+        timestamp: "2026-05-14T05:49:10.999Z",
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "call_spawn",
+          output: JSON.stringify({
+            agent_id: "019e2508-3630-7043-bf28-90c73040f168",
+            nickname: "Leibniz",
+          }),
+        },
+      },
+      {
+        timestamp: "2026-05-14T05:51:10.999Z",
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "call_wait",
+          output: JSON.stringify({
+            status: {
+              "019e2508-3630-7043-bf28-90c73040f168": {
+                completed: "Done",
+              },
+            },
+          }),
+        },
+      },
+    ].map((entry) => JSON.stringify(entry)).join("\n");
+
+    expect(subagentsFromSessionLogText("parent-thread", log)).toMatchObject([
+      {
+        id: "019e2508-3630-7043-bf28-90c73040f168",
+        displayName: "Leibniz",
+        threadId: "019e2508-3630-7043-bf28-90c73040f168",
+        status: "completed",
+      },
+    ]);
   });
 });
 
