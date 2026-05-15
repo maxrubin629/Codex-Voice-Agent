@@ -11,3 +11,5 @@ dist/
 .codex/skills/*
 !.codex/skills/realtime-project-orientation/
 !.codex/skills/realtime-project-orientation/**
+.codex/skills/realtime-project-orientation/.DS_Store
+.codex/skills/realtime-project-orientation/**/.DS_Store
