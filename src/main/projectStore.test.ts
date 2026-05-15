@@ -67,6 +67,72 @@ describe("ProjectStore sidecar layout", () => {
     ]);
   });
 
+  it("persists, loads, renames, and deletes opt-in replay sessions", async () => {
+    const store = new ProjectStore(await tempBaseFolder());
+    await store.ensureReady();
+
+    const project = await store.createProject("Replay Test");
+    const projectWithChat = await store.addChat(project.id, "Main", "thread-1");
+    const chatId = projectWithChat.activeChatId;
+    expect(chatId).toBeTruthy();
+
+    expect(await store.listReplaySessions(project.id)).toEqual([]);
+
+    const session = await store.createReplaySession({
+      projectId: project.id,
+      chatId: chatId!,
+      threadId: "thread-1",
+      name: "First pass",
+    });
+
+    await store.appendReplayEvent(project.id, session.id, {
+      at: "2026-05-13T12:00:00.000Z",
+      source: "realtime",
+      kind: "outbound",
+      message: "Realtime outbound response.create.",
+      raw: { type: "response.create", response: { instructions: "say hi" } },
+    });
+    await store.appendReplayEvent(project.id, session.id, {
+      at: "2026-05-13T12:00:01.000Z",
+      source: "codex",
+      kind: "turn/start/request",
+      message: "Sending turn/start to Codex app-server.",
+      raw: { threadId: "thread-1", input: [{ text: "Voice ===\nhello" }] },
+    });
+
+    const loaded = await store.loadReplaySession(project.id, session.id);
+    expect(loaded.metadata).toMatchObject({
+      id: session.id,
+      name: "First pass",
+      eventCount: 2,
+      chatId,
+      threadId: "thread-1",
+    });
+    expect(loaded.events).toHaveLength(2);
+    expect(loaded.events[0].raw).toMatchObject({ type: "response.create" });
+
+    const renamed = await store.renameReplaySession(project.id, session.id, "Renamed");
+    expect(renamed.name).toBe("Renamed");
+
+    const finalized = await store.finalizeReplaySession(project.id, session.id);
+    expect(finalized?.stoppedAt).toBeTruthy();
+
+    const replayPath = path.join(project.folderPath, ".codex-voice-agent", "replays", session.id);
+    expect(existsSync(replayPath)).toBe(true);
+    await store.deleteReplaySession(project.id, session.id);
+    expect(existsSync(replayPath)).toBe(false);
+
+    await store.createReplaySession({
+      projectId: project.id,
+      chatId: chatId!,
+      threadId: "thread-1",
+      name: "Second pass",
+    });
+    expect(await store.listReplaySessions(project.id)).toHaveLength(1);
+    await store.deleteAllReplaySessions(project.id);
+    expect(await store.listReplaySessions(project.id)).toEqual([]);
+  });
+
 });
 
 async function tempBaseFolder(): Promise<string> {

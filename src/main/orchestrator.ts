@@ -32,6 +32,9 @@ import type {
   QueuedCodexRequestResult,
   RealtimeReasoningEffort,
   ReasoningEffort,
+  ReplayRecordingState,
+  ReplaySessionLoadResult,
+  ReplaySessionMetadata,
   ThreadArtifactCandidate,
   ThreadProgressItem,
   ThreadSourceCandidate,
@@ -160,6 +163,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private todosByThread = new Map<string, CodexTodoItem[]>();
   private queuedRequestsByThread = new Map<string, QueuedCodexRequest[]>();
   private drainingQueuedThreads = new Set<string>();
+  private activeReplaySession: ReplaySessionMetadata | null = null;
   private readonly mcpOkGrants = new McpOkGrantStore();
 
   constructor(
@@ -189,6 +193,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 
   shutdown(): void {
+    void this.stopReplayRecording().catch(() => undefined);
     this.codex.stop();
   }
 
@@ -213,6 +218,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       mcpOkGrants: await this.mcpOkGrants.list(),
       realtime: realtimeConfig(),
       phone: this.phoneStatus(),
+      replay: this.replayRecordingState(),
     };
   }
 
@@ -401,7 +407,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(project.id, chat);
     const voiceBridgePromptInjectedAt =
       chat.voiceBridgePromptInjectedAt ?? (bridgeAlreadyInjected ? new Date().toISOString() : null);
-    const result = (await this.codex.request("turn/start", {
+    const inputText = codexVoiceTurnText(trimmed, bridgeAlreadyInjected);
+    const turnStartParams = {
       threadId: chat.codexThreadId,
       cwd,
       ...turnPermissionParams(turnSettings.permissionMode),
@@ -412,11 +419,13 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       input: [
         {
           type: "text",
-          text: codexVoiceTurnText(trimmed, bridgeAlreadyInjected),
+          text: inputText,
           text_elements: [],
         },
       ],
-    })) as { turn?: { id?: string } };
+    };
+    this.emitEvent("codex", "turn/start/request", "Sending turn/start to Codex app-server.", turnStartParams);
+    const result = (await this.codex.request("turn/start", turnStartParams)) as { turn?: { id?: string } };
 
     const turnId = result.turn?.id;
     if (!turnId) throw new Error("Codex did not return a turn id.");
@@ -666,7 +675,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     if (!resumedThreadId) throw new Error("Project is missing a Codex chat thread id.");
 
     const turnSettings = this.resolveTurnSettings(resumed.project, resumed.chat);
-    const result = (await this.codex.request("turn/start", {
+    const turnStartParams = {
       threadId: resumedThreadId,
       cwd: projectWorkspacePath(resumed.project),
       ...turnPermissionParams(turnSettings.permissionMode),
@@ -682,7 +691,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           text_elements: [],
         },
       ],
-    })) as { turn?: { id?: string } };
+    };
+    this.emitEvent("codex", "turn/start/request", "Sending summary turn/start to Codex app-server.", turnStartParams);
+    const result = (await this.codex.request("turn/start", turnStartParams)) as { turn?: { id?: string } };
 
     const turnId = result.turn?.id;
     if (!turnId) throw new Error("Codex did not return a summary turn id.");
@@ -1022,6 +1033,97 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     if (!message) return;
     const project = await this.requireProjectForChat(message.chatId);
     await this.store.upsertTranscriptMessage(project.id, message.chatId, message);
+  }
+
+  async listReplaySessions(projectId?: string): Promise<ReplaySessionMetadata[]> {
+    const project = projectId ? await this.store.getProject(projectId, { includeArchived: true }) : await this.getActiveProject();
+    if (!project) return [];
+    return this.store.listReplaySessions(project.id);
+  }
+
+  getReplayRecordingState(): ReplayRecordingState {
+    return this.replayRecordingState();
+  }
+
+  async startReplayRecording(name?: string): Promise<ReplaySessionMetadata> {
+    if (this.activeReplaySession) {
+      return this.activeReplaySession;
+    }
+    const project = await this.getActiveProject();
+    if (!project) throw new Error("Select a project before starting replay recording.");
+    const chat = activeChatForProject(project);
+    if (!chat) throw new Error("Select or create a chat before starting replay recording.");
+    const session = await this.store.createReplaySession({
+      projectId: project.id,
+      chatId: chat.id,
+      threadId: chat.codexThreadId,
+      name,
+    });
+    this.activeReplaySession = session;
+    this.emitEvent("app", "replayRecordingStarted", `Started replay recording: ${session.name}`, session);
+    await this.captureReplaySnapshot("start", project, chat);
+    this.emitState();
+    return session;
+  }
+
+  async stopReplayRecording(): Promise<ReplaySessionMetadata | null> {
+    const active = this.activeReplaySession;
+    if (!active) return null;
+    this.emitEvent("app", "replayRecordingStopped", `Stopped replay recording: ${active.name}`, active);
+    const finalized = await this.store.finalizeReplaySession(active.projectId, active.id);
+    this.activeReplaySession = null;
+    this.emitState();
+    return finalized ?? active;
+  }
+
+  async recordReplayEvent(event: AppEvent): Promise<void> {
+    const active = this.activeReplaySession;
+    if (!active) return;
+    try {
+      const updated = await this.store.appendReplayEvent(active.projectId, active.id, event);
+      if (updated) this.activeReplaySession = updated;
+      this.emitState();
+    } catch (error) {
+      this.activeReplaySession = null;
+      this.emitEvent(
+        "app",
+        "replayRecordingFailed",
+        error instanceof Error ? error.message : "Replay recording failed.",
+        { replayId: active.id, projectId: active.projectId },
+      );
+      this.emitState();
+    }
+  }
+
+  async loadReplaySession(projectId: string, replayId: string): Promise<ReplaySessionLoadResult> {
+    return this.store.loadReplaySession(projectId, replayId);
+  }
+
+  async renameReplaySession(projectId: string, replayId: string, name: string): Promise<ReplaySessionMetadata> {
+    const updated = await this.store.renameReplaySession(projectId, replayId, name);
+    if (this.activeReplaySession?.id === replayId && this.activeReplaySession.projectId === projectId) {
+      this.activeReplaySession = updated;
+      this.emitState();
+    }
+    return updated;
+  }
+
+  async deleteReplaySession(projectId: string, replayId: string): Promise<void> {
+    await this.store.deleteReplaySession(projectId, replayId);
+    if (this.activeReplaySession?.id === replayId && this.activeReplaySession.projectId === projectId) {
+      this.activeReplaySession = null;
+      this.emitState();
+    }
+  }
+
+  async deleteAllReplaySessions(projectId?: string): Promise<void> {
+    const project = projectId ? await this.store.getProject(projectId, { includeArchived: true }) : await this.getActiveProject();
+    if (!project) return;
+    await this.store.deleteAllReplaySessions(project.id);
+    if (this.activeReplaySession?.projectId === project.id) {
+      this.activeReplaySession = null;
+      this.emitState();
+    }
   }
 
   async setCodexSettings(
@@ -2305,6 +2407,37 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       activeTurnId: this.activeTurnByThread.get(subagent.threadId) ?? null,
       threadStatus: this.threadStatusByThread.get(subagent.threadId) ?? null,
     }));
+  }
+
+  private replayRecordingState(): ReplayRecordingState {
+    return { active: this.activeReplaySession };
+  }
+
+  private async captureReplaySnapshot(reason: "start", project: VoiceProject, chat: VoiceChat): Promise<void> {
+    const parentSummary = chat.codexThreadId
+      ? await this.getThreadSummary(chat.codexThreadId)
+      : emptyActiveThreadSummary({
+          status: "empty",
+          project,
+          chat,
+          errorMessage: "Chat does not have a Codex thread yet.",
+        });
+    const subagents = this.enrichSubagents(visibleSubagentsForChat(chat));
+    const subagentSummaries = await Promise.all(
+      subagents.map(async (subagent) => ({
+        subagent,
+        summary: await this.getThreadSummary(subagent.threadId),
+      })),
+    );
+    this.emitEvent("app", "replayThreadSnapshot", "Captured replay thread snapshot.", {
+      reason,
+      projectId: project.id,
+      chatId: chat.id,
+      threadId: chat.codexThreadId,
+      parentSummary,
+      subagents,
+      subagentSummaries,
+    });
   }
 
   private emitState(): void {

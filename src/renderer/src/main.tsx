@@ -28,12 +28,15 @@ import {
   type RealtimeModelId,
   type RealtimeReasoningEffort,
   type RealtimeVoiceId,
+  type ReplaySessionLoadResult,
+  type ReplaySessionMetadata,
   type ToolQuestionAnswer,
   type VoiceChat,
   type VoiceProject,
   type WindowChromeState,
 } from "../../shared/types";
 import { appendBufferedEvent } from "../../shared/eventBuffer";
+import { classifyReplayEvent, replayFrameAt, sortReplayEvents } from "../../shared/replay";
 import { RealtimeVoiceClient, type RealtimeChatContext } from "./realtimeClient";
 import { RightPanel } from "./rightPanel";
 import "./styles.css";
@@ -101,6 +104,9 @@ const emptyState: AppState = {
     },
     activeCall: null,
     logs: [],
+  },
+  replay: {
+    active: null,
   },
 };
 
@@ -3249,6 +3255,69 @@ function DebugDashboard({
     state.codexSettings.chatReasoningEffort ??
     state.codexSettings.defaultReasoningEffort ??
     DEFAULT_CODEX_REASONING_EFFORT;
+  const [replaySessions, setReplaySessions] = useState<ReplaySessionMetadata[]>([]);
+  const [selectedReplay, setSelectedReplay] = useState<ReplaySessionLoadResult | null>(null);
+  const [replayCursor, setReplayCursor] = useState(100);
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState(1);
+  const [selectedEvent, setSelectedEvent] = useState<AppEvent | null>(null);
+  const activeReplay = state.replay.active;
+  const replayProjectId = activeProject?.id ?? activeReplay?.projectId ?? null;
+  const replaySourceEvents = selectedReplay?.events ?? events;
+  const orderedReplayEvents = useMemo(() => sortReplayEvents(replaySourceEvents), [replaySourceEvents]);
+  const replayBounds = replayTimelineBounds(orderedReplayEvents);
+  const replayCursorMs = replayCursorMsFromPercent(replayBounds, replayCursor);
+  const replayFrame = useMemo(
+    () => replayFrameAt(orderedReplayEvents, replayCursorMs),
+    [orderedReplayEvents, replayCursorMs],
+  );
+  const replayModeLabel = selectedReplay ? selectedReplay.metadata.name : "Live buffer";
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!replayProjectId) {
+      setReplaySessions([]);
+      setSelectedReplay(null);
+      return undefined;
+    }
+    void window.codexVoice.listReplaySessions(replayProjectId).then((sessions) => {
+      if (!cancelled) setReplaySessions(sessions);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [replayProjectId, activeReplay?.id, activeReplay?.stoppedAt]);
+
+  useEffect(() => {
+    if (!replayPlaying || orderedReplayEvents.length <= 1) return undefined;
+    const timer = window.setInterval(() => {
+      setReplayCursor((current) => {
+        const next = Math.min(100, current + replaySpeed);
+        if (next >= 100) setReplayPlaying(false);
+        return next;
+      });
+    }, 160);
+    return () => window.clearInterval(timer);
+  }, [orderedReplayEvents.length, replayPlaying, replaySpeed]);
+
+  async function refreshReplaySessions(): Promise<void> {
+    if (!replayProjectId) {
+      setReplaySessions([]);
+      return;
+    }
+    setReplaySessions(await window.codexVoice.listReplaySessions(replayProjectId));
+  }
+
+  async function loadReplay(session: ReplaySessionMetadata | null): Promise<void> {
+    setReplayPlaying(false);
+    setReplayCursor(100);
+    setSelectedEvent(null);
+    if (!session) {
+      setSelectedReplay(null);
+      return;
+    }
+    setSelectedReplay(await window.codexVoice.loadReplaySession(session.projectId, session.id));
+  }
 
   return (
     <main className="debug-shell app-shell">
@@ -3276,6 +3345,65 @@ function DebugDashboard({
           <code>{activeFolder}</code>
         </div>
       </section>
+
+      <ReplayTimelinePanel
+        activeReplay={activeReplay}
+        sessions={replaySessions}
+        selectedReplay={selectedReplay}
+        replayModeLabel={replayModeLabel}
+        events={orderedReplayEvents}
+        frame={replayFrame}
+        bounds={replayBounds}
+        cursor={replayCursor}
+        playing={replayPlaying}
+        speed={replaySpeed}
+        selectedEvent={selectedEvent}
+        onCursorChange={setReplayCursor}
+        onPlayingChange={setReplayPlaying}
+        onSpeedChange={setReplaySpeed}
+        onSelectEvent={setSelectedEvent}
+        onLoadReplay={(session) => void onAction(() => loadReplay(session))}
+        onStartRecording={() =>
+          void onAction(async () => {
+            await window.codexVoice.startReplayRecording();
+            await refreshReplaySessions();
+          })
+        }
+        onStopRecording={() =>
+          void onAction(async () => {
+            await window.codexVoice.stopReplayRecording();
+            await refreshReplaySessions();
+          })
+        }
+        onRenameReplay={(session) =>
+          void onAction(async () => {
+            const name = window.prompt("Replay name", session.name);
+            if (!name || !name.trim()) return;
+            const updated = await window.codexVoice.renameReplaySession(session.projectId, session.id, name);
+            if (selectedReplay?.metadata.id === updated.id) {
+              setSelectedReplay(await window.codexVoice.loadReplaySession(updated.projectId, updated.id));
+            }
+            await refreshReplaySessions();
+          })
+        }
+        onDeleteReplay={(session) =>
+          void onAction(async () => {
+            if (!window.confirm(`Delete replay "${session.name}"? This removes the local raw event recording.`)) return;
+            await window.codexVoice.deleteReplaySession(session.projectId, session.id);
+            if (selectedReplay?.metadata.id === session.id) await loadReplay(null);
+            await refreshReplaySessions();
+          })
+        }
+        onDeleteAll={() =>
+          void onAction(async () => {
+            if (!replayProjectId) return;
+            if (!window.confirm("Delete all replays for this project? This removes local raw event recordings.")) return;
+            await window.codexVoice.deleteAllReplaySessions(replayProjectId);
+            await loadReplay(null);
+            await refreshReplaySessions();
+          })
+        }
+      />
 
       <section className="grid">
         <aside className="panel projects-panel">
@@ -3422,11 +3550,16 @@ function DebugDashboard({
 
         <section className="panel event-panel">
           <div className="panel-header">
-            <h2>Event Log</h2>
+            <h2>{selectedReplay ? "Replay Events" : "Event Log"}</h2>
             <button onClick={() => void onClearEvents()}>Clear</button>
           </div>
+          <p className="help">
+            {selectedReplay
+              ? `Scrubbing ${replayFrame.events.length} of ${orderedReplayEvents.length} recorded events.`
+              : `Showing the live in-memory buffer; this is not persisted unless recording is active.`}
+          </p>
           <div className="event-list">
-            {events.map((event, index) => (
+            {[...replayFrame.events].reverse().map((event, index) => (
               <article key={`${event.at}-${index}`} className={`event ${event.source}`}>
                 <div>
                   <strong>{event.kind}</strong>
@@ -3436,12 +3569,240 @@ function DebugDashboard({
                 <p>{event.message}</p>
               </article>
             ))}
-            {events.length === 0 && <p className="empty">No events yet.</p>}
+            {replayFrame.events.length === 0 && <p className="empty">No events yet.</p>}
           </div>
         </section>
       </section>
     </main>
   );
+}
+
+function ReplayTimelinePanel({
+  activeReplay,
+  sessions,
+  selectedReplay,
+  replayModeLabel,
+  events,
+  frame,
+  bounds,
+  cursor,
+  playing,
+  speed,
+  selectedEvent,
+  onCursorChange,
+  onPlayingChange,
+  onSpeedChange,
+  onSelectEvent,
+  onLoadReplay,
+  onStartRecording,
+  onStopRecording,
+  onRenameReplay,
+  onDeleteReplay,
+  onDeleteAll,
+}: {
+  activeReplay: ReplaySessionMetadata | null;
+  sessions: ReplaySessionMetadata[];
+  selectedReplay: ReplaySessionLoadResult | null;
+  replayModeLabel: string;
+  events: AppEvent[];
+  frame: ReturnType<typeof replayFrameAt>;
+  bounds: ReplayTimelineBounds;
+  cursor: number;
+  playing: boolean;
+  speed: number;
+  selectedEvent: AppEvent | null;
+  onCursorChange: (value: number) => void;
+  onPlayingChange: (value: boolean) => void;
+  onSpeedChange: (value: number) => void;
+  onSelectEvent: (event: AppEvent | null) => void;
+  onLoadReplay: (session: ReplaySessionMetadata | null) => void;
+  onStartRecording: () => void;
+  onStopRecording: () => void;
+  onRenameReplay: (session: ReplaySessionMetadata) => void;
+  onDeleteReplay: (session: ReplaySessionMetadata) => void;
+  onDeleteAll: () => void;
+}): React.ReactElement {
+  const selectedReplayId = selectedReplay?.metadata.id ?? "live";
+  const cursorTime = frame.cursorAt ? new Date(frame.cursorAt).toLocaleTimeString() : "No cursor";
+  const duration = bounds.minMs !== null && bounds.maxMs !== null ? formatReplayDuration(bounds.maxMs - bounds.minMs) : "0s";
+  const activeMatchesSelected = activeReplay && selectedReplay?.metadata.id === activeReplay.id;
+  return (
+    <section className="panel replay-panel">
+      <div className="panel-header">
+        <div>
+          <h2>Replay Timeline</h2>
+          <p>{replayModeLabel} / {duration}</p>
+        </div>
+        <div className="button-row wrap">
+          {activeReplay ? (
+            <button type="button" className="danger" onClick={onStopRecording}>
+              Stop Recording
+            </button>
+          ) : (
+            <button type="button" className="primary" onClick={onStartRecording}>
+              Start Recording
+            </button>
+          )}
+          <button type="button" className="danger" disabled={sessions.length === 0 || Boolean(activeReplay)} onClick={onDeleteAll}>
+            Delete All
+          </button>
+        </div>
+      </div>
+
+      <div className="replay-toolbar">
+        <label>
+          <span>Replay</span>
+          <select
+            value={selectedReplayId}
+            onChange={(event) => {
+              const value = event.target.value;
+              onLoadReplay(value === "live" ? null : sessions.find((session) => session.id === value) ?? null);
+            }}
+          >
+            <option value="live">Live buffer (not persisted)</option>
+            {sessions.map((session) => (
+              <option key={session.id} value={session.id}>
+                {session.name} ({session.eventCount})
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className={`replay-recording-indicator ${activeReplay ? "active" : ""}`}>
+          <span aria-hidden="true" />
+          {activeReplay ? `Recording ${activeReplay.eventCount} events` : "Recording off"}
+        </div>
+        {selectedReplay && (
+          <div className="button-row wrap">
+            <button type="button" onClick={() => onRenameReplay(selectedReplay.metadata)}>
+              Rename
+            </button>
+            <button type="button" className="danger" disabled={Boolean(activeMatchesSelected)} onClick={() => onDeleteReplay(selectedReplay.metadata)}>
+              Delete
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="replay-controls">
+        <button type="button" disabled={events.length === 0} onClick={() => onPlayingChange(!playing)}>
+          {playing ? "Pause" : "Play"}
+        </button>
+        <button type="button" disabled={events.length === 0} onClick={() => onCursorChange(100)}>
+          Jump Live
+        </button>
+        <label>
+          <span>Speed</span>
+          <select value={speed} onChange={(event) => onSpeedChange(Number(event.target.value) || 1)}>
+            <option value={0.5}>0.5x</option>
+            <option value={1}>1x</option>
+            <option value={2}>2x</option>
+            <option value={4}>4x</option>
+          </select>
+        </label>
+        <strong>{cursorTime}</strong>
+      </div>
+
+      <div className="replay-scrubber">
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={0.1}
+          value={cursor}
+          disabled={events.length === 0}
+          onChange={(event) => {
+            onPlayingChange(false);
+            onSelectEvent(null);
+            onCursorChange(Number(event.target.value));
+          }}
+          aria-label="Replay timeline"
+        />
+        <div className="replay-ticks">
+          {events.slice(-220).map((event, index) => (
+            <button
+              key={`${event.at}-${event.kind}-${index}`}
+              type="button"
+              className={`replay-tick ${classifyReplayEvent(event)}`}
+              style={{ left: `${eventPercent(event, bounds)}%` }}
+              title={`${event.source} ${event.kind}`}
+              onClick={() => {
+                onPlayingChange(false);
+                onCursorChange(eventPercent(event, bounds));
+                onSelectEvent(event);
+              }}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="replay-frame-grid">
+        <ReplayMetric label="Status" value={frame.latestStatus} />
+        <ReplayMetric label="Events" value={`${frame.events.length} / ${events.length}`} />
+        <ReplayMetric label="Tools" value={String(frame.toolCallCount)} />
+        <ReplayMetric label="Approvals" value={String(frame.pendingApprovalCount)} />
+        <ReplayMetric label="Subagents" value={String(frame.subagentCount)} />
+        <ReplayMetric label="Errors" value={String(frame.errorCount)} />
+      </div>
+
+      <div className="replay-detail-grid">
+        <section>
+          <h3>Transcript At Cursor</h3>
+          <pre>{frame.transcriptText || "No completed transcript events at this point."}</pre>
+        </section>
+        <section>
+          <h3>Raw Event</h3>
+          <pre>{JSON.stringify(selectedEvent ?? frame.currentEvent ?? null, null, 2)}</pre>
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function ReplayMetric({ label, value }: { label: string; value: string }): React.ReactElement {
+  return (
+    <div className="replay-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+type ReplayTimelineBounds = {
+  minMs: number | null;
+  maxMs: number | null;
+};
+
+function replayTimelineBounds(events: AppEvent[]): ReplayTimelineBounds {
+  const times = events
+    .map((event) => Date.parse(event.at))
+    .filter((value) => Number.isFinite(value));
+  if (times.length === 0) return { minMs: null, maxMs: null };
+  return {
+    minMs: Math.min(...times),
+    maxMs: Math.max(...times),
+  };
+}
+
+function replayCursorMsFromPercent(bounds: ReplayTimelineBounds, percent: number): number | null {
+  if (bounds.minMs === null || bounds.maxMs === null) return null;
+  if (bounds.minMs === bounds.maxMs) return bounds.maxMs;
+  const clamped = Math.min(100, Math.max(0, percent));
+  return bounds.minMs + ((bounds.maxMs - bounds.minMs) * clamped) / 100;
+}
+
+function eventPercent(event: AppEvent, bounds: ReplayTimelineBounds): number {
+  if (bounds.minMs === null || bounds.maxMs === null || bounds.minMs === bounds.maxMs) return 100;
+  const parsed = Date.parse(event.at);
+  if (!Number.isFinite(parsed)) return 100;
+  return Math.min(100, Math.max(0, ((parsed - bounds.minMs) / (bounds.maxMs - bounds.minMs)) * 100));
+}
+
+function formatReplayDuration(durationMs: number): string {
+  const seconds = Math.max(0, Math.round(durationMs / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}m ${remainder}s`;
 }
 
 function voiceStateLabel(

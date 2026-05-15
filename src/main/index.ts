@@ -197,6 +197,7 @@ function recordEvent(event: AppEvent): void {
 
 function publishEvent(event: AppEvent): void {
   recordEvent(event);
+  void orchestrator?.recordReplayEvent(event);
   void orchestrator?.recordTranscriptEvent(event).catch(() => {
     // Transcript persistence should never break live event delivery.
   });
@@ -298,6 +299,28 @@ function registerIpc(): void {
   registerIpcHandler("app:logEvent", (_event, payload: AppEvent) => {
     publishEvent(normalizeAppEvent(payload));
   });
+  registerIpcHandler("replay:list", (_event, payload?: { projectId?: string }) =>
+    requireOrchestrator().listReplaySessions(payload?.projectId),
+  );
+  registerIpcHandler("replay:recordingState", () =>
+    requireOrchestrator().getReplayRecordingState(),
+  );
+  registerIpcHandler("replay:start", (_event, payload?: { name?: string }) =>
+    requireOrchestrator().startReplayRecording(payload?.name),
+  );
+  registerIpcHandler("replay:stop", () => requireOrchestrator().stopReplayRecording());
+  registerIpcHandler("replay:load", (_event, payload: { projectId: string; replayId: string }) =>
+    requireOrchestrator().loadReplaySession(payload.projectId, payload.replayId),
+  );
+  registerIpcHandler("replay:rename", (_event, payload: { projectId: string; replayId: string; name: string }) =>
+    requireOrchestrator().renameReplaySession(payload.projectId, payload.replayId, payload.name),
+  );
+  registerIpcHandler("replay:delete", (_event, payload: { projectId: string; replayId: string }) =>
+    requireOrchestrator().deleteReplaySession(payload.projectId, payload.replayId),
+  );
+  registerIpcHandler("replay:deleteAll", (_event, payload?: { projectId?: string }) =>
+    requireOrchestrator().deleteAllReplaySessions(payload?.projectId),
+  );
   registerIpcHandler("projects:selectWorkspaceFolder", async () => {
     const options: OpenDialogOptions = {
       title: "Use an existing folder",

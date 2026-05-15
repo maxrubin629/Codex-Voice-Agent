@@ -475,6 +475,7 @@ export type AppState = {
     apiKeyEncrypted: boolean;
   };
   phone: PhoneStatus;
+  replay: ReplayRecordingState;
 };
 
 export type PhoneSettings = {
@@ -555,6 +556,28 @@ export type AppEvent = {
   raw?: unknown;
 };
 
+export type ReplaySessionMetadata = {
+  id: string;
+  name: string;
+  projectId: string;
+  projectName: string;
+  chatId: string | null;
+  chatName: string | null;
+  threadId: string | null;
+  startedAt: string;
+  stoppedAt: string | null;
+  eventCount: number;
+};
+
+export type ReplayRecordingState = {
+  active: ReplaySessionMetadata | null;
+};
+
+export type ReplaySessionLoadResult = {
+  metadata: ReplaySessionMetadata;
+  events: AppEvent[];
+};
+
 export type VoiceTranscriptMessageSource = "realtime" | "codex" | "app";
 export type VoiceTranscriptMessageRole = "user" | "assistant";
 export type VoiceTranscriptMessageStatus = "completed" | "streaming" | "interrupted" | "error";
@@ -604,6 +627,14 @@ export type CodexVoiceApi = {
   getEvents(): Promise<AppEvent[]>;
   clearEvents(): Promise<void>;
   logEvent(event: AppEvent): Promise<void>;
+  listReplaySessions(projectId?: string): Promise<ReplaySessionMetadata[]>;
+  getReplayRecordingState(): Promise<ReplayRecordingState>;
+  startReplayRecording(name?: string): Promise<ReplaySessionMetadata>;
+  stopReplayRecording(): Promise<ReplaySessionMetadata | null>;
+  loadReplaySession(projectId: string, replayId: string): Promise<ReplaySessionLoadResult>;
+  renameReplaySession(projectId: string, replayId: string, name: string): Promise<ReplaySessionMetadata>;
+  deleteReplaySession(projectId: string, replayId: string): Promise<void>;
+  deleteAllReplaySessions(projectId?: string): Promise<void>;
   selectWorkspaceFolder(): Promise<SelectedWorkspaceFolder | null>;
   setWorkspaceFolder(workspacePath: string, name?: string | null): Promise<VoiceProject>;
   createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject>;
