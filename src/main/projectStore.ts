@@ -1013,7 +1013,11 @@ function safeTranscriptFileName(value: string): string {
 }
 
 function safeReplayId(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_.-]/g, "_") || "replay";
+  const cleaned = value.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    throw new Error("Invalid replay id.");
+  }
+  return cleaned;
 }
 
 function sanitizeProjectName(name: string): string {

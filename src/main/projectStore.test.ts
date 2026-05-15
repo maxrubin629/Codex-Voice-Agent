@@ -133,6 +133,30 @@ describe("ProjectStore sidecar layout", () => {
     expect(await store.listReplaySessions(project.id)).toEqual([]);
   });
 
+  it("rejects dot replay ids before deleting paths", async () => {
+    const store = new ProjectStore(await tempBaseFolder());
+    await store.ensureReady();
+
+    const project = await store.createProject("Replay Path Test");
+    const projectWithChat = await store.addChat(project.id, "Main", "thread-1");
+    const chatId = projectWithChat.activeChatId;
+    expect(chatId).toBeTruthy();
+
+    await store.createReplaySession({
+      projectId: project.id,
+      chatId: chatId!,
+      threadId: "thread-1",
+      name: "Keep me",
+    });
+
+    const agentFolder = path.join(project.folderPath, ".codex-voice-agent");
+    expect(existsSync(agentFolder)).toBe(true);
+
+    await expect(store.deleteReplaySession(project.id, "..")).rejects.toThrow(/Invalid replay id/);
+    expect(existsSync(agentFolder)).toBe(true);
+    expect(await store.listReplaySessions(project.id)).toHaveLength(1);
+  });
+
 });
 
 async function tempBaseFolder(): Promise<string> {
