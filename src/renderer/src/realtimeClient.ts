@@ -703,6 +703,7 @@ export class RealtimeVoiceClient {
     if (!this.dc || this.dc.readyState !== "open") {
       throw new Error("Realtime data channel is not open.");
     }
+    this.log("outbound", realtimeOutboundLabel(payload), payload);
     this.dc.send(JSON.stringify(payload));
   }
 
@@ -1040,6 +1041,18 @@ function safeJson(raw: string | undefined): Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function realtimeOutboundLabel(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "Realtime outbound message.";
+  const type = stringValue((payload as { type?: unknown }).type) ?? "message";
+  if (type === "conversation.item.create") {
+    const item = (payload as { item?: { type?: unknown } }).item;
+    const itemType = item && typeof item === "object" ? stringValue(item.type) : undefined;
+    return `Realtime outbound ${type}${itemType ? ` (${itemType})` : ""}.`;
+  }
+  if (type === "response.create") return "Realtime outbound response.create.";
+  return `Realtime outbound ${type}.`;
 }
 
 function summarizeSubagentInspection(result: { subagent: unknown; summary: ActiveThreadSummary }): Record<string, unknown> {
