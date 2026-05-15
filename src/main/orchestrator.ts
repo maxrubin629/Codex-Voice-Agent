@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type {
   AppEvent,
@@ -32,6 +32,9 @@ import type {
   QueuedCodexRequestResult,
   RealtimeReasoningEffort,
   ReasoningEffort,
+  ReplayRecordingState,
+  ReplaySessionLoadResult,
+  ReplaySessionMetadata,
   ThreadArtifactCandidate,
   ThreadProgressItem,
   ThreadSourceCandidate,
@@ -39,6 +42,11 @@ import type {
   ThreadSummaryTurn,
   ToolQuestionAnswer,
   VoiceProject,
+  VoiceSubagentThread,
+  VoiceSubagentInspectResult,
+  VoiceSubagentListResult,
+  VoiceSubagentSteerResult,
+  VoiceSubagentSummary,
   VoiceTranscriptMessage,
 } from "../shared/types";
 import {
@@ -155,6 +163,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private todosByThread = new Map<string, CodexTodoItem[]>();
   private queuedRequestsByThread = new Map<string, QueuedCodexRequest[]>();
   private drainingQueuedThreads = new Set<string>();
+  private subagentLogSyncAtByThread = new Map<string, number>();
+  private activeReplaySession: ReplaySessionMetadata | null = null;
   private readonly mcpOkGrants = new McpOkGrantStore();
 
   constructor(
@@ -184,15 +194,20 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   }
 
   shutdown(): void {
+    void this.stopReplayRecording().catch(() => undefined);
     this.codex.stop();
   }
 
   async state(): Promise<AppState> {
-    const projects = await this.store.listProjects();
+    let projects = await this.store.listProjects();
     const archivedProjects = await this.store.listArchivedProjects();
     let activeProject = this.activeProjectId
       ? projects.find((project) => project.id === this.activeProjectId) ?? null
       : null;
+    if (activeProject && await this.syncProjectSubagentsFromSessionLogs(activeProject)) {
+      projects = await this.store.listProjects();
+      activeProject = projects.find((project) => project.id === this.activeProjectId) ?? null;
+    }
     if (this.activeProjectId && !activeProject) {
       this.activeProjectId = null;
       this.showProjectChatsFlag = false;
@@ -208,6 +223,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       mcpOkGrants: await this.mcpOkGrants.list(),
       realtime: realtimeConfig(),
       phone: this.phoneStatus(),
+      replay: this.replayRecordingState(),
     };
   }
 
@@ -396,7 +412,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(project.id, chat);
     const voiceBridgePromptInjectedAt =
       chat.voiceBridgePromptInjectedAt ?? (bridgeAlreadyInjected ? new Date().toISOString() : null);
-    const result = (await this.codex.request("turn/start", {
+    const inputText = codexVoiceTurnText(trimmed, bridgeAlreadyInjected);
+    const turnStartParams = {
       threadId: chat.codexThreadId,
       cwd,
       ...turnPermissionParams(turnSettings.permissionMode),
@@ -407,11 +424,13 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       input: [
         {
           type: "text",
-          text: codexVoiceTurnText(trimmed, bridgeAlreadyInjected),
+          text: inputText,
           text_elements: [],
         },
       ],
-    })) as { turn?: { id?: string } };
+    };
+    this.emitEvent("codex", "turn/start/request", "Sending turn/start to Codex app-server.", turnStartParams);
+    const result = (await this.codex.request("turn/start", turnStartParams)) as { turn?: { id?: string } };
 
     const turnId = result.turn?.id;
     if (!turnId) throw new Error("Codex did not return a turn id.");
@@ -661,7 +680,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     if (!resumedThreadId) throw new Error("Project is missing a Codex chat thread id.");
 
     const turnSettings = this.resolveTurnSettings(resumed.project, resumed.chat);
-    const result = (await this.codex.request("turn/start", {
+    const turnStartParams = {
       threadId: resumedThreadId,
       cwd: projectWorkspacePath(resumed.project),
       ...turnPermissionParams(turnSettings.permissionMode),
@@ -677,7 +696,9 @@ export class VoiceCodexOrchestrator extends EventEmitter {
           text_elements: [],
         },
       ],
-    })) as { turn?: { id?: string } };
+    };
+    this.emitEvent("codex", "turn/start/request", "Sending summary turn/start to Codex app-server.", turnStartParams);
+    const result = (await this.codex.request("turn/start", turnStartParams)) as { turn?: { id?: string } };
 
     const turnId = result.turn?.id;
     if (!turnId) throw new Error("Codex did not return a summary turn id.");
@@ -889,6 +910,38 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return chatId ? runtimes.filter((runtime) => runtime.chatId === chatId) : runtimes;
   }
 
+  async listSubagents(chatId?: string): Promise<VoiceSubagentListResult> {
+    const { chat } = await this.requireSyncedChatContext(chatId);
+    return {
+      chatId: chat.id,
+      chatName: chat.displayName,
+      subagents: this.enrichSubagents(visibleSubagentsForChat(chat)),
+    };
+  }
+
+  async inspectSubagent(target?: string, chatId?: string): Promise<VoiceSubagentInspectResult> {
+    const { chat } = await this.requireSyncedChatContext(chatId);
+    const subagent = resolveVisibleSubagentTarget(this.enrichSubagents(visibleSubagentsForChat(chat)), target);
+    return {
+      subagent,
+      summary: await this.getThreadSummary(subagent.threadId),
+    };
+  }
+
+  async steerSubagent(
+    target: string | undefined,
+    text: string,
+    chatId?: string,
+  ): Promise<VoiceSubagentSteerResult> {
+    const { chat } = await this.requireSyncedChatContext(chatId);
+    const subagent = resolveVisibleSubagentTarget(this.enrichSubagents(visibleSubagentsForChat(chat)), target);
+    const result = await this.steerCodexThread(subagent.threadId, text);
+    return {
+      subagent,
+      turnId: result.turnId,
+    };
+  }
+
   async getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary> {
     let project: VoiceProject | null = null;
     let chat: VoiceChat | null = null;
@@ -985,6 +1038,97 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     if (!message) return;
     const project = await this.requireProjectForChat(message.chatId);
     await this.store.upsertTranscriptMessage(project.id, message.chatId, message);
+  }
+
+  async listReplaySessions(projectId?: string): Promise<ReplaySessionMetadata[]> {
+    const project = projectId ? await this.store.getProject(projectId, { includeArchived: true }) : await this.getActiveProject();
+    if (!project) return [];
+    return this.store.listReplaySessions(project.id);
+  }
+
+  getReplayRecordingState(): ReplayRecordingState {
+    return this.replayRecordingState();
+  }
+
+  async startReplayRecording(name?: string): Promise<ReplaySessionMetadata> {
+    if (this.activeReplaySession) {
+      return this.activeReplaySession;
+    }
+    const project = await this.getActiveProject();
+    if (!project) throw new Error("Select a project before starting replay recording.");
+    const chat = activeChatForProject(project);
+    if (!chat) throw new Error("Select or create a chat before starting replay recording.");
+    const session = await this.store.createReplaySession({
+      projectId: project.id,
+      chatId: chat.id,
+      threadId: chat.codexThreadId,
+      name,
+    });
+    this.activeReplaySession = session;
+    this.emitEvent("app", "replayRecordingStarted", `Started replay recording: ${session.name}`, session);
+    await this.captureReplaySnapshot("start", project, chat);
+    this.emitState();
+    return session;
+  }
+
+  async stopReplayRecording(): Promise<ReplaySessionMetadata | null> {
+    const active = this.activeReplaySession;
+    if (!active) return null;
+    this.emitEvent("app", "replayRecordingStopped", `Stopped replay recording: ${active.name}`, active);
+    const finalized = await this.store.finalizeReplaySession(active.projectId, active.id);
+    this.activeReplaySession = null;
+    this.emitState();
+    return finalized ?? active;
+  }
+
+  async recordReplayEvent(event: AppEvent): Promise<void> {
+    const active = this.activeReplaySession;
+    if (!active) return;
+    try {
+      const updated = await this.store.appendReplayEvent(active.projectId, active.id, event);
+      if (updated) this.activeReplaySession = updated;
+      this.emitState();
+    } catch (error) {
+      this.activeReplaySession = null;
+      this.emitEvent(
+        "app",
+        "replayRecordingFailed",
+        error instanceof Error ? error.message : "Replay recording failed.",
+        { replayId: active.id, projectId: active.projectId },
+      );
+      this.emitState();
+    }
+  }
+
+  async loadReplaySession(projectId: string, replayId: string): Promise<ReplaySessionLoadResult> {
+    return this.store.loadReplaySession(projectId, replayId);
+  }
+
+  async renameReplaySession(projectId: string, replayId: string, name: string): Promise<ReplaySessionMetadata> {
+    const updated = await this.store.renameReplaySession(projectId, replayId, name);
+    if (this.activeReplaySession?.id === replayId && this.activeReplaySession.projectId === projectId) {
+      this.activeReplaySession = updated;
+      this.emitState();
+    }
+    return updated;
+  }
+
+  async deleteReplaySession(projectId: string, replayId: string): Promise<void> {
+    await this.store.deleteReplaySession(projectId, replayId);
+    if (this.activeReplaySession?.id === replayId && this.activeReplaySession.projectId === projectId) {
+      this.activeReplaySession = null;
+      this.emitState();
+    }
+  }
+
+  async deleteAllReplaySessions(projectId?: string): Promise<void> {
+    const project = projectId ? await this.store.getProject(projectId, { includeArchived: true }) : await this.getActiveProject();
+    if (!project) return;
+    await this.store.deleteAllReplaySessions(project.id);
+    if (this.activeReplaySession?.projectId === project.id) {
+      this.activeReplaySession = null;
+      this.emitState();
+    }
   }
 
   async setCodexSettings(
@@ -1163,6 +1307,11 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const chat = activeChatForProject(project);
     if (!chat) throw new Error("Active project does not have an active chat.");
     return { project, chat };
+  }
+
+  private async requireSyncedChatContext(chatId?: string): Promise<ChatContext> {
+    const context = await this.requireChatContext(chatId);
+    return await this.syncChatSubagentsFromSessionLog(context, true) ?? context;
   }
 
   private async requireChatContextForPrompt(text: string, chatId?: string): Promise<ChatContext> {
@@ -1375,6 +1524,13 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     if (method === "turn/plan/updated" && threadId) {
       this.todosByThread.set(threadId, todoItemsFromPlanNotification(params));
+    }
+
+    if ((method === "item/started" || method === "item/completed") && threadId) {
+      const item = recordFromUnknown(params?.item);
+      if (item && normalizeThreadItemType(item as CodexThreadItem) === "sub-agent") {
+        void this.rememberSubagentFromItem(threadId, item);
+      }
     }
 
     if (method === "item/agentMessage/delta") {
@@ -2221,6 +2377,113 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return null;
   }
 
+  private async syncProjectSubagentsFromSessionLogs(project: VoiceProject): Promise<boolean> {
+    let changed = false;
+    for (const chat of project.chats) {
+      if (chat.archivedAt || !chat.codexThreadId) continue;
+      const synced = await this.syncChatSubagentsFromSessionLog({ project, chat }, false);
+      changed ||= Boolean(synced);
+    }
+    return changed;
+  }
+
+  private async syncChatSubagentsFromSessionLog(
+    context: ChatContext,
+    force: boolean,
+  ): Promise<ChatContext | null> {
+    const threadId = context.chat.codexThreadId;
+    if (!threadId) return null;
+
+    const nowMs = Date.now();
+    const lastSyncAt = this.subagentLogSyncAtByThread.get(threadId) ?? 0;
+    if (!force && nowMs - lastSyncAt < 2_000) return null;
+    this.subagentLogSyncAtByThread.set(threadId, nowMs);
+
+    const logPath = await findCodexSessionLogPath(threadId);
+    if (!logPath) return null;
+
+    const subagents = subagentsFromSessionLogText(threadId, await readFile(logPath, "utf8"));
+    if (subagents.length === 0 || sameSubagents(context.chat.subagents, subagents)) return null;
+
+    const updatedProject = await this.store.updateChat(context.project.id, context.chat.id, { subagents });
+    const updatedChat = updatedProject.chats.find((candidate) => candidate.id === context.chat.id) ?? null;
+    if (!updatedChat) return null;
+    return { project: updatedProject, chat: updatedChat };
+  }
+
+  private async rememberSubagentFromItem(parentThreadId: string, item: Record<string, unknown>): Promise<void> {
+    const childThreadId =
+      firstStringField(item, ["newThreadId", "receiverThreadId", "threadId", "childThreadId"]) ?? null;
+    if (!childThreadId || childThreadId === parentThreadId) return;
+
+    const context = await this.findChatByThread(parentThreadId);
+    if (!context) return;
+
+    const now = new Date().toISOString();
+    const existing = context.chat.subagents ?? [];
+    const current = existing.find((subagent) => subagent.threadId === childThreadId) ?? null;
+    const status = firstStringField(item, ["agentStatus", "status", "phase"]);
+    const displayName =
+      firstStringField(item, ["name", "agentName", "displayName", "title", "label", "tool"]) ??
+      current?.displayName ??
+      "Subagent";
+    const nextSubagent: VoiceSubagentThread = {
+      id: current?.id ?? firstStringField(item, ["id", "itemId", "taskId"]) ?? `subagent:${childThreadId}`,
+      displayName,
+      threadId: childThreadId,
+      status: status ?? current?.status ?? null,
+      createdAt: current?.createdAt ?? now,
+      updatedAt: now,
+      raw: item,
+    };
+
+    const subagents = [
+      ...existing.filter((subagent) => subagent.threadId !== childThreadId),
+      nextSubagent,
+    ];
+    await this.store.updateChat(context.project.id, context.chat.id, { subagents });
+    this.emitState();
+  }
+
+  private enrichSubagents(subagents: VoiceSubagentSummary[]): VoiceSubagentSummary[] {
+    return subagents.map((subagent) => ({
+      ...subagent,
+      activeTurnId: this.activeTurnByThread.get(subagent.threadId) ?? null,
+      threadStatus: this.threadStatusByThread.get(subagent.threadId) ?? null,
+    }));
+  }
+
+  private replayRecordingState(): ReplayRecordingState {
+    return { active: this.activeReplaySession };
+  }
+
+  private async captureReplaySnapshot(reason: "start", project: VoiceProject, chat: VoiceChat): Promise<void> {
+    const parentSummary = chat.codexThreadId
+      ? await this.getThreadSummary(chat.codexThreadId)
+      : emptyActiveThreadSummary({
+          status: "empty",
+          project,
+          chat,
+          errorMessage: "Chat does not have a Codex thread yet.",
+        });
+    const subagents = this.enrichSubagents(visibleSubagentsForChat(chat));
+    const subagentSummaries = await Promise.all(
+      subagents.map(async (subagent) => ({
+        subagent,
+        summary: await this.getThreadSummary(subagent.threadId),
+      })),
+    );
+    this.emitEvent("app", "replayThreadSnapshot", "Captured replay thread snapshot.", {
+      reason,
+      projectId: project.id,
+      chatId: chat.id,
+      threadId: chat.codexThreadId,
+      parentSummary,
+      subagents,
+      subagentSummaries,
+    });
+  }
+
   private emitState(): void {
     void this.state().then((state) => this.emit("state", state));
   }
@@ -2417,6 +2680,296 @@ export function progressItemsFromThread(
   }
 
   return progress.slice(-18);
+}
+
+export function visibleSubagentsForChat(chat: VoiceChat): VoiceSubagentSummary[] {
+  const summaries = new Map<string, VoiceSubagentSummary>();
+
+  for (const subagent of chat.subagents ?? []) {
+    summaries.set(subagent.threadId, {
+      id: subagent.id,
+      parentChatId: chat.id,
+      parentChatName: chat.displayName,
+      title: subagent.displayName,
+      threadId: subagent.threadId,
+      detail: subagent.status ?? "Child thread",
+      status: subagent.status,
+      activeTurnId: null,
+      threadStatus: null,
+      source: "stored",
+    });
+  }
+
+  for (const item of chat.lastTurnOutput?.items ?? []) {
+    const record = recordFromUnknown(item);
+    if (!record || normalizeThreadItemType(record as CodexThreadItem) !== "sub-agent") continue;
+
+    const threadId =
+      firstStringField(record, ["newThreadId", "receiverThreadId", "threadId", "childThreadId"]) ?? null;
+    if (!threadId) continue;
+
+    const status = firstStringField(record, ["agentStatus", "status", "phase"]);
+    const prompt = firstStringField(record, ["prompt", "description", "detail", "summary"]);
+    const existing = summaries.get(threadId);
+    if (existing) {
+      summaries.set(threadId, {
+        ...existing,
+        detail: status ?? prompt ?? existing.detail,
+        status: status ?? existing.status,
+      });
+      continue;
+    }
+
+    summaries.set(threadId, {
+      id: firstStringField(record, ["id", "itemId", "taskId"]) ?? `subagent:${threadId}`,
+      parentChatId: chat.id,
+      parentChatName: chat.displayName,
+      title: firstStringField(record, ["name", "agentName", "displayName", "title", "label", "tool"]) ?? "Subagent",
+      threadId,
+      detail: status ?? prompt ?? "Child thread",
+      status,
+      activeTurnId: null,
+      threadStatus: null,
+      source: "turn-output",
+    });
+  }
+
+  return [...summaries.values()];
+}
+
+export function subagentsFromSessionLogText(parentThreadId: string, text: string): VoiceSubagentThread[] {
+  const spawnCalls = new Map<string, { message: string; createdAt: string | null }>();
+  const subagents = new Map<string, VoiceSubagentThread>();
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const entry = parseJsonRecord(line);
+    const timestamp = firstStringField(entry, ["timestamp"]);
+    const payload = recordField(entry, "payload");
+    if (!payload || entry.type !== "response_item") continue;
+
+    if (payload.type === "function_call") {
+      const name = firstStringField(payload, ["name"]);
+      if (name === "spawn_agent") {
+        const callId = firstStringField(payload, ["call_id", "callId", "id"]);
+        if (callId) {
+          spawnCalls.set(callId, {
+            message: spawnMessageFromArguments(firstStringField(payload, ["arguments"])),
+            createdAt: timestamp,
+          });
+        }
+        continue;
+      }
+
+      if (name === "close_agent") {
+        const target = targetAgentFromArguments(firstStringField(payload, ["arguments"]));
+        if (target) {
+          const current = subagents.get(target);
+          if (current) {
+            subagents.set(target, {
+              ...current,
+              status: "closed",
+              updatedAt: timestamp ?? current.updatedAt,
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (payload.type !== "function_call_output") continue;
+    const callId = firstStringField(payload, ["call_id", "callId"]);
+    const output = firstStringField(payload, ["output"]);
+    if (!callId || !output) continue;
+
+    const spawn = spawnCalls.get(callId);
+    if (spawn) {
+      const outputRecord = parseJsonRecord(output);
+      const childThreadId = firstStringField(outputRecord, ["agent_id", "agentId", "threadId"]);
+      if (!childThreadId || childThreadId === parentThreadId) continue;
+      const nickname = firstStringField(outputRecord, ["nickname", "name", "agentName"]);
+      subagents.set(childThreadId, {
+        id: childThreadId,
+        displayName: nickname ?? titleFromSpawnMessage(spawn.message),
+        threadId: childThreadId,
+        status: "running",
+        createdAt: spawn.createdAt ?? timestamp ?? undefined,
+        updatedAt: timestamp ?? undefined,
+        raw: { callId, message: spawn.message, output: outputRecord },
+      });
+      continue;
+    }
+
+    const outputRecord = parseJsonRecord(output);
+    const status = recordField(outputRecord, "status");
+    if (!status) continue;
+    for (const [childThreadId, value] of Object.entries(status)) {
+      const current = subagents.get(childThreadId);
+      if (!current || !value || typeof value !== "object" || Array.isArray(value)) continue;
+      const childStatus = value as Record<string, unknown>;
+      const label = firstStringField(childStatus, ["completed"])
+        ? "completed"
+        : firstStringField(childStatus, ["failed"])
+          ? "failed"
+          : firstStringField(childStatus, ["status"]) ?? current.status;
+      subagents.set(childThreadId, {
+        ...current,
+        status: label,
+        updatedAt: timestamp ?? current.updatedAt,
+      });
+    }
+  }
+
+  return [...subagents.values()];
+}
+
+function spawnMessageFromArguments(value: string | null): string {
+  if (!value) return "";
+  return firstStringField(parseJsonRecord(value), ["message", "task", "prompt"]) ?? "";
+}
+
+function targetAgentFromArguments(value: string | null): string | null {
+  if (!value) return null;
+  return firstStringField(parseJsonRecord(value), ["target", "agent_id", "agentId", "threadId"]);
+}
+
+function titleFromSpawnMessage(message: string): string {
+  const firstLine = message.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+  const role = firstLine.match(/^Role:\s*(.+)$/i)?.[1]?.trim();
+  if (role) return role.slice(0, 64);
+  const worker = firstLine.match(/^You are ([^.]+)\./i)?.[1]?.trim();
+  if (worker) return worker.slice(0, 64);
+  return "Subagent";
+}
+
+function sameSubagents(left: VoiceSubagentThread[] | undefined, right: VoiceSubagentThread[]): boolean {
+  return JSON.stringify((left ?? []).map(stableSubagentForCompare)) ===
+    JSON.stringify(right.map(stableSubagentForCompare));
+}
+
+function stableSubagentForCompare(subagent: VoiceSubagentThread): Record<string, string | null> {
+  return {
+    id: subagent.id,
+    displayName: subagent.displayName,
+    threadId: subagent.threadId,
+    status: subagent.status,
+  };
+}
+
+async function findCodexSessionLogPath(threadId: string): Promise<string | null> {
+  const home = process.env.HOME;
+  if (!home) return null;
+  return findFileUnder(path.join(home, ".codex", "sessions"), (filePath) =>
+    filePath.endsWith(".jsonl") && path.basename(filePath).includes(threadId),
+  );
+}
+
+async function findFileUnder(
+  folderPath: string,
+  predicate: (filePath: string) => boolean,
+): Promise<string | null> {
+  let entries;
+  try {
+    entries = await readdir(folderPath, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of entries) {
+    const entryPath = path.join(folderPath, entry.name);
+    if (entry.isFile() && predicate(entryPath)) return entryPath;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const match = await findFileUnder(path.join(folderPath, entry.name), predicate);
+    if (match) return match;
+  }
+
+  return null;
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  try {
+    return recordFromUnknown(JSON.parse(value)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+export function resolveVisibleSubagentTarget(
+  subagents: VoiceSubagentSummary[],
+  target?: string,
+): VoiceSubagentSummary {
+  const visible = subagents.filter((subagent) => subagent.threadId);
+  if (visible.length === 0) {
+    throw new Error("There are no visible child subagents for the selected chat.");
+  }
+
+  const rawTarget = target?.trim() ?? "";
+  if (!rawTarget) {
+    if (visible.length === 1) return visible[0];
+    throw new Error(`More than one child subagent is visible: ${subagentChoices(visible)}.`);
+  }
+
+  const ordinal = ordinalIndex(rawTarget);
+  if (ordinal !== null) {
+    const subagent = visible[ordinal];
+    if (subagent) return subagent;
+    throw new Error(`No visible child subagent matched "${rawTarget}". Available: ${subagentChoices(visible)}.`);
+  }
+
+  const needle = normalizeSubagentTarget(rawTarget);
+  const exact = visible.filter((subagent) =>
+    subagentTargetFields(subagent).some((field) => normalizeSubagentTarget(field) === needle),
+  );
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new Error(`More than one child subagent matched "${rawTarget}": ${subagentChoices(exact)}.`);
+  }
+
+  const partial = visible.filter((subagent) =>
+    subagentTargetFields(subagent).some((field) => normalizeSubagentTarget(field).includes(needle)),
+  );
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    throw new Error(`More than one child subagent matched "${rawTarget}": ${subagentChoices(partial)}.`);
+  }
+
+  throw new Error(`No visible child subagent matched "${rawTarget}". Available: ${subagentChoices(visible)}.`);
+}
+
+function subagentTargetFields(subagent: VoiceSubagentSummary): string[] {
+  return [
+    subagent.id,
+    subagent.title,
+    subagent.detail,
+    subagent.status,
+    subagent.threadStatus,
+    subagent.threadId,
+  ].filter((value): value is string => Boolean(value));
+}
+
+function subagentChoices(subagents: VoiceSubagentSummary[]): string {
+  return subagents
+    .map((subagent, index) => {
+      const status = subagent.status ?? subagent.threadStatus ?? subagent.detail;
+      return `${index + 1}. ${subagent.title}${status ? ` (${status})` : ""}`;
+    })
+    .join("; ");
+}
+
+function ordinalIndex(value: string): number | null {
+  const normalized = value.trim().toLowerCase();
+  if (/^\d+$/.test(normalized)) return Number(normalized) - 1;
+  if (["first", "1st", "one"].includes(normalized)) return 0;
+  if (["second", "2nd", "two"].includes(normalized)) return 1;
+  if (["third", "3rd", "three"].includes(normalized)) return 2;
+  return null;
+}
+
+function normalizeSubagentTarget(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
 function artifactCandidatesFromTurn(turn: CodexThreadTurn, index: number): ThreadArtifactCandidate[] {

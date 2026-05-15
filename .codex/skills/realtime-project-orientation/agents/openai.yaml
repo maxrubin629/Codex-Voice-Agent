@@ -1,0 +1,4 @@
+interface:
+  display_name: "Realtime Project Orientation"
+  short_description: "Create Realtime project context docs"
+  default_prompt: "Use $realtime-project-orientation to draft a Realtime-ready project orientation document."

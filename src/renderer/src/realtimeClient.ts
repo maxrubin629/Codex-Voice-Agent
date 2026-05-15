@@ -2,6 +2,7 @@ import type {
   AppEvent,
   ApprovalDecision,
   AppState,
+  ActiveThreadSummary,
   CodexPermissionMode,
   CodexSettingsScope,
   CodexTurnOutput,
@@ -702,6 +703,7 @@ export class RealtimeVoiceClient {
     if (!this.dc || this.dc.readyState !== "open") {
       throw new Error("Realtime data channel is not open.");
     }
+    this.log("outbound", realtimeOutboundLabel(payload), payload);
     this.dc.send(JSON.stringify(payload));
   }
 
@@ -854,6 +856,30 @@ async function callVoiceTool(
       runtime: state.runtime,
       codexSettings: state.codexSettings,
     };
+  }
+
+  if (name === "list_codex_subagents") {
+    const result = await window.codexVoice.listSubagents(
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
+    );
+    return { ok: true, ...result };
+  }
+
+  if (name === "inspect_codex_subagent") {
+    const result = await window.codexVoice.inspectSubagent(
+      optionalString(args.target),
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
+    );
+    return { ok: true, ...summarizeSubagentInspection(result) };
+  }
+
+  if (name === "steer_codex_subagent") {
+    const result = await window.codexVoice.steerSubagent(
+      optionalString(args.target),
+      stringArg(args.message),
+      await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
+    );
+    return { ok: true, message: "Child subagent received the update.", ...result };
   }
 
   if (name === "answer_codex_approval") {
@@ -1015,6 +1041,37 @@ function safeJson(raw: string | undefined): Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function realtimeOutboundLabel(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "Realtime outbound message.";
+  const type = stringValue((payload as { type?: unknown }).type) ?? "message";
+  if (type === "conversation.item.create") {
+    const item = (payload as { item?: { type?: unknown } }).item;
+    const itemType = item && typeof item === "object" ? stringValue(item.type) : undefined;
+    return `Realtime outbound ${type}${itemType ? ` (${itemType})` : ""}.`;
+  }
+  if (type === "response.create") return "Realtime outbound response.create.";
+  return `Realtime outbound ${type}.`;
+}
+
+function summarizeSubagentInspection(result: { subagent: unknown; summary: ActiveThreadSummary }): Record<string, unknown> {
+  const summary = result.summary;
+  return {
+    subagent: result.subagent,
+    summary: {
+      status: summary.status,
+      latestTurnStatus: summary.latestTurnStatus,
+      latestAssistantText: summary.latestAssistantText,
+      turnCount: summary.turnCount,
+      progress: summary.progress.slice(-8).map((item) => ({
+        label: item.label,
+        detail: item.detail,
+        status: item.status,
+        sourceType: item.sourceType,
+      })),
+    },
+  };
 }
 
 function stringArg(value: unknown): string {

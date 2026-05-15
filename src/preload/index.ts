@@ -8,6 +8,9 @@ import type {
   CodexServiceTier,
   CodexVoiceApi,
   ReasoningEffort,
+  ReplaySessionLoadResult,
+  ReplaySessionMetadata,
+  ReplayRecordingState,
   ToolQuestionAnswer,
   WindowChromeState,
 } from "../shared/types";
@@ -22,6 +25,20 @@ const api: CodexVoiceApi = {
   getEvents: () => ipcRenderer.invoke("app:getEvents"),
   clearEvents: () => ipcRenderer.invoke("app:clearEvents"),
   logEvent: (event: AppEvent) => ipcRenderer.invoke("app:logEvent", event),
+  listReplaySessions: (projectId?: string) =>
+    ipcRenderer.invoke("replay:list", { projectId }) as Promise<ReplaySessionMetadata[]>,
+  getReplayRecordingState: () =>
+    ipcRenderer.invoke("replay:recordingState") as Promise<ReplayRecordingState>,
+  startReplayRecording: (name?: string) =>
+    ipcRenderer.invoke("replay:start", { name }) as Promise<ReplaySessionMetadata>,
+  stopReplayRecording: () => ipcRenderer.invoke("replay:stop") as Promise<ReplaySessionMetadata | null>,
+  loadReplaySession: (projectId: string, replayId: string) =>
+    ipcRenderer.invoke("replay:load", { projectId, replayId }) as Promise<ReplaySessionLoadResult>,
+  renameReplaySession: (projectId: string, replayId: string, name: string) =>
+    ipcRenderer.invoke("replay:rename", { projectId, replayId, name }) as Promise<ReplaySessionMetadata>,
+  deleteReplaySession: (projectId: string, replayId: string) =>
+    ipcRenderer.invoke("replay:delete", { projectId, replayId }),
+  deleteAllReplaySessions: (projectId?: string) => ipcRenderer.invoke("replay:deleteAll", { projectId }),
   selectWorkspaceFolder: () => ipcRenderer.invoke("projects:selectWorkspaceFolder"),
   setWorkspaceFolder: (workspacePath: string, name?: string | null) =>
     ipcRenderer.invoke("projects:setWorkspaceFolder", { workspacePath, name }),
@@ -51,6 +68,11 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("codex:cancelQueued", { queuedId, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
   getChatStatus: (chatId?: string) => ipcRenderer.invoke("projects:chatStatus", { chatId }),
+  listSubagents: (chatId?: string) => ipcRenderer.invoke("codex:listSubagents", { chatId }),
+  inspectSubagent: (target?: string, chatId?: string) =>
+    ipcRenderer.invoke("codex:inspectSubagent", { target, chatId }),
+  steerSubagent: (target: string | undefined, text: string, chatId?: string) =>
+    ipcRenderer.invoke("codex:steerSubagent", { target, text, chatId }),
   setCodexSettings: (
     settings: {
       model?: string | null;

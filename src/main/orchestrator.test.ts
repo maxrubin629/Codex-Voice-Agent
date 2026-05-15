@@ -11,12 +11,15 @@ import {
   mcpToolGrantFromRequest,
   normalizeThreadItemType,
   progressItemsFromThread,
+  resolveVisibleSubagentTarget,
+  subagentsFromSessionLogText,
   threadTurnsHaveVoiceBridgePrompt,
   todoItemsFromPlanNotification,
+  visibleSubagentsForChat,
   type CodexThreadItem,
   type CodexThreadTurn,
 } from "./orchestrator";
-import type { PendingCodexRequest } from "../shared/types";
+import type { PendingCodexRequest, VoiceChat } from "../shared/types";
 
 function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
@@ -129,7 +132,174 @@ describe("subagent item parsing", () => {
       },
     ]);
   });
+
+  it("derives visible child subagents from stored state and latest turn output", () => {
+    const chat = chatWithSubagents({
+      subagents: [
+        {
+          id: "stored-worker",
+          displayName: "Stored worker",
+          threadId: "thread-stored",
+          status: "running",
+        },
+      ],
+      lastTurnOutput: {
+        threadId: "parent-thread",
+        turnId: "turn-1",
+        status: "completed",
+        finalAssistantText: "Done",
+        items: [
+          {
+            id: "item-stored",
+            type: "collabAgentToolCall",
+            newThreadId: "thread-stored",
+            agentStatus: "completed",
+            prompt: "stored worker finished",
+          },
+          {
+            id: "item-tests",
+            type: "remote-task-created",
+            newThreadId: "thread-tests",
+            agentName: "Tests worker",
+            agentStatus: "running",
+          },
+        ],
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
+      },
+    });
+
+    expect(visibleSubagentsForChat(chat)).toMatchObject([
+      {
+        id: "stored-worker",
+        title: "Stored worker",
+        threadId: "thread-stored",
+        detail: "completed",
+        status: "completed",
+        source: "stored",
+      },
+      {
+        id: "item-tests",
+        title: "Tests worker",
+        threadId: "thread-tests",
+        detail: "running",
+        status: "running",
+        source: "turn-output",
+      },
+    ]);
+  });
+
+  it("resolves child subagents by semantic target without allowing invisible threads", () => {
+    const subagents = visibleSubagentsForChat(chatWithSubagents({
+      lastTurnOutput: {
+        threadId: "parent-thread",
+        turnId: "turn-1",
+        status: "completed",
+        finalAssistantText: "Done",
+        items: [
+          {
+            id: "item-tests",
+            type: "remote-task-created",
+            newThreadId: "thread-tests",
+            agentName: "Tests worker",
+            agentStatus: "running",
+          },
+          {
+            id: "item-ui",
+            type: "remote-task-created",
+            newThreadId: "thread-ui",
+            agentName: "UI worker",
+            agentStatus: "waiting",
+          },
+        ],
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
+      },
+    }));
+
+    expect(resolveVisibleSubagentTarget(subagents, "tests").threadId).toBe("thread-tests");
+    expect(resolveVisibleSubagentTarget(subagents, "second").threadId).toBe("thread-ui");
+    expect(() => resolveVisibleSubagentTarget(subagents, "thread-not-visible")).toThrow(
+      /No visible child subagent matched/,
+    );
+    expect(() => resolveVisibleSubagentTarget(subagents)).toThrow(/More than one child subagent is visible/);
+  });
+
+  it("extracts spawned child agents from local session log records", () => {
+    const log = [
+      {
+        timestamp: "2026-05-14T05:49:10.448Z",
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "spawn_agent",
+          call_id: "call_spawn",
+          arguments: JSON.stringify({
+            message: "Role: Data Center Research. Gather sources.",
+          }),
+        },
+      },
+      {
+        timestamp: "2026-05-14T05:49:10.999Z",
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "call_spawn",
+          output: JSON.stringify({
+            agent_id: "019e2508-3630-7043-bf28-90c73040f168",
+            nickname: "Leibniz",
+          }),
+        },
+      },
+      {
+        timestamp: "2026-05-14T05:51:10.999Z",
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          call_id: "call_wait",
+          output: JSON.stringify({
+            status: {
+              "019e2508-3630-7043-bf28-90c73040f168": {
+                completed: "Done",
+              },
+            },
+          }),
+        },
+      },
+    ].map((entry) => JSON.stringify(entry)).join("\n");
+
+    expect(subagentsFromSessionLogText("parent-thread", log)).toMatchObject([
+      {
+        id: "019e2508-3630-7043-bf28-90c73040f168",
+        displayName: "Leibniz",
+        threadId: "019e2508-3630-7043-bf28-90c73040f168",
+        status: "completed",
+      },
+    ]);
+  });
 });
+
+function chatWithSubagents(patch: Partial<VoiceChat>): VoiceChat {
+  return {
+    id: "chat-1",
+    displayName: "Main chat",
+    codexThreadId: "parent-thread",
+    voiceBridgePromptInjectedAt: null,
+    model: "gpt-5.5",
+    reasoningEffort: "medium",
+    serviceTier: null,
+    permissionMode: "default",
+    createdAt: "2026-05-13T00:00:00.000Z",
+    updatedAt: "2026-05-13T00:00:00.000Z",
+    archivedAt: null,
+    lastSummary: null,
+    lastStatus: null,
+    lastTurnOutput: null,
+    ...patch,
+  };
+}
 
 describe("MCP OK grant request parsing", () => {
   function request(method: string, params: Record<string, unknown>): PendingCodexRequest {

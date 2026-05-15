@@ -102,7 +102,7 @@ export const DEFAULT_CODEX_MODEL = "gpt-5.5";
 export const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = "medium";
 export const DEFAULT_CODEX_SERVICE_TIER: CodexServiceTier | null = null;
 export const FAST_CODEX_SERVICE_TIER: CodexServiceTier = "priority";
-export const DEFAULT_CODEX_PERMISSION_MODE: CodexPermissionMode = "default";
+export const DEFAULT_CODEX_PERMISSION_MODE: CodexPermissionMode = "auto-review";
 
 export const CODEX_PERMISSION_PROFILES: CodexPermissionProfile[] = [
   {
@@ -205,6 +205,35 @@ export type VoiceSubagentThread = {
   createdAt?: string | null;
   updatedAt?: string | null;
   raw?: unknown;
+};
+
+export type VoiceSubagentSummary = {
+  id: string;
+  parentChatId: string;
+  parentChatName: string;
+  title: string;
+  threadId: string;
+  detail: string;
+  status: string | null;
+  activeTurnId: string | null;
+  threadStatus: string | null;
+  source: "stored" | "turn-output";
+};
+
+export type VoiceSubagentListResult = {
+  chatId: string;
+  chatName: string;
+  subagents: VoiceSubagentSummary[];
+};
+
+export type VoiceSubagentInspectResult = {
+  subagent: VoiceSubagentSummary;
+  summary: ActiveThreadSummary;
+};
+
+export type VoiceSubagentSteerResult = {
+  subagent: VoiceSubagentSummary;
+  turnId: string;
 };
 
 export type CodexTurnOutput = {
@@ -446,6 +475,7 @@ export type AppState = {
     apiKeyEncrypted: boolean;
   };
   phone: PhoneStatus;
+  replay: ReplayRecordingState;
 };
 
 export type PhoneSettings = {
@@ -526,6 +556,28 @@ export type AppEvent = {
   raw?: unknown;
 };
 
+export type ReplaySessionMetadata = {
+  id: string;
+  name: string;
+  projectId: string;
+  projectName: string;
+  chatId: string | null;
+  chatName: string | null;
+  threadId: string | null;
+  startedAt: string;
+  stoppedAt: string | null;
+  eventCount: number;
+};
+
+export type ReplayRecordingState = {
+  active: ReplaySessionMetadata | null;
+};
+
+export type ReplaySessionLoadResult = {
+  metadata: ReplaySessionMetadata;
+  events: AppEvent[];
+};
+
 export type VoiceTranscriptMessageSource = "realtime" | "codex" | "app";
 export type VoiceTranscriptMessageRole = "user" | "assistant";
 export type VoiceTranscriptMessageStatus = "completed" | "streaming" | "interrupted" | "error";
@@ -575,6 +627,14 @@ export type CodexVoiceApi = {
   getEvents(): Promise<AppEvent[]>;
   clearEvents(): Promise<void>;
   logEvent(event: AppEvent): Promise<void>;
+  listReplaySessions(projectId?: string): Promise<ReplaySessionMetadata[]>;
+  getReplayRecordingState(): Promise<ReplayRecordingState>;
+  startReplayRecording(name?: string): Promise<ReplaySessionMetadata>;
+  stopReplayRecording(): Promise<ReplaySessionMetadata | null>;
+  loadReplaySession(projectId: string, replayId: string): Promise<ReplaySessionLoadResult>;
+  renameReplaySession(projectId: string, replayId: string, name: string): Promise<ReplaySessionMetadata>;
+  deleteReplaySession(projectId: string, replayId: string): Promise<void>;
+  deleteAllReplaySessions(projectId?: string): Promise<void>;
   selectWorkspaceFolder(): Promise<SelectedWorkspaceFolder | null>;
   setWorkspaceFolder(workspacePath: string, name?: string | null): Promise<VoiceProject>;
   createProject(name?: string, workspacePath?: string | null): Promise<VoiceProject>;
@@ -601,6 +661,9 @@ export type CodexVoiceApi = {
   ): Promise<CancelQueuedCodexRequestResult>;
   interruptCodex(chatId?: string): Promise<void>;
   getChatStatus(chatId?: string): Promise<CodexChatRuntime[]>;
+  listSubagents(chatId?: string): Promise<VoiceSubagentListResult>;
+  inspectSubagent(target?: string, chatId?: string): Promise<VoiceSubagentInspectResult>;
+  steerSubagent(target: string | undefined, text: string, chatId?: string): Promise<VoiceSubagentSteerResult>;
   setCodexSettings(
     settings: {
       model?: string | null;

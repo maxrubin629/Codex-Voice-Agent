@@ -1,9 +1,10 @@
 import { app } from "electron";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  type AppEvent,
   type CodexTurnOutput,
   DEFAULT_CODEX_MODEL,
   DEFAULT_CODEX_PERMISSION_MODE,
@@ -12,8 +13,11 @@ import {
   type CodexPermissionMode,
   type CodexServiceTier,
   type ReasoningEffort,
+  type ReplaySessionLoadResult,
+  type ReplaySessionMetadata,
   type VoiceChat,
   type VoiceProject,
+  type VoiceSubagentThread,
   type VoiceTranscriptMessage,
   type VoiceTranscriptMessageRole,
   type VoiceTranscriptMessageSource,
@@ -30,8 +34,12 @@ type ListProjectsOptions = {
 };
 
 const INDEX_FILE = ".codex-voice-projects.json";
-const PROJECT_FILE = ".codex-voice-project.json";
-const TRANSCRIPT_FOLDER = ".codex-voice-transcripts";
+const AGENT_FOLDER = ".codex-voice-agent";
+const PROJECT_FILE = "project.json";
+const TRANSCRIPT_FOLDER = "transcripts";
+const REPLAY_FOLDER = "replays";
+const REPLAY_METADATA_FILE = "metadata.json";
+const REPLAY_EVENTS_FILE = "events.jsonl";
 const MAX_TRANSCRIPT_MESSAGES = 5_000;
 
 export class ProjectStore {
@@ -126,7 +134,9 @@ export class ProjectStore {
         nextProject,
         ...index.projects.filter((existing) => existing.id !== project.id),
       ];
-      await this.writeJsonAtomic(path.join(project.folderPath, PROJECT_FILE), nextProject);
+      const projectPath = this.projectPath(project.folderPath);
+      await mkdir(path.dirname(projectPath), { recursive: true });
+      await this.writeJsonAtomic(projectPath, nextProject);
       await this.writeIndex({ version: 1, projects: nextProjects });
       return nextProject;
     });
@@ -320,6 +330,124 @@ export class ProjectStore {
     });
   }
 
+  async listReplaySessions(projectId: string): Promise<ReplaySessionMetadata[]> {
+    const project = await this.getProject(projectId, { includeArchived: true });
+    if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+    try {
+      const entries = await readdir(this.replayFolderPath(project), { withFileTypes: true });
+      const sessions: ReplaySessionMetadata[] = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const metadata = await this.readReplayMetadata(project, entry.name);
+        if (metadata) sessions.push(metadata);
+      }
+      return sessions.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+    } catch {
+      return [];
+    }
+  }
+
+  async createReplaySession({
+    projectId,
+    chatId,
+    threadId,
+    name,
+  }: {
+    projectId: string;
+    chatId: string | null;
+    threadId: string | null;
+    name?: string | null;
+  }): Promise<ReplaySessionMetadata> {
+    return this.enqueueMutation(async () => {
+      const project = await this.getProject(projectId, { includeArchived: true });
+      if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+      const chat = chatId ? project.chats.find((candidate) => candidate.id === chatId) ?? null : null;
+      if (chatId && !chat) throw new Error(`Unknown chat: ${chatId}`);
+
+      const id = randomUUID();
+      const startedAt = new Date().toISOString();
+      const metadata: ReplaySessionMetadata = {
+        id,
+        name: cleanReplayName(name) ?? defaultReplayName(chat?.displayName ?? project.displayName, startedAt),
+        projectId: project.id,
+        projectName: project.displayName,
+        chatId: chat?.id ?? null,
+        chatName: chat?.displayName ?? null,
+        threadId: threadId ?? chat?.codexThreadId ?? null,
+        startedAt,
+        stoppedAt: null,
+        eventCount: 0,
+      };
+      await mkdir(this.replaySessionPath(project, id), { recursive: true });
+      await this.writeJsonAtomic(this.replayMetadataPath(project, id), metadata);
+      await this.writeTextAtomic(this.replayEventsPath(project, id), "");
+      return metadata;
+    });
+  }
+
+  async appendReplayEvent(projectId: string, replayId: string, event: AppEvent): Promise<ReplaySessionMetadata | null> {
+    return this.enqueueMutation(async () => {
+      const project = await this.getProject(projectId, { includeArchived: true });
+      if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+      const metadata = await this.readReplayMetadata(project, replayId);
+      if (!metadata) return null;
+      await mkdir(this.replaySessionPath(project, replayId), { recursive: true });
+      await appendFile(this.replayEventsPath(project, replayId), `${JSON.stringify(event)}\n`, { mode: 0o600 });
+      const updated = { ...metadata, eventCount: metadata.eventCount + 1 };
+      await this.writeJsonAtomic(this.replayMetadataPath(project, replayId), updated);
+      return updated;
+    });
+  }
+
+  async finalizeReplaySession(projectId: string, replayId: string): Promise<ReplaySessionMetadata | null> {
+    return this.enqueueMutation(async () => {
+      const project = await this.getProject(projectId, { includeArchived: true });
+      if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+      const metadata = await this.readReplayMetadata(project, replayId);
+      if (!metadata) return null;
+      const updated = { ...metadata, stoppedAt: metadata.stoppedAt ?? new Date().toISOString() };
+      await this.writeJsonAtomic(this.replayMetadataPath(project, replayId), updated);
+      return updated;
+    });
+  }
+
+  async loadReplaySession(projectId: string, replayId: string): Promise<ReplaySessionLoadResult> {
+    const project = await this.getProject(projectId, { includeArchived: true });
+    if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+    const metadata = await this.readReplayMetadata(project, replayId);
+    if (!metadata) throw new Error(`Unknown replay: ${replayId}`);
+    return {
+      metadata,
+      events: await this.readReplayEvents(project, replayId),
+    };
+  }
+
+  async renameReplaySession(projectId: string, replayId: string, name: string): Promise<ReplaySessionMetadata> {
+    return this.enqueueMutation(async () => {
+      const project = await this.getProject(projectId, { includeArchived: true });
+      if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+      const metadata = await this.readReplayMetadata(project, replayId);
+      if (!metadata) throw new Error(`Unknown replay: ${replayId}`);
+      const cleanName = cleanReplayName(name);
+      if (!cleanName) throw new Error("Replay name is required.");
+      const updated = { ...metadata, name: cleanName };
+      await this.writeJsonAtomic(this.replayMetadataPath(project, replayId), updated);
+      return updated;
+    });
+  }
+
+  async deleteReplaySession(projectId: string, replayId: string): Promise<void> {
+    const project = await this.getProject(projectId, { includeArchived: true });
+    if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+    await rm(this.replaySessionPath(project, replayId), { recursive: true, force: true });
+  }
+
+  async deleteAllReplaySessions(projectId: string): Promise<void> {
+    const project = await this.getProject(projectId, { includeArchived: true });
+    if (!project) throw new Error(`Unknown voice project: ${projectId}`);
+    await rm(this.replayFolderPath(project), { recursive: true, force: true });
+  }
+
   private async setChatArchived(
     projectId: string,
     chatId: string,
@@ -407,7 +535,7 @@ export class ProjectStore {
     const projects: VoiceProject[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      const projectPath = path.join(this.baseFolder, entry.name, PROJECT_FILE);
+      const projectPath = this.projectPath(path.join(this.baseFolder, entry.name));
       if (!existsSync(projectPath)) continue;
       try {
         const project = normalizeProject(JSON.parse(await readFile(projectPath, "utf8")));
@@ -438,8 +566,57 @@ export class ProjectStore {
     }
   }
 
+  private projectPath(projectFolderPath: string): string {
+    return path.join(projectFolderPath, AGENT_FOLDER, PROJECT_FILE);
+  }
+
   private transcriptPath(project: VoiceProject, chatId: string): string {
-    return path.join(project.folderPath, TRANSCRIPT_FOLDER, `${safeTranscriptFileName(chatId)}.jsonl`);
+    return path.join(project.folderPath, AGENT_FOLDER, TRANSCRIPT_FOLDER, `${safeTranscriptFileName(chatId)}.jsonl`);
+  }
+
+  private replayFolderPath(project: VoiceProject): string {
+    return path.join(project.folderPath, AGENT_FOLDER, REPLAY_FOLDER);
+  }
+
+  private replaySessionPath(project: VoiceProject, replayId: string): string {
+    return path.join(this.replayFolderPath(project), safeReplayId(replayId));
+  }
+
+  private replayMetadataPath(project: VoiceProject, replayId: string): string {
+    return path.join(this.replaySessionPath(project, replayId), REPLAY_METADATA_FILE);
+  }
+
+  private replayEventsPath(project: VoiceProject, replayId: string): string {
+    return path.join(this.replaySessionPath(project, replayId), REPLAY_EVENTS_FILE);
+  }
+
+  private async readReplayMetadata(project: VoiceProject, replayId: string): Promise<ReplaySessionMetadata | null> {
+    try {
+      const raw = await readFile(this.replayMetadataPath(project, replayId), "utf8");
+      return normalizeReplaySessionMetadata(JSON.parse(raw), project) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readReplayEvents(project: VoiceProject, replayId: string): Promise<AppEvent[]> {
+    try {
+      const raw = await readFile(this.replayEventsPath(project, replayId), "utf8");
+      return raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return normalizeReplayEvent(JSON.parse(line));
+          } catch {
+            return null;
+          }
+        })
+        .filter((event): event is AppEvent => Boolean(event));
+    } catch {
+      return [];
+    }
   }
 
   private async readTranscriptMessagesFile(filePath: string, chatId: string): Promise<VoiceTranscriptMessage[]> {
@@ -581,11 +758,17 @@ function normalizeChat(
     permissionMode?: CodexPermissionMode;
   };
   const hasStoredServiceTier = Object.prototype.hasOwnProperty.call(chat, "serviceTier");
+  const subagents = Array.isArray(chat.subagents)
+    ? chat.subagents
+        .map(normalizeSubagentThread)
+        .filter((subagent): subagent is VoiceSubagentThread => Boolean(subagent))
+    : undefined;
   return {
     id: String(chat.id ?? randomUUID()),
     displayName: String(chat.displayName ?? "New chat"),
     codexThreadId: stringOrNull(chat.codexThreadId),
     voiceBridgePromptInjectedAt: stringOrNull(chat.voiceBridgePromptInjectedAt),
+    ...(subagents ? { subagents } : {}),
     model: stringOrNull(chat.model) ?? fallbackModel,
     reasoningEffort: reasoningEffortOrNull(chat.reasoningEffort) ?? fallbackReasoningEffort,
     serviceTier: hasStoredServiceTier ? serviceTierOrNull(chat.serviceTier) : fallbackServiceTier,
@@ -596,6 +779,22 @@ function normalizeChat(
     lastSummary: chat.lastSummary ?? null,
     lastStatus: chat.lastStatus ?? null,
     lastTurnOutput: normalizeCodexTurnOutput(chat.lastTurnOutput),
+  };
+}
+
+function normalizeSubagentThread(value: unknown): VoiceSubagentThread | null {
+  const subagent = value as Partial<VoiceSubagentThread> & Record<string, unknown>;
+  const threadId = stringOrNull(subagent.threadId);
+  if (!threadId) return null;
+  const raw = subagent.raw;
+  return {
+    id: stringOrNull(subagent.id) ?? `subagent:${threadId}`,
+    displayName: stringOrNull(subagent.displayName) ?? "Subagent",
+    threadId,
+    status: stringOrNull(subagent.status),
+    ...(stringOrNull(subagent.createdAt) ? { createdAt: stringOrNull(subagent.createdAt) } : {}),
+    ...(stringOrNull(subagent.updatedAt) ? { updatedAt: stringOrNull(subagent.updatedAt) } : {}),
+    ...(raw !== undefined ? { raw } : {}),
   };
 }
 
@@ -710,6 +909,56 @@ function transcriptStatusOrNull(value: unknown): VoiceTranscriptMessageStatus | 
     : null;
 }
 
+function normalizeReplaySessionMetadata(value: unknown, project: VoiceProject): ReplaySessionMetadata | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Partial<ReplaySessionMetadata> & Record<string, unknown>;
+  const id = stringOrNull(record.id);
+  const startedAt = stringOrNull(record.startedAt);
+  if (!id || !startedAt) return null;
+  const chatId = stringOrNull(record.chatId);
+  const chat = chatId ? project.chats.find((candidate) => candidate.id === chatId) ?? null : null;
+  return {
+    id: safeReplayId(id),
+    name: cleanReplayName(record.name) ?? defaultReplayName(chat?.displayName ?? project.displayName, startedAt),
+    projectId: project.id,
+    projectName: stringOrNull(record.projectName) ?? project.displayName,
+    chatId: chat?.id ?? chatId,
+    chatName: stringOrNull(record.chatName) ?? chat?.displayName ?? null,
+    threadId: stringOrNull(record.threadId) ?? chat?.codexThreadId ?? null,
+    startedAt,
+    stoppedAt: stringOrNull(record.stoppedAt),
+    eventCount: Math.max(0, Math.floor(numberOrNull(record.eventCount) ?? 0)),
+  };
+}
+
+function normalizeReplayEvent(value: unknown): AppEvent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Partial<AppEvent> & Record<string, unknown>;
+  const at = stringOrNull(record.at);
+  const kind = stringOrNull(record.kind);
+  if (!at || !kind) return null;
+  const source = record.source === "codex" || record.source === "realtime" || record.source === "app"
+    ? record.source
+    : "app";
+  return {
+    at,
+    source,
+    kind,
+    message: typeof record.message === "string" ? record.message : String(record.message ?? ""),
+    ...(record.raw !== undefined ? { raw: record.raw } : {}),
+  };
+}
+
+function cleanReplayName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const cleaned = value.replace(/\s+/g, " ").trim();
+  return cleaned ? cleaned.slice(0, 120) : null;
+}
+
+function defaultReplayName(label: string, startedAt: string): string {
+  return `${label} ${new Date(startedAt).toLocaleString()}`;
+}
+
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
@@ -761,6 +1010,14 @@ function dateMs(value: unknown): number | null {
 
 function safeTranscriptFileName(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]/g, "_") || "chat";
+}
+
+function safeReplayId(value: string): string {
+  const cleaned = value.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    throw new Error("Invalid replay id.");
+  }
+  return cleaned;
 }
 
 function sanitizeProjectName(name: string): string {
