@@ -15,7 +15,7 @@ export type ApiKeyStatus = {
   encrypted: boolean;
 };
 
-const FILE_NAME = "codex-voice-secrets.json";
+const FILE_NAME = "cva-secrets.json";
 
 export function getOpenAiApiKey(): string | null {
   if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;

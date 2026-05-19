@@ -15,7 +15,7 @@ import type {
 import { getOpenAiApiKey } from "./apiKeyStore";
 import { realtimeConfig, realtimeTools } from "./realtime";
 
-const SETTINGS_FILE_NAME = "codex-voice-phone-settings.json";
+const SETTINGS_FILE_NAME = "cva-phone-settings.json";
 const OPENAI_CALLS_ENDPOINT = "https://api.openai.com/v1/realtime/calls";
 const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300;
 const DEFAULT_WEBHOOK_PATH = "/phone/realtime-webhook";
@@ -982,7 +982,7 @@ function phoneAcceptPayload(): unknown {
 
 function phoneRoutingInstructions(): string {
   return [
-    "You are the inbound phone layer for Codex Voice.",
+    "You are the inbound phone layer for Codex Voice Agent.",
     "Start by asking the caller which recent Codex chat or project they want to use, or whether they want to create a new one.",
     "Do not submit work to Codex, steer a running Codex turn, or claim any computer action has started until the caller has clearly chosen a destination.",
     "If the caller asks for coding work before choosing a destination, briefly route them first.",

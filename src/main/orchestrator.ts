@@ -3777,7 +3777,7 @@ function describeServerRequest(message: CodexJsonMessage): PendingCodexRequest {
       title: "ChatGPT auth refresh needed",
       subtitle: "Account token refresh",
       body:
-        "Codex app-server asked this client to refresh ChatGPT auth tokens. Codex Voice cannot refresh ChatGPT desktop auth tokens directly.",
+        "Codex app-server asked this client to refresh ChatGPT auth tokens. Codex Voice Agent cannot refresh ChatGPT desktop auth tokens directly.",
       details: detailList([
         detail("Reason", stringField(params.reason)),
         detail("Previous account", stringField(params.previousAccountId)),
@@ -4016,7 +4016,7 @@ function responseForDecision(request: PendingCodexRequest, decision: ApprovalDec
         contentItems: [
           {
             type: "inputText",
-            text: "Codex Voice cannot service dynamic app-server tool calls yet.",
+            text: "Codex Voice Agent cannot service dynamic app-server tool calls yet.",
           },
         ],
       },
@@ -4026,7 +4026,7 @@ function responseForDecision(request: PendingCodexRequest, decision: ApprovalDec
     return {
       kind: "error",
       message:
-        "Codex Voice cannot refresh ChatGPT auth tokens directly. Re-authenticate Codex from the desktop app or CLI, then retry.",
+        "Codex Voice Agent cannot refresh ChatGPT auth tokens directly. Re-authenticate Codex from the desktop app or CLI, then retry.",
     };
   }
   return { kind: "error", message: `Unsupported Codex server request method: ${method}` };

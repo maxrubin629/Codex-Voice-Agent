@@ -405,7 +405,7 @@ function App(): React.ReactElement {
   }, [error]);
 
   useEffect(() => {
-    document.title = windowKind === "debug" ? "Codex Voice Debug" : "Codex Voice";
+    document.title = windowKind === "debug" ? "Codex Voice Agent Debug" : "Codex Voice Agent";
     void refreshState();
     void refreshEvents();
     void window.codexVoice.getWindowChromeState().then(setWindowChromeState).catch(() => {
@@ -1214,7 +1214,7 @@ function VoiceHome({
       <div className="voice-shell">
         <div className="voice-home-content">
         <header className="voice-home-header">
-          <h1>Codex Voice</h1>
+          <h1>Codex Voice Agent</h1>
           {selectedSubagent && (
             <p className="voice-header-breadcrumb">
               {activeProject?.displayName ?? "Project"} / {selectedSubagent.parentTitle} / {selectedSubagent.title}
@@ -3323,7 +3323,7 @@ function DebugDashboard({
     <main className="debug-shell app-shell">
       <header className="topbar">
         <div>
-          <h1>Codex Voice Debug</h1>
+          <h1>Codex Voice Agent Debug</h1>
           <p>Voice is the front door. Codex owns the computer work.</p>
         </div>
         <div className="status-stack">
@@ -3451,7 +3451,7 @@ function DebugDashboard({
           </div>
           <p className="help">
             {state.realtime.available
-              ? `Realtime voice is controlled from the main Codex Voice window. Model: ${state.realtime.model}, voice: ${state.realtime.voice}, reasoning: ${state.realtime.reasoningEffort ?? "none"}.`
+              ? `Realtime voice is controlled from the main Codex Voice Agent window. Model: ${state.realtime.model}, voice: ${state.realtime.voice}, reasoning: ${state.realtime.reasoningEffort ?? "none"}.`
               : state.realtime.reason}
           </p>
 
@@ -4004,7 +4004,7 @@ function friendlyRealtimeIssue(issue: string): string {
     return "This key does not appear to have access to Realtime sessions. Check the project permissions or use another key.";
   }
   if (haystack.includes("network") || haystack.includes("failed to fetch") || haystack.includes("fetch failed")) {
-    return "Codex Voice could not reach OpenAI. Check the network connection, then try again.";
+    return "Codex Voice Agent could not reach OpenAI. Check the network connection, then try again.";
   }
   if (message) {
     return `OpenAI reported: ${message}`;
@@ -4016,7 +4016,7 @@ function friendlyRealtimeSettingsError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes("No handler registered") && message.includes("realtime:setSettings")) {
     return new Error(
-      "Codex Voice main process is still running an older build. Restart Codex Voice, then choose the Realtime settings again.",
+      "Codex Voice Agent main process is still running an older build. Restart Codex Voice Agent, then choose the Realtime settings again.",
     );
   }
   return error instanceof Error ? error : new Error(message);

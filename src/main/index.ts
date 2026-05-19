@@ -22,7 +22,7 @@ import type {
   WindowChromeState,
 } from "../shared/types";
 
-const appName = "Codex Voice";
+const appName = "Codex Voice Agent";
 const voiceCompactWindowWidth = 444;
 const voiceExpandedRightPaneWidth = 874;
 const voiceWindowMinHeight = 640;
@@ -56,7 +56,7 @@ function createVoiceWindow(): void {
     height: 661,
     minWidth: voiceCompactWindowWidth,
     minHeight: voiceWindowMinHeight,
-    title: "Codex Voice",
+    title: "Codex Voice Agent",
     ...(process.platform === "darwin"
       ? {
           titleBarStyle: "hiddenInset" as const,
@@ -139,7 +139,7 @@ function createDebugWindow(): void {
     height: 860,
     minWidth: 960,
     minHeight: 700,
-    title: "Codex Voice Debug",
+    title: "Codex Voice Agent Debug",
     icon: appIcon,
     backgroundColor: "#f4f6f8",
     webPreferences: {

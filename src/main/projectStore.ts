@@ -33,8 +33,8 @@ type ListProjectsOptions = {
   includeArchived?: boolean;
 };
 
-const INDEX_FILE = ".codex-voice-projects.json";
-const AGENT_FOLDER = ".codex-voice-agent";
+const INDEX_FILE = ".cva-projects.json";
+const AGENT_FOLDER = ".cva-agent";
 const PROJECT_FILE = "project.json";
 const TRANSCRIPT_FOLDER = "transcripts";
 const REPLAY_FOLDER = "replays";
@@ -48,7 +48,7 @@ export class ProjectStore {
   private readonly lockPath: string;
   private mutationQueue: Promise<void> = Promise.resolve();
 
-  constructor(baseFolder = path.join(app.getPath("documents"), "Codex Voice Projects")) {
+  constructor(baseFolder = path.join(app.getPath("documents"), "Codex Voice Agent Projects")) {
     this.baseFolder = baseFolder;
     this.indexPath = path.join(baseFolder, INDEX_FILE);
     this.lockPath = `${this.indexPath}.lock`;

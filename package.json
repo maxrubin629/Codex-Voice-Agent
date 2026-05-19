@@ -1,6 +1,6 @@
 {
-  "name": "codex-voice",
-  "productName": "Codex Voice",
+  "name": "codex-voice-agent",
+  "productName": "Codex Voice Agent",
   "version": "0.0.1",
   "private": true,
   "description": "A local Realtime voice layer around Codex app-server projects.",

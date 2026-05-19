@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({
   app: {
-    getPath: () => "/tmp/codex-voice-test",
+    getPath: () => "/tmp/cva-test",
   },
 }));
 
@@ -40,14 +40,14 @@ describe("ProjectStore sidecar layout", () => {
       status: "completed",
     });
 
-    const agentFolder = path.join(project.folderPath, ".codex-voice-agent");
+    const agentFolder = path.join(project.folderPath, ".cva-agent");
     const projectPath = path.join(agentFolder, "project.json");
     const transcriptPath = path.join(agentFolder, "transcripts", `${chatId}.jsonl`);
 
     expect(existsSync(projectPath)).toBe(true);
     expect(existsSync(transcriptPath)).toBe(true);
-    expect(existsSync(path.join(project.folderPath, ".codex-voice-project.json"))).toBe(false);
-    expect(existsSync(path.join(project.folderPath, ".codex-voice-transcripts"))).toBe(false);
+    expect(existsSync(path.join(project.folderPath, ".cva-project.json"))).toBe(false);
+    expect(existsSync(path.join(project.folderPath, ".cva-transcripts"))).toBe(false);
 
     expect(JSON.parse(await readFile(projectPath, "utf8"))).toMatchObject({
       id: project.id,
@@ -117,7 +117,7 @@ describe("ProjectStore sidecar layout", () => {
     const finalized = await store.finalizeReplaySession(project.id, session.id);
     expect(finalized?.stoppedAt).toBeTruthy();
 
-    const replayPath = path.join(project.folderPath, ".codex-voice-agent", "replays", session.id);
+    const replayPath = path.join(project.folderPath, ".cva-agent", "replays", session.id);
     expect(existsSync(replayPath)).toBe(true);
     await store.deleteReplaySession(project.id, session.id);
     expect(existsSync(replayPath)).toBe(false);
@@ -149,7 +149,7 @@ describe("ProjectStore sidecar layout", () => {
       name: "Keep me",
     });
 
-    const agentFolder = path.join(project.folderPath, ".codex-voice-agent");
+    const agentFolder = path.join(project.folderPath, ".cva-agent");
     expect(existsSync(agentFolder)).toBe(true);
 
     await expect(store.deleteReplaySession(project.id, "..")).rejects.toThrow(/Invalid replay id/);
@@ -160,7 +160,7 @@ describe("ProjectStore sidecar layout", () => {
 });
 
 async function tempBaseFolder(): Promise<string> {
-  const folder = await mkdtemp(path.join(os.tmpdir(), "codex-voice-project-store-"));
+  const folder = await mkdtemp(path.join(os.tmpdir(), "cva-project-store-"));
   tempFolders.push(folder);
   return folder;
 }

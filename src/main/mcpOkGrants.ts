@@ -8,7 +8,7 @@ type McpOkGrantsFile = {
   grants: McpOkGrant[];
 };
 
-const GRANTS_FILE_NAME = "codex-voice-mcp-ok-grants.json";
+const GRANTS_FILE_NAME = "cva-mcp-ok-grants.json";
 
 export class McpOkGrantStore {
   private grants: McpOkGrant[] = [];

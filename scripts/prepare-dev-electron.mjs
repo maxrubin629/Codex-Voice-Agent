@@ -3,8 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
-const appName = "Codex Voice";
-const appIdentifier = "com.openai.codex-voice.dev";
+const appName = "Codex Voice Agent";
+const appIdentifier = "com.maxrubin.codex-voice-agent.dev";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const electronPackage = join(repoRoot, "node_modules/electron");

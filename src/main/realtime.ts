@@ -17,7 +17,7 @@ import {
 import { getOpenAiApiKey, getOpenAiApiKeyStatus } from "./apiKeyStore";
 
 const REALTIME_ENDPOINT = "https://api.openai.com/v1/realtime/client_secrets";
-const SETTINGS_FILE_NAME = "codex-voice-realtime-settings.json";
+const SETTINGS_FILE_NAME = "cva-realtime-settings.json";
 
 type RealtimeSettingsFile = {
   version: 1;
@@ -356,7 +356,7 @@ export function realtimeTools(): unknown[] {
           workspacePath: {
             type: "string",
             description:
-              "Optional real workspace/repo directory for this Codex task, such as ~/workspace/codex-voice. Use when the user names a path or repo so the thread appears under that workspace in Codex.",
+              "Optional real workspace/repo directory for this Codex task, such as ~/workspace/codex-voice-agent. Use when the user names a path or repo so the thread appears under that workspace in Codex.",
           },
         },
         required: ["request"],
@@ -397,7 +397,7 @@ export function realtimeTools(): unknown[] {
           workspacePath: {
             type: "string",
             description:
-              "Optional real workspace/repo directory for this queued Codex task, such as ~/workspace/codex-voice.",
+              "Optional real workspace/repo directory for this queued Codex task, such as ~/workspace/codex-voice-agent.",
           },
         },
         required: ["request"],
@@ -618,7 +618,7 @@ export function realtimeTools(): unknown[] {
           workspacePath: {
             type: "string",
             description:
-              "Optional real workspace/repo directory, such as ~/workspace/codex-voice. Omit only when the user wants a blank scratch voice project.",
+              "Optional real workspace/repo directory, such as ~/workspace/codex-voice-agent. Omit only when the user wants a blank scratch voice project.",
           },
         },
       },

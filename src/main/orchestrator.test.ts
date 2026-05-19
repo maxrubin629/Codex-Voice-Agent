@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({
   app: {
-    getPath: () => "/tmp/codex-voice-test",
+    getPath: () => "/tmp/cva-test",
   },
 }));
 

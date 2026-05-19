@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({
   app: {
-    getPath: () => "/tmp/codex-voice-test",
+    getPath: () => "/tmp/cva-test",
   },
 }));
 
@@ -13,7 +13,7 @@ import { McpOkGrantStore } from "./mcpOkGrants";
 
 describe("MCP OK grant store", () => {
   it("persists a normalized global server/tool grant", async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), "codex-voice-grants-"));
+    const dir = await mkdtemp(path.join(tmpdir(), "cva-grants-"));
     const filePath = path.join(dir, "grants.json");
     const store = new McpOkGrantStore(filePath);
 
@@ -31,7 +31,7 @@ describe("MCP OK grant store", () => {
   });
 
   it("rejects empty server or tool grants", async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), "codex-voice-grants-"));
+    const dir = await mkdtemp(path.join(tmpdir(), "cva-grants-"));
     const store = new McpOkGrantStore(path.join(dir, "grants.json"));
 
     await expect(store.save("", "search")).rejects.toThrow("requires a server and tool");

@@ -57,7 +57,7 @@ export class CodexBridge extends EventEmitter {
     await this.request("initialize", {
       clientInfo: {
         name: "codex_voice",
-        title: "Codex Voice",
+        title: "Codex Voice Agent",
         version: "0.0.1",
       },
       capabilities: {

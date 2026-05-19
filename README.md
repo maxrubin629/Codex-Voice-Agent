@@ -1,8 +1,8 @@
-# Codex Voice
+# Codex Voice Agent
 
-![Codex Voice](./docs/assets/codex-voice-readme-banner.png)
+![Codex Voice Agent](./docs/assets/codex-voice-agent-readme-banner.png)
 
-Codex Voice is a local desktop app that lets you talk to Codex through OpenAI
+Codex Voice Agent is a local desktop app that lets you talk to Codex through OpenAI
 Realtime voice. Realtime handles the voice/control layer; `codex app-server`
 owns local execution, approvals, questions, project state, and tool work.
 
@@ -11,7 +11,7 @@ owns local execution, approvals, questions, project state, and tool work.
 - Compact voice window for speaking requests to Codex.
 - Project creation, resume, summarize, interrupt, and steer flows for
   `codex app-server` turns.
-- Per-project workspaces stored under `~/Documents/Codex Voice Projects/`.
+- Per-project workspaces stored under `~/Documents/Codex Voice Agent Projects/`.
 - Approval and tool-question forwarding between Codex, the UI, and the voice
   layer.
 - Debug window for project state, chats, runtime status, events, pending
