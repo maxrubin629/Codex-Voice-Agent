@@ -893,6 +893,31 @@ function VoiceHome({
   }, [contextMenu]);
 
   useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const action = voiceShortcutActionForEvent(event);
+      if (!action) return;
+
+      event.preventDefault();
+      if (action === "settings") {
+        setPermissionsOpen(false);
+        setModelOpen(false);
+        setSettingsOpen((current) => !current);
+        return;
+      }
+
+      setPermissionsOpen(false);
+      if (futureOpenRef.current) {
+        closeFuturePane();
+      } else {
+        openFuturePane();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  useEffect(() => {
     const previousIds = pendingRequestIdsRef.current;
     const nextIds = pendingRequestIds(pendingRequests);
     pendingRequestIdsRef.current = nextIds;
@@ -4920,8 +4945,12 @@ function requestContextLabel(request: PendingCodexRequest): string {
   return [request.projectName, request.chatName].filter(Boolean).join(" / ");
 }
 
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+const rootElement = typeof document === "undefined" ? null : document.getElementById("root");
+
+if (rootElement) {
+  createRoot(rootElement).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+}
