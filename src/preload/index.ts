@@ -8,6 +8,7 @@ import type {
   CodexSettingsScope,
   CodexServiceTier,
   CodexVoiceApi,
+  RealtimeContextRequest,
   ReasoningEffort,
   ReplaySessionLoadResult,
   ReplaySessionMetadata,
@@ -109,6 +110,8 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
   getTranscriptMessages: (chatId?: string) =>
     ipcRenderer.invoke("rightPanel:getTranscriptMessages", { chatId }),
+  getRealtimeContext: (request?: RealtimeContextRequest) =>
+    ipcRenderer.invoke("realtime:getContext", request),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),

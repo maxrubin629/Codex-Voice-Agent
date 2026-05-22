@@ -14,6 +14,7 @@ import type {
   CodexPermissionMode,
   CodexSettingsScope,
   RealtimeModelId,
+  RealtimeContextRequest,
   RealtimeReasoningEffort,
   RealtimeVoiceId,
   PhoneSettingsUpdate,
@@ -500,6 +501,11 @@ function registerIpc(): void {
   registerIpcHandler(
     "rightPanel:getTranscriptMessages",
     (_event, payload?: { chatId?: string }) => requireOrchestrator().getTranscriptMessages(payload?.chatId),
+  );
+  registerIpcHandler(
+    "realtime:getContext",
+    (_event, payload?: RealtimeContextRequest) =>
+      requireOrchestrator().getRealtimeContext(payload),
   );
   registerIpcHandler("settings:saveOpenAiApiKey", (_event, payload: { apiKey: string }) => {
     saveOpenAiApiKey(payload.apiKey);

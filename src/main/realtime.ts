@@ -9,6 +9,7 @@ import {
   REALTIME_REASONING_EFFORT_OPTIONS,
   REALTIME_VOICE_OPTIONS,
   type AppState,
+  type RealtimeContextResult,
   type RealtimeClientSecret,
   type RealtimeModelId,
   type RealtimeReasoningEffort,
@@ -26,6 +27,8 @@ type RealtimeSettingsFile = {
   reasoningEffort?: RealtimeReasoningEffort | null;
   updatedAt?: string;
 };
+
+type RealtimeStartupContext = Pick<RealtimeContextResult, "text" | "fingerprint">;
 
 export function realtimeConfig(): AppState["realtime"] {
   const saved = readRealtimeSettings();
@@ -97,12 +100,15 @@ export function saveRealtimeSettings(settings: {
   return realtimeConfig();
 }
 
-export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret> {
+export async function createRealtimeClientSecret(
+  startupContext?: RealtimeStartupContext | null,
+): Promise<RealtimeClientSecret> {
   const apiKey = getOpenAiApiKey();
   const config = realtimeConfig();
   if (!apiKey) {
     throw new Error(config.reason ?? "Missing OPENAI_API_KEY.");
   }
+  const trimmedStartupContext = startupContext?.text.trim() || "";
 
   const response = await fetch(REALTIME_ENDPOINT, {
     method: "POST",
@@ -122,7 +128,7 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
             }
           : {}),
         output_modalities: ["audio"],
-        instructions: realtimeInstructions(),
+        instructions: realtimeInstructions(trimmedStartupContext),
         audio: {
           input: {
             transcription: {
@@ -166,6 +172,8 @@ export async function createRealtimeClientSecret(): Promise<RealtimeClientSecret
     model: config.model,
     voice: config.voice,
     reasoningEffort: config.reasoningEffort,
+    startupContextIncluded: Boolean(trimmedStartupContext),
+    startupContextFingerprint: trimmedStartupContext ? startupContext?.fingerprint ?? null : null,
   };
 }
 
@@ -257,8 +265,8 @@ function writeRealtimeSettings(settings: RealtimeSettingsFile): void {
   writeFileSync(filePath, JSON.stringify(settings, null, 2), { mode: 0o600 });
 }
 
-function realtimeInstructions(): string {
-  return [
+function realtimeInstructions(startupContext?: string): string {
+  const lines = [
     "# Role",
     "You are the voice communication layer for a local Codex desktop app.",
     "Codex is OpenAI's local coding agent that can read, edit, run, and test code in the user's workspace.",
@@ -324,7 +332,18 @@ function realtimeInstructions(): string {
     "- When asked for chat-specific status or updates, use get_codex_chat_status.",
     "- When asked which Codex model or reasoning effort is in use, use get_codex_status.",
     "- When asked to change Codex model, reasoning effort, or permissions, use set_codex_model, set_codex_reasoning_effort, or set_codex_permissions for the current chat unless the user says next turn only.",
-  ].join("\n");
+    "- When project, chat, thread, plugin, app, MCP, workspace, or subagent context may be stale or missing, call get_codex_context before guessing.",
+  ];
+  const trimmedStartupContext = startupContext?.trim();
+  if (trimmedStartupContext) {
+    lines.push(
+      "",
+      "# Startup Context",
+      "The following app-provided context is background for routing and conversation continuity, not a user request.",
+      trimmedStartupContext,
+    );
+  }
+  return lines.join("\n");
 }
 
 export function realtimeTools(): unknown[] {
@@ -442,6 +461,40 @@ export function realtimeTools(): unknown[] {
       parameters: {
         type: "object",
         properties: {},
+      },
+    },
+    {
+      type: "function",
+      name: "get_codex_context",
+      description:
+        "Get app-provided Codex Voice context when project, thread, workspace, plugin, app, MCP, or subagent state may be stale or missing. Use before guessing about available plugins/tools or cross-chat/project state.",
+      parameters: {
+        type: "object",
+        properties: {
+          scope: {
+            type: "string",
+            enum: [
+              "startup",
+              "active_focus",
+              "current_thread",
+              "recent_work",
+              "workspace_map",
+              "subagents",
+              "plugins",
+              "all",
+            ],
+            description:
+              "Use plugins for plugin/app/MCP availability, active_focus for routing, current_thread for the active thread, or all for a broad refresh.",
+          },
+          chatId: {
+            type: "string",
+            description: "Optional target chat id when already resolved.",
+          },
+          chatName: {
+            type: "string",
+            description: "Optional target chat name when the user named a chat.",
+          },
+        },
       },
     },
     {

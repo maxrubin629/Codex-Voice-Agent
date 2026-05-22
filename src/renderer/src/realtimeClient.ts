@@ -7,6 +7,7 @@ import type {
   CodexSettingsScope,
   CodexTurnOutput,
   PendingCodexRequest,
+  RealtimeContextRequest,
   ToolQuestionAnswer,
   VoiceChat,
   VoiceTranscriptMessage,
@@ -94,6 +95,7 @@ export class RealtimeVoiceClient {
     if (this.pc) return;
     this.callbacks.onConnectionChange(false, "Creating Realtime session.");
     const secret = await window.codexVoice.createRealtimeClientSecret();
+    this.startupContextIncluded = Boolean(secret.startupContextIncluded);
 
     const pc = new RTCPeerConnection();
     const audioEl = document.createElement("audio");
@@ -328,9 +330,10 @@ export class RealtimeVoiceClient {
 
     const injectionSeq = ++this.chatContextInjectionSeq;
     try {
-      const messages = this.callbacks.getTranscriptMessages
-        ? await this.callbacks.getTranscriptMessages(context.chatId)
-        : [];
+      const realtimeContext = await window.codexVoice.getRealtimeContext({
+        scope: "active_focus",
+        chatId: context.chatId,
+      });
       if (
         !this.connected ||
         injectionSeq !== this.chatContextInjectionSeq ||
@@ -339,23 +342,16 @@ export class RealtimeVoiceClient {
         return;
       }
 
-      const transcriptContext = transcriptContextFromMessages(messages);
       const previousFingerprint = this.injectedTranscriptFingerprints.get(contextKey);
-      const includeTranscript = previousFingerprint !== transcriptContext.fingerprint;
-      const activeContext = activeChatContextText(
-        context,
-        includeTranscript ? transcriptContext : null,
-      );
-      this.sendConversationText(activeContext.text);
-      if (includeTranscript) {
-        this.injectedTranscriptFingerprints.set(contextKey, transcriptContext.fingerprint);
-      }
+      if (realtimeContext.fingerprint && previousFingerprint === realtimeContext.fingerprint) return;
+      this.sendConversationText(realtimeContext.text);
+      if (realtimeContext.fingerprint) this.injectedTranscriptFingerprints.set(contextKey, realtimeContext.fingerprint);
       this.log("activeChatContext", `Injected active chat context for ${context.chatName}.`, {
         reason,
         chatId: context.chatId,
         threadId: context.threadId,
-        transcriptIncluded: includeTranscript,
-        transcriptMessageCount: includeTranscript ? transcriptContext.count : 0,
+        contextScope: realtimeContext.scope,
+        contextFingerprint: realtimeContext.fingerprint,
       });
     } catch (error) {
       this.log(
@@ -883,6 +879,15 @@ async function callVoiceTool(
     };
   }
 
+  if (name === "get_codex_context") {
+    const result = await window.codexVoice.getRealtimeContext({
+      scope: realtimeContextScopeArg(args.scope),
+      chatId: optionalString(args.chatId),
+      chatName: optionalString(args.chatName),
+    });
+    return { ...result, context: result.text };
+  }
+
   if (name === "list_codex_subagents") {
     const result = await window.codexVoice.listSubagents(
       await resolveChatId(optionalString(args.chatId), optionalString(args.chatName), true),
@@ -1108,6 +1113,23 @@ function stringArg(value: unknown): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function realtimeContextScopeArg(value: unknown): RealtimeContextRequest["scope"] {
+  const scope = optionalString(value);
+  const allowed: Array<NonNullable<RealtimeContextRequest["scope"]>> = [
+    "startup",
+    "active_focus",
+    "current_thread",
+    "recent_work",
+    "workspace_map",
+    "subagents",
+    "plugins",
+    "all",
+  ];
+  return allowed.includes(scope as NonNullable<RealtimeContextRequest["scope"]>)
+    ? scope as RealtimeContextRequest["scope"]
+    : undefined;
 }
 
 async function resolveChatId(

@@ -178,6 +178,23 @@ describe("realtime delegation orchestration", () => {
   });
 });
 
+describe("realtime context orchestration", () => {
+  it("reads plugin, MCP, and app availability from app-server for realtime", async () => {
+    const { orchestrator, codex } = await testOrchestrator();
+
+    const result = await orchestrator.getRealtimeContext({ scope: "plugins" });
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("Available Plugins And Apps");
+    expect(result.text).toContain("Browser (browser) - installed, enabled - OpenAI");
+    expect(result.text).toContain("github - connected - 2 tools");
+    expect(result.text).toContain("Google Drive (google-drive) - enabled, accessible via Google Drive");
+    expect(codex.requests.map((request) => request.method)).toContain("plugin/list");
+    expect(codex.requests.map((request) => request.method)).toContain("mcpServerStatus/list");
+    expect(codex.requests.map((request) => request.method)).toContain("app/list");
+  });
+});
+
 describe("todo and plan parsing", () => {
   it("summarizes TodoListItem items with TodoItem completed booleans", () => {
     const todoList: CodexThreadItem = {

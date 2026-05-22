@@ -11,6 +11,8 @@ import type {
   PendingCodexRequest,
   QueuedCodexRequestResult,
   ReasoningEffort,
+  RealtimeContextRequest,
+  RealtimeContextResult,
   ToolQuestionAnswer,
   VoiceChat,
   VoiceProject,
@@ -51,6 +53,7 @@ type VoiceToolApi = {
   createChat(name: string, projectId?: string): Promise<VoiceProject>;
   switchChat(chatId: string, projectId?: string): Promise<VoiceProject>;
   getChatStatus(chatId?: string): Promise<CodexRuntimeState["chats"]>;
+  getRealtimeContext(request?: RealtimeContextRequest): Promise<RealtimeContextResult>;
   showProjectChats(open?: boolean): Promise<void>;
   resumeProject(projectId: string): Promise<VoiceProject>;
   summarizeProject(projectId?: string, chatId?: string): Promise<string>;
@@ -120,6 +123,15 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
         runtime: state.runtime,
         codexSettings: state.codexSettings,
       };
+    }
+
+    if (name === "get_codex_context") {
+      const result = await api.getRealtimeContext({
+        scope: realtimeContextScopeArg(args.scope),
+        chatId: optionalString(args.chatId),
+        chatName: optionalString(args.chatName),
+      });
+      return { ...result, context: result.text };
     }
 
     if (name === "list_codex_subagents") {
@@ -329,6 +341,23 @@ function stringArg(value: unknown): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function realtimeContextScopeArg(value: unknown): RealtimeContextRequest["scope"] {
+  const scope = optionalString(value);
+  const allowed: Array<NonNullable<RealtimeContextRequest["scope"]>> = [
+    "startup",
+    "active_focus",
+    "current_thread",
+    "recent_work",
+    "workspace_map",
+    "subagents",
+    "plugins",
+    "all",
+  ];
+  return allowed.includes(scope as NonNullable<RealtimeContextRequest["scope"]>)
+    ? scope as RealtimeContextRequest["scope"]
+    : undefined;
 }
 
 async function resolveChatId(

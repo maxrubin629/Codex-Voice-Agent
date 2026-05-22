@@ -603,6 +603,60 @@ export type VoiceTranscriptMessage = {
   metadata?: Record<string, unknown>;
 };
 
+export type RealtimeContextScope =
+  | "startup"
+  | "active_focus"
+  | "current_thread"
+  | "recent_work"
+  | "workspace_map"
+  | "subagents"
+  | "plugins"
+  | "all";
+
+export type RealtimeContextRequest = {
+  scope?: RealtimeContextScope;
+  chatId?: string;
+  chatName?: string;
+};
+
+export type RealtimeContextPluginSummary = {
+  id: string;
+  name: string;
+  marketplace: string | null;
+  installed: boolean;
+  enabled: boolean;
+};
+
+export type RealtimeContextMcpServerSummary = {
+  name: string;
+  authStatus: string | null;
+  toolNames: string[];
+};
+
+export type RealtimeContextAppSummary = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  accessible: boolean;
+  pluginDisplayNames: string[];
+};
+
+export type RealtimeContextInventory = {
+  plugins: RealtimeContextPluginSummary[];
+  mcpServers: RealtimeContextMcpServerSummary[];
+  apps: RealtimeContextAppSummary[];
+  errors: string[];
+};
+
+export type RealtimeContextResult = {
+  ok: boolean;
+  scope: RealtimeContextScope;
+  text: string;
+  fingerprint: string | null;
+  generatedAt: string;
+  errorMessage?: string;
+};
+
 export type WindowChromeState = {
   isFullScreen: boolean;
 };
@@ -620,6 +674,8 @@ export type RealtimeClientSecret = {
   model: RealtimeModelId;
   voice: RealtimeVoiceId;
   reasoningEffort: RealtimeReasoningEffort | null;
+  startupContextIncluded?: boolean;
+  startupContextFingerprint?: string | null;
 };
 
 export type CodexVoiceApi = {
@@ -694,6 +750,7 @@ export type CodexVoiceApi = {
   getThreadSummary(threadId: string): Promise<ActiveThreadSummary>;
   getActiveThreadSummary(chatId?: string): Promise<ActiveThreadSummary>;
   getTranscriptMessages(chatId?: string): Promise<VoiceTranscriptMessage[]>;
+  getRealtimeContext(request?: RealtimeContextRequest): Promise<RealtimeContextResult>;
   saveOpenAiApiKey(apiKey: string): Promise<void>;
   clearOpenAiApiKey(): Promise<void>;
   createRealtimeClientSecret(): Promise<RealtimeClientSecret>;
