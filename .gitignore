@@ -2,6 +2,7 @@ node_modules/
 out/
 dist/
 .DS_Store
+codex-repo-context/
 *.log
 .env
 .env.*
