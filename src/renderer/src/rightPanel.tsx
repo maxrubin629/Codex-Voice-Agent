@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { transcriptMessageFromEvent } from "../../shared/transcriptMessages";
 import type {
   ActiveThreadSummary,
@@ -14,6 +14,7 @@ import type {
 } from "../../shared/types";
 
 type RightPanelTabId = "transcript" | "approvals" | "todos";
+const transcriptScrollPinThresholdPx = 48;
 
 export function RightPanel({
   open,
@@ -323,7 +324,21 @@ function TranscriptTab({
   error: string | null;
   messages: VoiceTranscriptMessage[];
 }): React.ReactElement {
-  const entries = transcriptEntries(messages, events, chatId);
+  const entries = useMemo(() => transcriptEntries(messages, events, chatId), [chatId, events, messages]);
+  const transcriptListRef = useRef<HTMLDivElement | null>(null);
+  const transcriptScrollPinnedRef = useRef(true);
+  const entryFingerprint = entries.map((message) => `${message.id}:${message.status}:${message.text.length}`).join("|");
+
+  useLayoutEffect(() => {
+    const list = transcriptListRef.current;
+    if (!list || entries.length === 0) return;
+    if (transcriptScrollPinnedRef.current) scrollTranscriptListToBottom(list);
+  }, [entries.length, entryFingerprint]);
+
+  function handleTranscriptScroll(event: React.UIEvent<HTMLDivElement>): void {
+    transcriptScrollPinnedRef.current = isTranscriptScrollPinned(event.currentTarget);
+  }
+
   if (entries.length === 0) {
     return (
       <RightPanelEmpty
@@ -334,7 +349,7 @@ function TranscriptTab({
   }
 
   return (
-    <div className="voice-transcript-list">
+    <div className="voice-transcript-list" ref={transcriptListRef} onScroll={handleTranscriptScroll}>
       {entries.map((message) => (
         <article key={message.id} className={`voice-transcript-entry ${message.role}`}>
           <span>{message.role === "user" ? "You" : "Realtime"}</span>
@@ -346,7 +361,7 @@ function TranscriptTab({
   );
 }
 
-function transcriptEntries(
+export function transcriptEntries(
   storedMessages: VoiceTranscriptMessage[],
   events: AppEvent[],
   chatId: string | null,
@@ -368,6 +383,17 @@ function transcriptEntries(
   return [...byId.values()].sort((left, right) =>
     (left.completedAt ?? left.createdAt).localeCompare(right.completedAt ?? right.createdAt),
   );
+}
+
+export function isTranscriptScrollPinned(
+  element: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
+  thresholdPx = transcriptScrollPinThresholdPx,
+): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= thresholdPx;
+}
+
+function scrollTranscriptListToBottom(element: Pick<HTMLElement, "scrollHeight" | "scrollTop">): void {
+  element.scrollTop = element.scrollHeight;
 }
 
 function ApprovalsTab({
