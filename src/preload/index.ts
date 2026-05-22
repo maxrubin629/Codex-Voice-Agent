@@ -4,6 +4,7 @@ import type {
   AppState,
   ApprovalDecision,
   CodexPermissionMode,
+  CodexRequestOptions,
   CodexSettingsScope,
   CodexServiceTier,
   CodexVoiceApi,
@@ -59,11 +60,23 @@ const api: CodexVoiceApi = {
   showProjectChats: (open?: boolean) => ipcRenderer.invoke("projects:showChats", { open }),
   summarizeProject: (projectId?: string, chatId?: string) =>
     ipcRenderer.invoke("projects:summarize", { projectId, chatId }),
-  sendToCodex: (text: string, chatId?: string, workspacePath?: string | null) =>
-    ipcRenderer.invoke("codex:send", { text, chatId, workspacePath }),
+  sendToCodex: (
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ) =>
+    ipcRenderer.invoke("codex:send", { text, chatId, workspacePath, ...options }),
   steerCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:steer", { text, chatId }),
-  queueCodexRequest: (text: string, chatId?: string, workspacePath?: string | null) =>
-    ipcRenderer.invoke("codex:queue", { text, chatId, workspacePath }),
+  queueCodexRequest: (
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ) =>
+    ipcRenderer.invoke("codex:queue", { text, chatId, workspacePath, ...options }),
+  realtimeSessionStarted: () => ipcRenderer.invoke("realtime:sessionStarted"),
+  realtimeSessionEnded: () => ipcRenderer.invoke("realtime:sessionEnded"),
   cancelQueuedCodexRequest: (queuedId?: string | null, chatId?: string) =>
     ipcRenderer.invoke("codex:cancelQueued", { queuedId, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),

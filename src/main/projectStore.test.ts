@@ -97,7 +97,7 @@ describe("ProjectStore sidecar layout", () => {
       source: "codex",
       kind: "turn/start/request",
       message: "Sending turn/start to Codex app-server.",
-      raw: { threadId: "thread-1", input: [{ text: "Voice ===\nhello" }] },
+      raw: { threadId: "thread-1", input: [{ text: "<realtime_delegation>\n  <input>hello</input>\n</realtime_delegation>" }] },
     });
 
     const loaded = await store.loadReplaySession(project.id, session.id);

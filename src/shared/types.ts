@@ -527,6 +527,11 @@ export type CodexActionResult = {
   chat: VoiceChat | null;
 };
 
+export type CodexRequestOptions = {
+  source?: "typed" | "realtime";
+  transcriptDelta?: string | null;
+};
+
 export type QueuedCodexRequestResult = {
   queued: boolean;
   queuedId: string | null;
@@ -648,13 +653,21 @@ export type CodexVoiceApi = {
   listChats(projectId?: string): Promise<VoiceChat[]>;
   showProjectChats(open?: boolean): Promise<void>;
   summarizeProject(projectId?: string, chatId?: string): Promise<string>;
-  sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult>;
+  sendToCodex(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ): Promise<CodexActionResult>;
   steerCodex(text: string, chatId?: string): Promise<{ turnId: string }>;
   queueCodexRequest(
     text: string,
     chatId?: string,
     workspacePath?: string | null,
+    options?: CodexRequestOptions,
   ): Promise<QueuedCodexRequestResult>;
+  realtimeSessionStarted(): Promise<void>;
+  realtimeSessionEnded(): Promise<void>;
   cancelQueuedCodexRequest(
     queuedId?: string | null,
     chatId?: string,

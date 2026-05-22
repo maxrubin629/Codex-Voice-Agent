@@ -15,6 +15,8 @@ import type {
 type RealtimeCallbacks = {
   onLog: (event: AppEvent) => void;
   onConnectionChange: (connected: boolean, label: string) => void;
+  onSessionStarted?: () => Promise<void>;
+  onSessionEnded?: () => Promise<void>;
   onOutputLevel?: (level: number) => void;
   getTranscriptMessages?: (chatId: string) => Promise<VoiceTranscriptMessage[]>;
 };
@@ -75,6 +77,8 @@ export class RealtimeVoiceClient {
   private trackedResponses = new Map<string, TrackedRealtimeResponse>();
   private functionCallsByCallId = new Map<string, TrackedFunctionCall>();
   private functionCallsByItemId = new Map<string, TrackedFunctionCall>();
+  private sessionLifecycleActive = false;
+  private startupContextIncluded = false;
 
   constructor(private readonly callbacks: RealtimeCallbacks) {}
 
@@ -116,9 +120,11 @@ export class RealtimeVoiceClient {
           `Connected to ${secret.model} (${secret.voice}, reasoning ${secret.reasoningEffort}).`,
         );
         this.log("connection", "Realtime data channel opened.");
-        void this.injectActiveChatContext("connect");
+        this.notifySessionStarted();
+        if (!this.startupContextIncluded) void this.injectActiveChatContext("connect");
       });
       dc.addEventListener("close", () => {
+        this.notifySessionEnded();
         this.callbacks.onConnectionChange(false, "Realtime data channel closed.");
         this.log("connection", "Realtime data channel closed.");
       });
@@ -152,6 +158,7 @@ export class RealtimeVoiceClient {
   }
 
   disconnect(): void {
+    this.notifySessionEnded();
     this.realtimeEpoch += 1;
     this.trackedResponses.clear();
     this.functionCallsByCallId.clear();
@@ -788,6 +795,22 @@ export class RealtimeVoiceClient {
       raw,
     });
   }
+
+  private notifySessionStarted(): void {
+    if (this.sessionLifecycleActive) return;
+    this.sessionLifecycleActive = true;
+    void this.callbacks.onSessionStarted?.().catch((error) => {
+      this.log("sessionLifecycleFailed", error instanceof Error ? error.message : "Unable to mark realtime started.");
+    });
+  }
+
+  private notifySessionEnded(): void {
+    if (!this.sessionLifecycleActive) return;
+    this.sessionLifecycleActive = false;
+    void this.callbacks.onSessionEnded?.().catch((error) => {
+      this.log("sessionLifecycleFailed", error instanceof Error ? error.message : "Unable to mark realtime ended.");
+    });
+  }
 }
 
 async function callVoiceTool(
@@ -801,9 +824,10 @@ async function callVoiceTool(
     const context = optionalString(args.context);
     const chatId = await resolveChatId(optionalString(args.chatId), optionalString(args.chatName));
     const result = await window.codexVoice.sendToCodex(
-      context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+      request,
       chatId,
       optionalString(args.workspacePath),
+      { source: "realtime", transcriptDelta: context },
     );
     return {
       ok: true,
@@ -826,9 +850,10 @@ async function callVoiceTool(
     const request = stringArg(args.request);
     const context = optionalString(args.context);
     const result = await window.codexVoice.queueCodexRequest(
-      context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+      request,
       await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
       optionalString(args.workspacePath),
+      { source: "realtime", transcriptDelta: context },
     );
     return { ok: true, ...result };
   }

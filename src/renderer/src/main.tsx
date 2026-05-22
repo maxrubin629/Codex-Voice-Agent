@@ -536,6 +536,8 @@ function App(): React.ReactElement {
         onLog: (event) => {
           logRealtimeEvent(event);
         },
+        onSessionStarted: () => window.codexVoice.realtimeSessionStarted(),
+        onSessionEnded: () => window.codexVoice.realtimeSessionEnded(),
         onOutputLevel: updateVoiceOutputLevel,
         getTranscriptMessages: (chatId) => window.codexVoice.getTranscriptMessages(chatId),
       });

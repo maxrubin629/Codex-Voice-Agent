@@ -2,6 +2,7 @@ import type {
   AppState,
   ApprovalDecision,
   CodexPermissionMode,
+  CodexRequestOptions,
   CodexRuntimeState,
   CodexSettings,
   CodexSettingsScope,
@@ -18,12 +19,18 @@ import type { PhoneToolHandler } from "./phone";
 
 type VoiceToolApi = {
   state(): Promise<AppState>;
-  sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult>;
+  sendToCodex(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ): Promise<CodexActionResult>;
   steerCodex(text: string, chatId?: string): Promise<{ turnId: string }>;
   queueCodexRequest(
     text: string,
     chatId?: string,
     workspacePath?: string | null,
+    options?: CodexRequestOptions,
   ): Promise<QueuedCodexRequestResult>;
   cancelQueuedCodexRequest(queuedId?: string | null, chatId?: string): Promise<unknown>;
   interruptCodex(chatId?: string): Promise<void>;
@@ -56,9 +63,10 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
       const context = optionalString(args.context);
       const chatId = await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName));
       const result = await api.sendToCodex(
-        context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+        request,
         chatId,
         optionalString(args.workspacePath),
+        { source: "realtime", transcriptDelta: context },
       );
       return {
         ok: true,
@@ -81,9 +89,10 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
       const request = stringArg(args.request);
       const context = optionalString(args.context);
       const result = await api.queueCodexRequest(
-        context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+        request,
         await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName)),
         optionalString(args.workspacePath),
+        { source: "realtime", transcriptDelta: context },
       );
       return { ok: true, ...result };
     }
