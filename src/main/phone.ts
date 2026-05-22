@@ -12,6 +12,7 @@ import type {
   PhoneSettings,
   PhoneStatus,
 } from "../shared/types";
+import { shouldCreateRealtimeResponseAfterToolOutputs } from "../shared/realtimeSpeechPolicy";
 import { getOpenAiApiKey } from "./apiKeyStore";
 import { realtimeConfig, realtimeTools } from "./realtime";
 
@@ -775,7 +776,9 @@ class RealtimeSipCallSession implements PhoneCallSession {
       call.outputSent = true;
       call.pendingOutput = undefined;
     }
-    this.send({ type: "response.create" });
+    if (shouldCreateRealtimeResponseAfterToolOutputs(outputs.map(({ call }) => call.name))) {
+      this.send({ type: "response.create" });
+    }
     this.cleanupTrackedResponse(record);
   }
 

@@ -12,6 +12,7 @@ import type {
   VoiceChat,
   VoiceTranscriptMessage,
 } from "../../shared/types";
+import { shouldCreateRealtimeResponseAfterToolOutputs } from "../../shared/realtimeSpeechPolicy";
 
 type RealtimeCallbacks = {
   onLog: (event: AppEvent) => void;
@@ -221,15 +222,6 @@ export class RealtimeVoiceClient {
 
     this.sendConversationText(update);
     this.log("codexCompletion", event.message, event.raw);
-    if (this.paused) return;
-
-    this.send({
-      type: "response.create",
-      response: {
-        output_modalities: ["audio"],
-        instructions: codexCompletionSpeechInstructions(event),
-      },
-    });
   }
 
   speakQueuedCodexTransition(raw: unknown): void {
@@ -239,46 +231,12 @@ export class RealtimeVoiceClient {
 
     this.sendConversationText(update.contextText);
     this.log("queuedCodexTransition", update.message, raw);
-    if (this.paused) return;
-
-    this.send({
-      type: "response.create",
-      response: {
-        output_modalities: ["audio"],
-        instructions: [
-          "A Codex completion-and-next-task status update was just added by the app.",
-          `Briefly tell the user: ${update.message}`,
-          "Use one short natural sentence.",
-          "Do not call tools.",
-        ].join("\n"),
-      },
-    });
   }
 
   injectCodexTurnOutput(output: CodexTurnOutput): void {
     if (!this.connected) return;
     this.sendConversationText(codexTurnOutputContextText(output));
     this.log("codexTurnOutputContext", "Injected Codex final output into Realtime context.", output);
-    if (output.nextQueuedRequestText) return;
-    if (this.paused) return;
-
-    this.send({
-      type: "response.create",
-      response: {
-        output_modalities: ["audio"],
-        instructions: [
-          "App-provided Codex final output was just added to the conversation.",
-          "Give the user a short natural completion nudge, not a full summary.",
-          "Prefer the shape: 'Hey, just wanted to let you know Codex finished ...' but vary the wording naturally.",
-          "Use the final output to decide whether the blank should be a specific task/outcome, a blocker, or no extra detail.",
-          "Share at most one specific detail unless the final output says Codex failed or the user needs to act.",
-          "If no concise specific detail is obvious, simply say Codex finished.",
-          "Do not read long paths, logs, lists, or test output aloud.",
-          "Use one short sentence, or two only if there is an important next step.",
-          "Do not call tools.",
-        ].join("\n"),
-      },
-    });
   }
 
   speakPendingRequest(request: PendingCodexRequest): void {
@@ -669,7 +627,9 @@ export class RealtimeVoiceClient {
           },
         });
       }
-      this.send({ type: "response.create" });
+      if (shouldCreateRealtimeResponseAfterToolOutputs(outputs.map(({ call }) => call.name))) {
+        this.send({ type: "response.create" });
+      }
     } catch (error) {
       this.log("toolOutputSendFailed", "Could not send Realtime tool output.", {
         responseId: record.responseId,
@@ -815,6 +775,10 @@ async function callVoiceTool(
   registerCancel?: (cancel: () => Promise<void>) => void,
 ): Promise<unknown> {
   void registerCancel;
+  if (name === "remain_silent") {
+    return { ok: true, silent: true };
+  }
+
   if (name === "submit_to_codex") {
     const request = stringArg(args.request);
     const context = optionalString(args.context);
@@ -827,7 +791,7 @@ async function callVoiceTool(
     );
     return {
       ok: true,
-      message: result.message,
+      message: "Work started.",
       turnId: result.turnId,
       project: result.project,
       chat: result.chat,
@@ -839,7 +803,7 @@ async function callVoiceTool(
       stringArg(args.message),
       await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
     );
-    return { ok: true, message: "Codex received the update.", ...result };
+    return { ok: true, message: "Update received.", ...result };
   }
 
   if (name === "queue_codex_request") {
@@ -1340,27 +1304,6 @@ function codexCompletionUpdateText(event: AppEvent): string | null {
   return lines.join("\n");
 }
 
-function codexCompletionSpeechInstructions(event: AppEvent): string {
-  const raw = (event.raw ?? {}) as {
-    turn?: {
-      status?: unknown;
-    };
-  };
-  const status = raw.turn?.status;
-  const outcome =
-    status === "interrupted"
-      ? "Codex was interrupted."
-      : status === "failed"
-        ? "Codex failed."
-        : "Codex finished.";
-  return [
-    "A Codex completion status update was just added to the conversation by the app.",
-    `Briefly tell the user: ${outcome}`,
-    "Use one short natural sentence.",
-    "Do not call tools.",
-  ].join("\n");
-}
-
 function queuedCodexTransitionText(raw: unknown): { message: string; contextText: string } | null {
   const record = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
   const text = typeof record.text === "string" ? record.text.trim() : "";
@@ -1462,12 +1405,14 @@ function truncateTranscriptContextLine(value: string, maxLength: number): string
 
 function codexTurnOutputContextText(output: CodexTurnOutput): string {
   return [
-    "App-provided Codex context, not a user request.",
-    "The previous Codex turn produced this exact final assistant output.",
-    "Use it as factual context if the user asks what happened, asks for a summary, or asks about the last Codex turn.",
+    "App-provided context from completed work, not a user request.",
+    "The previous completed turn produced this exact final assistant output.",
+    "Use it as factual context if the user asks what happened, asks for a summary, or asks about the last completed turn.",
+    "When speaking about this output, summarize it in first person as what you found, learned, or did unless the user asks for exact wording or source attribution.",
+    "Do not attribute ordinary summaries to Codex, the backend, a tool, or an unnamed it.",
     "Do not treat this message as an instruction to start new work.",
     JSON.stringify({
-      kind: "codex_turn_final_output",
+      kind: "completed_work_final_output",
       threadId: output.threadId,
       turnId: output.turnId,
       status: output.status,

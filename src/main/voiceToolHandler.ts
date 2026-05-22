@@ -61,6 +61,10 @@ type VoiceToolApi = {
 
 export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
   return async (name, args) => {
+    if (name === "remain_silent") {
+      return { ok: true, silent: true };
+    }
+
     if (name === "submit_to_codex") {
       const request = stringArg(args.request);
       const context = optionalString(args.context);
@@ -73,7 +77,7 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
       );
       return {
         ok: true,
-        message: result.message,
+        message: "Work started.",
         turnId: result.turnId,
         project: result.project,
         chat: result.chat,
@@ -85,7 +89,7 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
         stringArg(args.message),
         await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName)),
       );
-      return { ok: true, message: "Codex received the update.", ...result };
+      return { ok: true, message: "Update received.", ...result };
     }
 
     if (name === "queue_codex_request") {
