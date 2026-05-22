@@ -20,6 +20,7 @@ export function RightPanel({
   state,
   events,
   activateTranscriptRequest,
+  activateApprovalsRequest,
   inspectedThread,
   onClose,
   onAction,
@@ -28,6 +29,7 @@ export function RightPanel({
   state: AppState;
   events: AppEvent[];
   activateTranscriptRequest: number;
+  activateApprovalsRequest: number;
   inspectedThread: { threadId: string; label: string } | null;
   onClose: () => void;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
@@ -53,6 +55,11 @@ export function RightPanel({
     if (!open || activateTranscriptRequest === 0) return;
     setActiveTabId("transcript");
   }, [activateTranscriptRequest, open]);
+
+  useEffect(() => {
+    if (!open || activateApprovalsRequest === 0) return;
+    setActiveTabId("approvals");
+  }, [activateApprovalsRequest, open]);
 
   useEffect(() => {
     if (!open) return undefined;
