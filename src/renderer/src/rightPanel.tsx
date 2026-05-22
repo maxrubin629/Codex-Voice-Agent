@@ -42,6 +42,7 @@ export function RightPanel({
   const [error, setError] = useState<string | null>(null);
   const activeChat = activeChatForState(state);
   const todos = todosForActiveChat(state, activeChat);
+  const lastApprovalsActivationRequestRef = useRef(0);
   const inspectedRequests = inspectedThread
     ? state.runtime.pendingRequests.filter((request) => request.threadId === inspectedThread.threadId)
     : state.runtime.pendingRequests;
@@ -58,7 +59,10 @@ export function RightPanel({
   }, [activateTranscriptRequest, open]);
 
   useEffect(() => {
-    if (!open || activateApprovalsRequest === 0) return;
+    if (!shouldConsumeActivationRequest(open, activateApprovalsRequest, lastApprovalsActivationRequestRef.current)) {
+      return;
+    }
+    lastApprovalsActivationRequestRef.current = activateApprovalsRequest;
     setActiveTabId("approvals");
   }, [activateApprovalsRequest, open]);
 
@@ -390,6 +394,14 @@ export function isTranscriptScrollPinned(
   thresholdPx = transcriptScrollPinThresholdPx,
 ): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= thresholdPx;
+}
+
+export function shouldConsumeActivationRequest(
+  open: boolean,
+  activationRequest: number,
+  lastConsumedRequest: number,
+): boolean {
+  return open && activationRequest !== 0 && activationRequest !== lastConsumedRequest;
 }
 
 function scrollTranscriptListToBottom(element: Pick<HTMLElement, "scrollHeight" | "scrollTop">): void {

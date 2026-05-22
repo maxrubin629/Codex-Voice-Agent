@@ -6,6 +6,7 @@ import {
   voiceShortcutActionForEvent,
 } from "./main";
 import {
+  shouldConsumeActivationRequest,
   isTranscriptScrollPinned,
   transcriptEntries,
 } from "./rightPanel";
@@ -55,6 +56,13 @@ describe("pending request activation", () => {
     expect(hasNewPendingRequests(["approval-1"], [request("approval-1")])).toBe(false);
     expect(hasNewPendingRequests(["approval-1"], [request("approval-1"), request("approval-2")])).toBe(true);
     expect(hasNewPendingRequests(["approval-1", "approval-2"], [request("approval-2")])).toBe(false);
+  });
+
+  it("consumes a sidebar activation request only once", () => {
+    expect(shouldConsumeActivationRequest(true, 1, 0)).toBe(true);
+    expect(shouldConsumeActivationRequest(true, 1, 1)).toBe(false);
+    expect(shouldConsumeActivationRequest(false, 2, 1)).toBe(false);
+    expect(shouldConsumeActivationRequest(true, 2, 1)).toBe(true);
   });
 });
 
