@@ -14,6 +14,7 @@ import type {
   CodexChatRuntime,
   CodexModelSummary,
   CodexPermissionMode,
+  CodexRequestOptions,
   CodexTodoItem,
   VoiceChat,
   CodexSettings,
@@ -30,6 +31,11 @@ import type {
   PendingCodexRequest,
   PhoneStatus,
   QueuedCodexRequestResult,
+  RealtimeClientSecret,
+  RealtimeContextInventory,
+  RealtimeContextRequest,
+  RealtimeContextResult,
+  RealtimeContextScope,
   RealtimeReasoningEffort,
   ReasoningEffort,
   ReplayRecordingState,
@@ -59,7 +65,16 @@ import {
 } from "../shared/types";
 import { transcriptMessageFromEvent } from "../shared/transcriptMessages";
 import { CodexBridge, type CodexJsonMessage } from "./codexBridge";
-import { createRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
+import { createRealtimeClientSecret as createOpenAIRealtimeClientSecret, realtimeConfig, saveRealtimeSettings } from "./realtime";
+import {
+  buildRealtimeContextResult,
+  type RealtimeWorkspaceEntry,
+} from "./realtimeContext";
+import {
+  buildRealtimeConversationEndedDelegationText,
+  buildRealtimeDelegationText,
+  realtimeUserMessageItem,
+} from "./realtimeDelegation";
 import { ProjectStore } from "./projectStore";
 import { McpOkGrantStore } from "./mcpOkGrants";
 import { defaultPhoneStatus as createDefaultPhoneStatus } from "./phone";
@@ -105,22 +120,6 @@ type ChatContext = {
   recovered?: boolean;
 };
 
-const CODEX_VOICE_BRIDGE_PROMPT = [
-  "This thread will sometimes receive messages from a voice interface.",
-  "",
-  "Codex (you) owns the actual planning, computer use, tool use, browser use, and execution.",
-  "",
-  "For requests that may require controlling desktop apps or browser state, use tool_search to discover relevant tools such as computer-use or Chrome before choosing an approach. Ask for clarification or approval when needed, and keep final outputs clear, with the right amount of detail to be relayed by voice.",
-  "",
-  "Messages beginning with exactly `Voice ===` followed by a newline are mediated by the Realtime model. Treat the content after that marker as the user's intended request, but account for possible transcription, summarization, or routing errors. The Realtime model cannot directly see the state of the project or thread unless that information is provided to it through the conversation. If the request is ambiguous, ask a concise clarification.",
-  "",
-  "Messages that do not begin with that marker are normal text-based messages from the user and should be treated normally.",
-  "",
-  "Do not mention this convention unless it is relevant to resolving ambiguity.",
-].join("\n");
-const CODEX_VOICE_MARKER = "Voice ===\n";
-const CODEX_VOICE_BRIDGE_PROMPT_PATTERN = new RegExp(escapeRegExp(CODEX_VOICE_BRIDGE_PROMPT));
-
 type ReviewTarget =
   | { type: "uncommittedChanges" }
   | { type: "baseBranch"; branch: string }
@@ -134,6 +133,7 @@ type QueuedCodexRequest = {
   projectId: string;
   threadId: string;
   workspacePath: string | null;
+  options: CodexRequestOptions;
   queuedAt: string;
 };
 
@@ -165,6 +165,8 @@ export class VoiceCodexOrchestrator extends EventEmitter {
   private drainingQueuedThreads = new Set<string>();
   private subagentLogSyncAtByThread = new Map<string, number>();
   private activeReplaySession: ReplaySessionMetadata | null = null;
+  private realtimeSessionActive = false;
+  private realtimeStartedThreadIds = new Set<string>();
   private readonly mcpOkGrants = new McpOkGrantStore();
 
   constructor(
@@ -395,11 +397,17 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.emitState();
   }
 
-  async sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult> {
+  async sendToCodex(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options: CodexRequestOptions = {},
+  ): Promise<CodexActionResult> {
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Cannot send an empty request to Codex.");
 
-    if (trimmed.startsWith("/")) {
+    const realtimeSource = options.source === "realtime";
+    if (!realtimeSource && trimmed.startsWith("/")) {
       return this.handleNativeSlashCommand(trimmed);
     }
 
@@ -409,10 +417,14 @@ export class VoiceCodexOrchestrator extends EventEmitter {
 
     const turnSettings = this.resolveTurnSettings(project, chat);
     const cwd = projectWorkspacePath(project);
-    const bridgeAlreadyInjected = await this.threadHasVoiceBridgePrompt(project.id, chat);
-    const voiceBridgePromptInjectedAt =
-      chat.voiceBridgePromptInjectedAt ?? (bridgeAlreadyInjected ? new Date().toISOString() : null);
-    const inputText = codexVoiceTurnText(trimmed, bridgeAlreadyInjected);
+    const includeRealtimeStart = realtimeSource && !this.realtimeStartedThreadIds.has(chat.codexThreadId);
+    const inputText = realtimeSource
+      ? buildRealtimeDelegationText({
+          input: trimmed,
+          transcriptDelta: options.transcriptDelta,
+          includeStart: includeRealtimeStart,
+        })
+      : trimmed;
     const turnStartParams = {
       threadId: chat.codexThreadId,
       cwd,
@@ -435,6 +447,10 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const turnId = result.turn?.id;
     if (!turnId) throw new Error("Codex did not return a turn id.");
 
+    if (realtimeSource) {
+      this.realtimeSessionActive = true;
+      this.realtimeStartedThreadIds.add(chat.codexThreadId);
+    }
     this.activeTurnByThread.set(chat.codexThreadId, turnId);
     this.threadByTurn.set(turnId, chat.codexThreadId);
     this.activeTurnModelByThread.set(chat.codexThreadId, turnSettings.model);
@@ -448,7 +464,6 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     this.status = `${chat.displayName}: Codex is working.`;
     const updated = await this.store.updateChat(project.id, chat.id, {
       lastStatus: "Codex is working.",
-      voiceBridgePromptInjectedAt: voiceBridgePromptInjectedAt ?? new Date().toISOString(),
     });
     this.emitEvent("app", "turnStarted", `Sent request to "${chat.displayName}".`, { turnId, chatId: chat.id, text: trimmed });
     this.emitState();
@@ -514,6 +529,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     text: string,
     chatId?: string,
     workspacePath?: string | null,
+    options: CodexRequestOptions = {},
   ): Promise<QueuedCodexRequestResult> {
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Cannot queue an empty request for Codex.");
@@ -522,7 +538,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     const threadId = chat.codexThreadId;
     const activeTurnId = threadId ? this.activeTurnByThread.get(threadId) ?? null : null;
     if (!threadId || !activeTurnId) {
-      const started = await this.sendToCodex(trimmed, chat.id, workspacePath);
+      const started = await this.sendToCodex(trimmed, chat.id, workspacePath, options);
       return {
         queued: false,
         queuedId: null,
@@ -543,6 +559,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       projectId: project.id,
       threadId,
       workspacePath: workspacePath?.trim() || null,
+      options,
       queuedAt: new Date().toISOString(),
     };
     queue.push(queued);
@@ -660,6 +677,39 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     await this.store.updateChat(project.id, chat.id, { lastStatus: "Requested Codex interruption." });
     this.status = `Requested interruption for "${chat.displayName}".`;
     this.emitEvent("app", "turnInterrupted", this.status, { chatId: chat.id, turnId });
+    this.emitState();
+  }
+
+  async realtimeSessionStarted(): Promise<void> {
+    this.realtimeSessionActive = true;
+    this.realtimeStartedThreadIds.clear();
+    this.emitEvent("realtime", "conversationStarted", "Realtime conversation started.");
+    this.emitState();
+  }
+
+  async realtimeSessionEnded(): Promise<void> {
+    if (!this.realtimeSessionActive && this.realtimeStartedThreadIds.size === 0) return;
+
+    const threadIds = await this.realtimeEndTargetThreadIds();
+    this.realtimeSessionActive = false;
+    this.realtimeStartedThreadIds.clear();
+
+    if (threadIds.length === 0) {
+      this.emitEvent("realtime", "conversationEnded", "Realtime conversation ended with no active Codex thread.");
+      this.emitState();
+      return;
+    }
+
+    const text = buildRealtimeConversationEndedDelegationText();
+    for (const threadId of threadIds) {
+      const params = {
+        threadId,
+        items: [realtimeUserMessageItem(text)],
+      };
+      this.emitEvent("codex", "thread/inject_items/request", "Injecting realtime end context into Codex thread.", params);
+      await this.codex.request("thread/inject_items", params);
+    }
+    this.emitEvent("realtime", "conversationEnded", "Realtime conversation ended.", { threadIds });
     this.emitState();
   }
 
@@ -1033,6 +1083,73 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return this.store.listTranscriptMessages(project.id, chat.id);
   }
 
+  async getRealtimeContext(request: RealtimeContextRequest = {}): Promise<RealtimeContextResult> {
+    const scope = normalizeRealtimeContextScope(request.scope);
+    let state: AppState;
+    try {
+      state = await this.state();
+      const chatId = await this.resolveRealtimeContextChatId(request, state);
+      const project = chatId
+        ? await this.requireProjectForChat(chatId)
+        : state.activeProject ?? (state.runtime.activeProjectId
+          ? state.projects.find((candidate) => candidate.id === state.runtime.activeProjectId) ?? null
+          : null);
+      const activeThreadSummary = shouldIncludeRealtimeContextSection(scope, "current_thread")
+        ? await this.getActiveThreadSummary(chatId ?? undefined).catch((error) =>
+            emptyActiveThreadSummary({
+              status: "error",
+              project,
+              chat: project
+                ? chatId
+                  ? project.chats.find((candidate) => candidate.id === chatId && !candidate.archivedAt) ?? null
+                  : activeChatForProject(project)
+                : null,
+              errorMessage: error instanceof Error ? error.message : String(error),
+            }),
+          )
+        : null;
+      const chatStatuses = shouldIncludeRealtimeContextSection(scope, "recent_work")
+        || shouldIncludeRealtimeContextSection(scope, "active_focus")
+          ? await this.getChatStatus(chatId ?? undefined).catch(() => [])
+          : [];
+      const subagents = shouldIncludeRealtimeContextSection(scope, "subagents")
+        ? await this.listSubagents(chatId ?? undefined).catch(() => null)
+        : null;
+      const transcriptMessages = scope === "startup" || scope === "all" || scope === "active_focus"
+        ? await this.getTranscriptMessages(chatId ?? undefined).catch(() => [])
+        : [];
+      const inventory = shouldIncludeRealtimeContextSection(scope, "plugins")
+        ? await this.realtimeContextInventory(project).catch((error) => ({
+            plugins: [],
+            mcpServers: [],
+            apps: [],
+            errors: [error instanceof Error ? error.message : String(error)],
+          }))
+        : null;
+      const workspaceEntries = shouldIncludeRealtimeContextSection(scope, "workspace_map")
+        ? await realtimeWorkspaceEntries(project ? projectWorkspacePath(project) : null).catch(() => [])
+        : [];
+
+      return buildRealtimeContextResult({
+        scope,
+        state,
+        activeThreadSummary,
+        chatStatuses,
+        subagents,
+        transcriptMessages,
+        inventory,
+        workspaceEntries,
+      });
+    } catch (error) {
+      state = await this.safeRealtimeContextState();
+      return buildRealtimeContextResult({
+        scope,
+        state,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async recordTranscriptEvent(event: AppEvent): Promise<void> {
     const message = transcriptMessageFromEvent(event);
     if (!message) return;
@@ -1216,7 +1333,19 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return this.codexSettings(updated);
   }
 
-  createRealtimeClientSecret = createRealtimeClientSecret;
+  async createRealtimeClientSecret(): Promise<RealtimeClientSecret> {
+    try {
+      const startupContext = await this.getRealtimeContext({ scope: "startup" });
+      return createOpenAIRealtimeClientSecret(startupContext.ok ? startupContext : null);
+    } catch (error) {
+      this.emitEvent(
+        "realtime",
+        "startupContextFailed",
+        error instanceof Error ? error.message : "Unable to build Realtime startup context.",
+      );
+      return createOpenAIRealtimeClientSecret(null);
+    }
+  }
 
   async setRealtimeSettings(settings: {
     model?: AppState["realtime"]["model"] | null;
@@ -1314,6 +1443,65 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return await this.syncChatSubagentsFromSessionLog(context, true) ?? context;
   }
 
+  private async resolveRealtimeContextChatId(
+    request: RealtimeContextRequest,
+    state: AppState,
+  ): Promise<string | undefined> {
+    const chatId = request.chatId?.trim();
+    if (chatId) return chatId;
+    const chatName = request.chatName?.trim().toLowerCase();
+    if (!chatName) return undefined;
+    const activeProject = state.activeProject ??
+      (state.runtime.activeProjectId
+        ? state.projects.find((project) => project.id === state.runtime.activeProjectId) ?? null
+        : null);
+    const candidates = activeProject?.chats.filter((chat) => !chat.archivedAt) ?? [];
+    const exact = candidates.find((chat) => chat.displayName.toLowerCase() === chatName);
+    if (exact) return exact.id;
+    const partial = candidates.find((chat) => chat.displayName.toLowerCase().includes(chatName));
+    return partial?.id;
+  }
+
+  private async realtimeContextInventory(project: VoiceProject | null): Promise<RealtimeContextInventory> {
+    const errors: string[] = [];
+    const workspacePath = project ? projectWorkspacePath(project) : null;
+    const activeChat = project ? activeChatForProject(project) : null;
+
+    const plugins = await this.codex.request("plugin/list", {
+      cwds: workspacePath ? [workspacePath] : null,
+    }).then((result) => realtimePluginsFromResult(result), (error) => {
+      errors.push(`plugin/list failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    });
+
+    const mcpServers = await this.codex.request("mcpServerStatus/list", {
+      limit: 100,
+      detail: "toolsAndAuthOnly",
+    }).then((result) => realtimeMcpServersFromResult(result), (error) => {
+      errors.push(`mcpServerStatus/list failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    });
+
+    const apps = await this.codex.request("app/list", {
+      limit: 100,
+      threadId: activeChat?.codexThreadId ?? null,
+      forceRefetch: false,
+    }).then((result) => realtimeAppsFromResult(result), (error) => {
+      errors.push(`app/list failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    });
+
+    return { plugins, mcpServers, apps, errors };
+  }
+
+  private async safeRealtimeContextState(): Promise<AppState> {
+    try {
+      return await this.state();
+    } catch {
+      return emptyRealtimeContextState(this.store.baseFolder);
+    }
+  }
+
   private async requireChatContextForPrompt(text: string, chatId?: string): Promise<ChatContext> {
     if (chatId) return this.requireChatContext(chatId);
 
@@ -1333,21 +1521,13 @@ export class VoiceCodexOrchestrator extends EventEmitter {
     return { project, chat };
   }
 
-  private async threadHasVoiceBridgePrompt(projectId: string, chat: VoiceChat): Promise<boolean> {
-    if (chat.voiceBridgePromptInjectedAt) return true;
-    if (!chat.codexThreadId) return false;
+  private async realtimeEndTargetThreadIds(): Promise<string[]> {
+    const touchedThreadIds = [...this.realtimeStartedThreadIds];
+    if (touchedThreadIds.length > 0) return touchedThreadIds;
 
-    const response = (await this.codex.request("thread/read", {
-      threadId: chat.codexThreadId,
-      includeTurns: true,
-    })) as ThreadReadResponse;
-    const hasLegacyPrompt = threadTurnsHaveVoiceBridgePrompt(response.thread?.turns);
-    if (hasLegacyPrompt) {
-      await this.store.updateChat(projectId, chat.id, {
-        voiceBridgePromptInjectedAt: new Date().toISOString(),
-      });
-    }
-    return hasLegacyPrompt;
+    const project = await this.getActiveProject();
+    const chat = project ? activeChatForProject(project) : null;
+    return chat?.codexThreadId ? [chat.codexThreadId] : [];
   }
 
   private async resumeChatThread(project: VoiceProject, chat: VoiceChat): Promise<ChatContext> {
@@ -1639,7 +1819,7 @@ export class VoiceCodexOrchestrator extends EventEmitter {
       await this.store.updateChat(context.project.id, context.chat.id, {
         lastStatus: "Starting queued request.",
       });
-      const result = await this.sendToCodex(queued.text, context.chat.id, queued.workspacePath);
+      const result = await this.sendToCodex(queued.text, context.chat.id, queued.workspacePath, queued.options);
       this.emitEvent("app", "queuedTurnStarted", this.status, {
         queuedId: queued.id,
         previousTurnId,
@@ -4575,6 +4755,171 @@ function projectWorkspacePath(project: VoiceProject): string {
   return project.workspacePath || project.folderPath;
 }
 
+const REALTIME_CONTEXT_SCOPES: RealtimeContextScope[] = [
+  "startup",
+  "active_focus",
+  "current_thread",
+  "recent_work",
+  "workspace_map",
+  "subagents",
+  "plugins",
+  "all",
+];
+const REALTIME_CONTEXT_NOISY_DIRS = new Set([
+  ".git",
+  ".next",
+  ".cache",
+  ".codex-voice-agent",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "target",
+]);
+const REALTIME_CONTEXT_WORKSPACE_MAX_ENTRIES = 80;
+const REALTIME_CONTEXT_WORKSPACE_MAX_DEPTH = 2;
+
+function normalizeRealtimeContextScope(scope: unknown): RealtimeContextScope {
+  return typeof scope === "string" && REALTIME_CONTEXT_SCOPES.includes(scope as RealtimeContextScope)
+    ? (scope as RealtimeContextScope)
+    : "all";
+}
+
+function shouldIncludeRealtimeContextSection(
+  scope: RealtimeContextScope,
+  section: RealtimeContextScope,
+): boolean {
+  if (scope === "startup" || scope === "all") return true;
+  return scope === section;
+}
+
+async function realtimeWorkspaceEntries(workspacePath: string | null): Promise<RealtimeWorkspaceEntry[]> {
+  if (!workspacePath) return [];
+  const entries: RealtimeWorkspaceEntry[] = [];
+  await collectRealtimeWorkspaceEntries(workspacePath, "", 0, entries);
+  return entries;
+}
+
+async function collectRealtimeWorkspaceEntries(
+  root: string,
+  relativePath: string,
+  depth: number,
+  entries: RealtimeWorkspaceEntry[],
+): Promise<void> {
+  if (entries.length >= REALTIME_CONTEXT_WORKSPACE_MAX_ENTRIES || depth > REALTIME_CONTEXT_WORKSPACE_MAX_DEPTH) {
+    return;
+  }
+  const dirPath = relativePath ? path.join(root, relativePath) : root;
+  const dirEntries = await readdir(dirPath, { withFileTypes: true });
+  for (const entry of dirEntries.sort((left, right) => left.name.localeCompare(right.name))) {
+    if (entries.length >= REALTIME_CONTEXT_WORKSPACE_MAX_ENTRIES) return;
+    if (entry.name.startsWith(".") && entry.name !== ".codex") continue;
+    if (entry.isDirectory() && REALTIME_CONTEXT_NOISY_DIRS.has(entry.name)) continue;
+    const childRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
+    if (entry.isDirectory()) {
+      entries.push({ path: childRelativePath, kind: "directory" });
+      await collectRealtimeWorkspaceEntries(root, childRelativePath, depth + 1, entries);
+    } else if (entry.isFile()) {
+      entries.push({ path: childRelativePath, kind: "file" });
+    }
+  }
+}
+
+function realtimePluginsFromResult(result: unknown): RealtimeContextInventory["plugins"] {
+  const record = recordFromUnknown(result);
+  const marketplaces = Array.isArray(record?.marketplaces) ? record.marketplaces : [];
+  return marketplaces.flatMap((marketplaceValue) => {
+    const marketplace = recordFromUnknown(marketplaceValue);
+    const marketplaceName = stringField(marketplace?.name) ?? null;
+    const plugins = Array.isArray(marketplace?.plugins) ? marketplace.plugins : [];
+    return plugins.map((pluginValue) => {
+      const plugin = recordFromUnknown(pluginValue) ?? {};
+      return {
+        id: stringField(plugin.id) ?? stringField(plugin.name) ?? "unknown",
+        name: stringField(plugin.name) ?? stringField(plugin.id) ?? "Unknown plugin",
+        marketplace: marketplaceName,
+        installed: Boolean(plugin.installed),
+        enabled: Boolean(plugin.enabled),
+      };
+    });
+  });
+}
+
+function realtimeMcpServersFromResult(result: unknown): RealtimeContextInventory["mcpServers"] {
+  const record = recordFromUnknown(result);
+  const servers = Array.isArray(record?.data) ? record.data : [];
+  return servers.map((serverValue) => {
+    const server = recordFromUnknown(serverValue) ?? {};
+    const tools = recordFromUnknown(server.tools) ?? {};
+    return {
+      name: stringField(server.name) ?? "unknown",
+      authStatus: stringField(server.authStatus) ?? stringField(server.auth_status) ?? null,
+      toolNames: Object.keys(tools).sort(),
+    };
+  });
+}
+
+function realtimeAppsFromResult(result: unknown): RealtimeContextInventory["apps"] {
+  const record = recordFromUnknown(result);
+  const apps = Array.isArray(record?.data) ? record.data : [];
+  return apps.map((appValue) => {
+    const app = recordFromUnknown(appValue) ?? {};
+    return {
+      id: stringField(app.id) ?? stringField(app.name) ?? "unknown",
+      name: stringField(app.name) ?? stringField(app.id) ?? "Unknown app",
+      enabled: Boolean(app.isEnabled),
+      accessible: Boolean(app.isAccessible),
+      pluginDisplayNames: Array.isArray(app.pluginDisplayNames)
+        ? app.pluginDisplayNames.filter((name): name is string => typeof name === "string")
+        : [],
+    };
+  });
+}
+
+function emptyRealtimeContextState(baseFolder: string): AppState {
+  return {
+    baseFolder,
+    projects: [],
+    archivedProjects: [],
+    activeProject: null,
+    runtime: {
+      ready: false,
+      activeProjectId: null,
+      activeChatId: null,
+      activeTurnId: null,
+      status: "Unable to read app state.",
+      threadStatus: null,
+      tokenUsage: null,
+      pendingRequests: [],
+      chats: [],
+      showProjectChats: false,
+    },
+    codexSettings: {
+      defaultModel: DEFAULT_CODEX_MODEL,
+      defaultReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
+      defaultServiceTier: DEFAULT_CODEX_SERVICE_TIER,
+      defaultPermissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+      chatModel: null,
+      chatReasoningEffort: null,
+      chatServiceTier: null,
+      chatPermissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+      nextTurnModel: null,
+      nextTurnReasoningEffort: null,
+      nextTurnServiceTier: null,
+      nextTurnPermissionMode: null,
+      activeTurnModel: null,
+      activeTurnReasoningEffort: null,
+      activeTurnServiceTier: null,
+      activeTurnPermissionMode: null,
+      models: [],
+    },
+    mcpOkGrants: [],
+    realtime: realtimeConfig(),
+    phone: createDefaultPhoneStatus(),
+    replay: { active: null },
+  };
+}
+
 async function resolveWorkspacePathInput(value: string | null | undefined): Promise<string | null> {
   const raw = value?.trim();
   if (!raw) return null;
@@ -4715,20 +5060,4 @@ function emptyChatForThread(threadId: string): VoiceChat {
     lastStatus: null,
     lastTurnOutput: null,
   };
-}
-
-export function codexVoiceTurnText(userText: string, bridgeAlreadyInjected: boolean): string {
-  const voiceRequest = `${CODEX_VOICE_MARKER}${userText}`;
-  return bridgeAlreadyInjected ? voiceRequest : `${CODEX_VOICE_BRIDGE_PROMPT}\n\n${voiceRequest}`;
-}
-
-export function threadTurnsHaveVoiceBridgePrompt(turns: CodexThreadTurn[] | undefined): boolean {
-  return (turns ?? []).some((turn) => {
-    const userText = userTextFromTurn(turn);
-    return userText ? CODEX_VOICE_BRIDGE_PROMPT_PATTERN.test(userText) : false;
-  });
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

@@ -2,6 +2,7 @@ import type {
   AppState,
   ApprovalDecision,
   CodexPermissionMode,
+  CodexRequestOptions,
   CodexRuntimeState,
   CodexSettings,
   CodexSettingsScope,
@@ -10,6 +11,8 @@ import type {
   PendingCodexRequest,
   QueuedCodexRequestResult,
   ReasoningEffort,
+  RealtimeContextRequest,
+  RealtimeContextResult,
   ToolQuestionAnswer,
   VoiceChat,
   VoiceProject,
@@ -18,12 +21,18 @@ import type { PhoneToolHandler } from "./phone";
 
 type VoiceToolApi = {
   state(): Promise<AppState>;
-  sendToCodex(text: string, chatId?: string, workspacePath?: string | null): Promise<CodexActionResult>;
+  sendToCodex(
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ): Promise<CodexActionResult>;
   steerCodex(text: string, chatId?: string): Promise<{ turnId: string }>;
   queueCodexRequest(
     text: string,
     chatId?: string,
     workspacePath?: string | null,
+    options?: CodexRequestOptions,
   ): Promise<QueuedCodexRequestResult>;
   cancelQueuedCodexRequest(queuedId?: string | null, chatId?: string): Promise<unknown>;
   interruptCodex(chatId?: string): Promise<void>;
@@ -44,6 +53,7 @@ type VoiceToolApi = {
   createChat(name: string, projectId?: string): Promise<VoiceProject>;
   switchChat(chatId: string, projectId?: string): Promise<VoiceProject>;
   getChatStatus(chatId?: string): Promise<CodexRuntimeState["chats"]>;
+  getRealtimeContext(request?: RealtimeContextRequest): Promise<RealtimeContextResult>;
   showProjectChats(open?: boolean): Promise<void>;
   resumeProject(projectId: string): Promise<VoiceProject>;
   summarizeProject(projectId?: string, chatId?: string): Promise<string>;
@@ -51,18 +61,23 @@ type VoiceToolApi = {
 
 export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
   return async (name, args) => {
+    if (name === "remain_silent") {
+      return { ok: true, silent: true };
+    }
+
     if (name === "submit_to_codex") {
       const request = stringArg(args.request);
       const context = optionalString(args.context);
       const chatId = await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName));
       const result = await api.sendToCodex(
-        context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+        request,
         chatId,
         optionalString(args.workspacePath),
+        { source: "realtime", transcriptDelta: context },
       );
       return {
         ok: true,
-        message: result.message,
+        message: "Work started.",
         turnId: result.turnId,
         project: result.project,
         chat: result.chat,
@@ -74,16 +89,17 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
         stringArg(args.message),
         await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName)),
       );
-      return { ok: true, message: "Codex received the update.", ...result };
+      return { ok: true, message: "Update received.", ...result };
     }
 
     if (name === "queue_codex_request") {
       const request = stringArg(args.request);
       const context = optionalString(args.context);
       const result = await api.queueCodexRequest(
-        context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+        request,
         await resolveChatId(api, optionalString(args.chatId), optionalString(args.chatName)),
         optionalString(args.workspacePath),
+        { source: "realtime", transcriptDelta: context },
       );
       return { ok: true, ...result };
     }
@@ -111,6 +127,15 @@ export function createVoiceToolHandler(api: VoiceToolApi): PhoneToolHandler {
         runtime: state.runtime,
         codexSettings: state.codexSettings,
       };
+    }
+
+    if (name === "get_codex_context") {
+      const result = await api.getRealtimeContext({
+        scope: realtimeContextScopeArg(args.scope),
+        chatId: optionalString(args.chatId),
+        chatName: optionalString(args.chatName),
+      });
+      return { ...result, context: result.text };
     }
 
     if (name === "list_codex_subagents") {
@@ -320,6 +345,23 @@ function stringArg(value: unknown): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function realtimeContextScopeArg(value: unknown): RealtimeContextRequest["scope"] {
+  const scope = optionalString(value);
+  const allowed: Array<NonNullable<RealtimeContextRequest["scope"]>> = [
+    "startup",
+    "active_focus",
+    "current_thread",
+    "recent_work",
+    "workspace_map",
+    "subagents",
+    "plugins",
+    "all",
+  ];
+  return allowed.includes(scope as NonNullable<RealtimeContextRequest["scope"]>)
+    ? scope as RealtimeContextRequest["scope"]
+    : undefined;
 }
 
 async function resolveChatId(

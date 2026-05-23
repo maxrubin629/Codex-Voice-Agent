@@ -14,6 +14,7 @@ import type {
   CodexPermissionMode,
   CodexSettingsScope,
   RealtimeModelId,
+  RealtimeContextRequest,
   RealtimeReasoningEffort,
   RealtimeVoiceId,
   PhoneSettingsUpdate,
@@ -222,7 +223,11 @@ async function boot(): Promise<void> {
   const store = new ProjectStore();
   const codex = new CodexBridge();
   orchestrator = new VoiceCodexOrchestrator(store, codex, () => requirePhoneController().status());
-  phoneController = new PhoneController(undefined, { toolHandler: createVoiceToolHandler(orchestrator) });
+  phoneController = new PhoneController(undefined, {
+    toolHandler: createVoiceToolHandler(orchestrator),
+    onRealtimeSessionStarted: () => requireOrchestrator().realtimeSessionStarted(),
+    onRealtimeSessionEnded: () => requireOrchestrator().realtimeSessionEnded(),
+  });
 
   orchestrator.on("state", (state) => broadcastToAppWindows("app:state", state));
   orchestrator.on("event", (event) => publishEvent(normalizeAppEvent(event)));
@@ -398,17 +403,43 @@ function registerIpc(): void {
   );
   registerIpcHandler(
     "codex:send",
-    (_event, payload: { text: string; chatId?: string; workspacePath?: string | null }) =>
-      requireOrchestrator().sendToCodex(payload.text, payload.chatId, payload.workspacePath),
+    (
+      _event,
+      payload: {
+        text: string;
+        chatId?: string;
+        workspacePath?: string | null;
+        source?: "typed" | "realtime";
+        transcriptDelta?: string | null;
+      },
+    ) =>
+      requireOrchestrator().sendToCodex(payload.text, payload.chatId, payload.workspacePath, {
+        source: payload.source,
+        transcriptDelta: payload.transcriptDelta,
+      }),
   );
   registerIpcHandler("codex:steer", (_event, payload: { text: string; chatId?: string }) =>
     requireOrchestrator().steerCodex(payload.text, payload.chatId),
   );
   registerIpcHandler(
     "codex:queue",
-    (_event, payload: { text: string; chatId?: string; workspacePath?: string | null }) =>
-      requireOrchestrator().queueCodexRequest(payload.text, payload.chatId, payload.workspacePath),
+    (
+      _event,
+      payload: {
+        text: string;
+        chatId?: string;
+        workspacePath?: string | null;
+        source?: "typed" | "realtime";
+        transcriptDelta?: string | null;
+      },
+    ) =>
+      requireOrchestrator().queueCodexRequest(payload.text, payload.chatId, payload.workspacePath, {
+        source: payload.source,
+        transcriptDelta: payload.transcriptDelta,
+      }),
   );
+  registerIpcHandler("realtime:sessionStarted", () => requireOrchestrator().realtimeSessionStarted());
+  registerIpcHandler("realtime:sessionEnded", () => requireOrchestrator().realtimeSessionEnded());
   registerIpcHandler(
     "codex:cancelQueued",
     (_event, payload?: { queuedId?: string | null; chatId?: string }) =>
@@ -470,6 +501,11 @@ function registerIpc(): void {
   registerIpcHandler(
     "rightPanel:getTranscriptMessages",
     (_event, payload?: { chatId?: string }) => requireOrchestrator().getTranscriptMessages(payload?.chatId),
+  );
+  registerIpcHandler(
+    "realtime:getContext",
+    (_event, payload?: RealtimeContextRequest) =>
+      requireOrchestrator().getRealtimeContext(payload),
   );
   registerIpcHandler("settings:saveOpenAiApiKey", (_event, payload: { apiKey: string }) => {
     saveOpenAiApiKey(payload.apiKey);

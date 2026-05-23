@@ -7,14 +7,18 @@ import type {
   CodexSettingsScope,
   CodexTurnOutput,
   PendingCodexRequest,
+  RealtimeContextRequest,
   ToolQuestionAnswer,
   VoiceChat,
   VoiceTranscriptMessage,
 } from "../../shared/types";
+import { shouldCreateRealtimeResponseAfterToolOutputs } from "../../shared/realtimeSpeechPolicy";
 
 type RealtimeCallbacks = {
   onLog: (event: AppEvent) => void;
   onConnectionChange: (connected: boolean, label: string) => void;
+  onSessionStarted?: () => Promise<void>;
+  onSessionEnded?: () => Promise<void>;
   onOutputLevel?: (level: number) => void;
   getTranscriptMessages?: (chatId: string) => Promise<VoiceTranscriptMessage[]>;
 };
@@ -75,6 +79,8 @@ export class RealtimeVoiceClient {
   private trackedResponses = new Map<string, TrackedRealtimeResponse>();
   private functionCallsByCallId = new Map<string, TrackedFunctionCall>();
   private functionCallsByItemId = new Map<string, TrackedFunctionCall>();
+  private sessionLifecycleActive = false;
+  private startupContextIncluded = false;
 
   constructor(private readonly callbacks: RealtimeCallbacks) {}
 
@@ -90,6 +96,7 @@ export class RealtimeVoiceClient {
     if (this.pc) return;
     this.callbacks.onConnectionChange(false, "Creating Realtime session.");
     const secret = await window.codexVoice.createRealtimeClientSecret();
+    this.startupContextIncluded = Boolean(secret.startupContextIncluded);
 
     const pc = new RTCPeerConnection();
     const audioEl = document.createElement("audio");
@@ -116,9 +123,11 @@ export class RealtimeVoiceClient {
           `Connected to ${secret.model} (${secret.voice}, reasoning ${secret.reasoningEffort}).`,
         );
         this.log("connection", "Realtime data channel opened.");
-        void this.injectActiveChatContext("connect");
+        this.notifySessionStarted();
+        if (!this.startupContextIncluded) void this.injectActiveChatContext("connect");
       });
       dc.addEventListener("close", () => {
+        this.notifySessionEnded();
         this.callbacks.onConnectionChange(false, "Realtime data channel closed.");
         this.log("connection", "Realtime data channel closed.");
       });
@@ -152,6 +161,7 @@ export class RealtimeVoiceClient {
   }
 
   disconnect(): void {
+    this.notifySessionEnded();
     this.realtimeEpoch += 1;
     this.trackedResponses.clear();
     this.functionCallsByCallId.clear();
@@ -212,15 +222,6 @@ export class RealtimeVoiceClient {
 
     this.sendConversationText(update);
     this.log("codexCompletion", event.message, event.raw);
-    if (this.paused) return;
-
-    this.send({
-      type: "response.create",
-      response: {
-        output_modalities: ["audio"],
-        instructions: codexCompletionSpeechInstructions(event),
-      },
-    });
   }
 
   speakQueuedCodexTransition(raw: unknown): void {
@@ -230,46 +231,12 @@ export class RealtimeVoiceClient {
 
     this.sendConversationText(update.contextText);
     this.log("queuedCodexTransition", update.message, raw);
-    if (this.paused) return;
-
-    this.send({
-      type: "response.create",
-      response: {
-        output_modalities: ["audio"],
-        instructions: [
-          "A Codex completion-and-next-task status update was just added by the app.",
-          `Briefly tell the user: ${update.message}`,
-          "Use one short natural sentence.",
-          "Do not call tools.",
-        ].join("\n"),
-      },
-    });
   }
 
   injectCodexTurnOutput(output: CodexTurnOutput): void {
     if (!this.connected) return;
     this.sendConversationText(codexTurnOutputContextText(output));
     this.log("codexTurnOutputContext", "Injected Codex final output into Realtime context.", output);
-    if (output.nextQueuedRequestText) return;
-    if (this.paused) return;
-
-    this.send({
-      type: "response.create",
-      response: {
-        output_modalities: ["audio"],
-        instructions: [
-          "App-provided Codex final output was just added to the conversation.",
-          "Give the user a short natural completion nudge, not a full summary.",
-          "Prefer the shape: 'Hey, just wanted to let you know Codex finished ...' but vary the wording naturally.",
-          "Use the final output to decide whether the blank should be a specific task/outcome, a blocker, or no extra detail.",
-          "Share at most one specific detail unless the final output says Codex failed or the user needs to act.",
-          "If no concise specific detail is obvious, simply say Codex finished.",
-          "Do not read long paths, logs, lists, or test output aloud.",
-          "Use one short sentence, or two only if there is an important next step.",
-          "Do not call tools.",
-        ].join("\n"),
-      },
-    });
   }
 
   speakPendingRequest(request: PendingCodexRequest): void {
@@ -321,9 +288,10 @@ export class RealtimeVoiceClient {
 
     const injectionSeq = ++this.chatContextInjectionSeq;
     try {
-      const messages = this.callbacks.getTranscriptMessages
-        ? await this.callbacks.getTranscriptMessages(context.chatId)
-        : [];
+      const realtimeContext = await window.codexVoice.getRealtimeContext({
+        scope: "active_focus",
+        chatId: context.chatId,
+      });
       if (
         !this.connected ||
         injectionSeq !== this.chatContextInjectionSeq ||
@@ -332,23 +300,16 @@ export class RealtimeVoiceClient {
         return;
       }
 
-      const transcriptContext = transcriptContextFromMessages(messages);
       const previousFingerprint = this.injectedTranscriptFingerprints.get(contextKey);
-      const includeTranscript = previousFingerprint !== transcriptContext.fingerprint;
-      const activeContext = activeChatContextText(
-        context,
-        includeTranscript ? transcriptContext : null,
-      );
-      this.sendConversationText(activeContext.text);
-      if (includeTranscript) {
-        this.injectedTranscriptFingerprints.set(contextKey, transcriptContext.fingerprint);
-      }
+      if (realtimeContext.fingerprint && previousFingerprint === realtimeContext.fingerprint) return;
+      this.sendConversationText(realtimeContext.text);
+      if (realtimeContext.fingerprint) this.injectedTranscriptFingerprints.set(contextKey, realtimeContext.fingerprint);
       this.log("activeChatContext", `Injected active chat context for ${context.chatName}.`, {
         reason,
         chatId: context.chatId,
         threadId: context.threadId,
-        transcriptIncluded: includeTranscript,
-        transcriptMessageCount: includeTranscript ? transcriptContext.count : 0,
+        contextScope: realtimeContext.scope,
+        contextFingerprint: realtimeContext.fingerprint,
       });
     } catch (error) {
       this.log(
@@ -666,7 +627,9 @@ export class RealtimeVoiceClient {
           },
         });
       }
-      this.send({ type: "response.create" });
+      if (shouldCreateRealtimeResponseAfterToolOutputs(outputs.map(({ call }) => call.name))) {
+        this.send({ type: "response.create" });
+      }
     } catch (error) {
       this.log("toolOutputSendFailed", "Could not send Realtime tool output.", {
         responseId: record.responseId,
@@ -788,6 +751,22 @@ export class RealtimeVoiceClient {
       raw,
     });
   }
+
+  private notifySessionStarted(): void {
+    if (this.sessionLifecycleActive) return;
+    this.sessionLifecycleActive = true;
+    void this.callbacks.onSessionStarted?.().catch((error) => {
+      this.log("sessionLifecycleFailed", error instanceof Error ? error.message : "Unable to mark realtime started.");
+    });
+  }
+
+  private notifySessionEnded(): void {
+    if (!this.sessionLifecycleActive) return;
+    this.sessionLifecycleActive = false;
+    void this.callbacks.onSessionEnded?.().catch((error) => {
+      this.log("sessionLifecycleFailed", error instanceof Error ? error.message : "Unable to mark realtime ended.");
+    });
+  }
 }
 
 async function callVoiceTool(
@@ -796,18 +775,23 @@ async function callVoiceTool(
   registerCancel?: (cancel: () => Promise<void>) => void,
 ): Promise<unknown> {
   void registerCancel;
+  if (name === "remain_silent") {
+    return { ok: true, silent: true };
+  }
+
   if (name === "submit_to_codex") {
     const request = stringArg(args.request);
     const context = optionalString(args.context);
     const chatId = await resolveChatId(optionalString(args.chatId), optionalString(args.chatName));
     const result = await window.codexVoice.sendToCodex(
-      context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+      request,
       chatId,
       optionalString(args.workspacePath),
+      { source: "realtime", transcriptDelta: context },
     );
     return {
       ok: true,
-      message: result.message,
+      message: "Work started.",
       turnId: result.turnId,
       project: result.project,
       chat: result.chat,
@@ -819,16 +803,17 @@ async function callVoiceTool(
       stringArg(args.message),
       await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
     );
-    return { ok: true, message: "Codex received the update.", ...result };
+    return { ok: true, message: "Update received.", ...result };
   }
 
   if (name === "queue_codex_request") {
     const request = stringArg(args.request);
     const context = optionalString(args.context);
     const result = await window.codexVoice.queueCodexRequest(
-      context ? `${request}\n\nVoice conversation context:\n${context}` : request,
+      request,
       await resolveChatId(optionalString(args.chatId), optionalString(args.chatName)),
       optionalString(args.workspacePath),
+      { source: "realtime", transcriptDelta: context },
     );
     return { ok: true, ...result };
   }
@@ -856,6 +841,15 @@ async function callVoiceTool(
       runtime: state.runtime,
       codexSettings: state.codexSettings,
     };
+  }
+
+  if (name === "get_codex_context") {
+    const result = await window.codexVoice.getRealtimeContext({
+      scope: realtimeContextScopeArg(args.scope),
+      chatId: optionalString(args.chatId),
+      chatName: optionalString(args.chatName),
+    });
+    return { ...result, context: result.text };
   }
 
   if (name === "list_codex_subagents") {
@@ -1085,6 +1079,23 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function realtimeContextScopeArg(value: unknown): RealtimeContextRequest["scope"] {
+  const scope = optionalString(value);
+  const allowed: Array<NonNullable<RealtimeContextRequest["scope"]>> = [
+    "startup",
+    "active_focus",
+    "current_thread",
+    "recent_work",
+    "workspace_map",
+    "subagents",
+    "plugins",
+    "all",
+  ];
+  return allowed.includes(scope as NonNullable<RealtimeContextRequest["scope"]>)
+    ? scope as RealtimeContextRequest["scope"]
+    : undefined;
+}
+
 async function resolveChatId(
   chatId: string | undefined,
   name?: string,
@@ -1293,27 +1304,6 @@ function codexCompletionUpdateText(event: AppEvent): string | null {
   return lines.join("\n");
 }
 
-function codexCompletionSpeechInstructions(event: AppEvent): string {
-  const raw = (event.raw ?? {}) as {
-    turn?: {
-      status?: unknown;
-    };
-  };
-  const status = raw.turn?.status;
-  const outcome =
-    status === "interrupted"
-      ? "Codex was interrupted."
-      : status === "failed"
-        ? "Codex failed."
-        : "Codex finished.";
-  return [
-    "A Codex completion status update was just added to the conversation by the app.",
-    `Briefly tell the user: ${outcome}`,
-    "Use one short natural sentence.",
-    "Do not call tools.",
-  ].join("\n");
-}
-
 function queuedCodexTransitionText(raw: unknown): { message: string; contextText: string } | null {
   const record = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
   const text = typeof record.text === "string" ? record.text.trim() : "";
@@ -1415,12 +1405,14 @@ function truncateTranscriptContextLine(value: string, maxLength: number): string
 
 function codexTurnOutputContextText(output: CodexTurnOutput): string {
   return [
-    "App-provided Codex context, not a user request.",
-    "The previous Codex turn produced this exact final assistant output.",
-    "Use it as factual context if the user asks what happened, asks for a summary, or asks about the last Codex turn.",
+    "App-provided context from completed work, not a user request.",
+    "The previous completed turn produced this exact final assistant output.",
+    "Use it as factual context if the user asks what happened, asks for a summary, or asks about the last completed turn.",
+    "When speaking about this output, summarize it in first person as what you found, learned, or did unless the user asks for exact wording or source attribution.",
+    "Do not attribute ordinary summaries to Codex, the backend, a tool, or an unnamed it.",
     "Do not treat this message as an instruction to start new work.",
     JSON.stringify({
-      kind: "codex_turn_final_output",
+      kind: "completed_work_final_output",
       threadId: output.threadId,
       turnId: output.turnId,
       status: output.status,

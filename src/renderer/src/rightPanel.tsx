@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { transcriptMessageFromEvent } from "../../shared/transcriptMessages";
 import type {
   ActiveThreadSummary,
@@ -14,12 +14,14 @@ import type {
 } from "../../shared/types";
 
 type RightPanelTabId = "transcript" | "approvals" | "todos";
+const transcriptScrollPinThresholdPx = 48;
 
 export function RightPanel({
   open,
   state,
   events,
   activateTranscriptRequest,
+  activateApprovalsRequest,
   inspectedThread,
   onClose,
   onAction,
@@ -28,6 +30,7 @@ export function RightPanel({
   state: AppState;
   events: AppEvent[];
   activateTranscriptRequest: number;
+  activateApprovalsRequest: number;
   inspectedThread: { threadId: string; label: string } | null;
   onClose: () => void;
   onAction: (action: () => Promise<unknown>) => Promise<void>;
@@ -39,6 +42,7 @@ export function RightPanel({
   const [error, setError] = useState<string | null>(null);
   const activeChat = activeChatForState(state);
   const todos = todosForActiveChat(state, activeChat);
+  const lastApprovalsActivationRequestRef = useRef(0);
   const inspectedRequests = inspectedThread
     ? state.runtime.pendingRequests.filter((request) => request.threadId === inspectedThread.threadId)
     : state.runtime.pendingRequests;
@@ -53,6 +57,14 @@ export function RightPanel({
     if (!open || activateTranscriptRequest === 0) return;
     setActiveTabId("transcript");
   }, [activateTranscriptRequest, open]);
+
+  useEffect(() => {
+    if (!shouldConsumeActivationRequest(open, activateApprovalsRequest, lastApprovalsActivationRequestRef.current)) {
+      return;
+    }
+    lastApprovalsActivationRequestRef.current = activateApprovalsRequest;
+    setActiveTabId("approvals");
+  }, [activateApprovalsRequest, open]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -316,7 +328,21 @@ function TranscriptTab({
   error: string | null;
   messages: VoiceTranscriptMessage[];
 }): React.ReactElement {
-  const entries = transcriptEntries(messages, events, chatId);
+  const entries = useMemo(() => transcriptEntries(messages, events, chatId), [chatId, events, messages]);
+  const transcriptListRef = useRef<HTMLDivElement | null>(null);
+  const transcriptScrollPinnedRef = useRef(true);
+  const entryFingerprint = entries.map((message) => `${message.id}:${message.status}:${message.text.length}`).join("|");
+
+  useLayoutEffect(() => {
+    const list = transcriptListRef.current;
+    if (!list || entries.length === 0) return;
+    if (transcriptScrollPinnedRef.current) scrollTranscriptListToBottom(list);
+  }, [entries.length, entryFingerprint]);
+
+  function handleTranscriptScroll(event: React.UIEvent<HTMLDivElement>): void {
+    transcriptScrollPinnedRef.current = isTranscriptScrollPinned(event.currentTarget);
+  }
+
   if (entries.length === 0) {
     return (
       <RightPanelEmpty
@@ -327,7 +353,7 @@ function TranscriptTab({
   }
 
   return (
-    <div className="voice-transcript-list">
+    <div className="voice-transcript-list" ref={transcriptListRef} onScroll={handleTranscriptScroll}>
       {entries.map((message) => (
         <article key={message.id} className={`voice-transcript-entry ${message.role}`}>
           <span>{message.role === "user" ? "You" : "Realtime"}</span>
@@ -339,7 +365,7 @@ function TranscriptTab({
   );
 }
 
-function transcriptEntries(
+export function transcriptEntries(
   storedMessages: VoiceTranscriptMessage[],
   events: AppEvent[],
   chatId: string | null,
@@ -361,6 +387,25 @@ function transcriptEntries(
   return [...byId.values()].sort((left, right) =>
     (left.completedAt ?? left.createdAt).localeCompare(right.completedAt ?? right.createdAt),
   );
+}
+
+export function isTranscriptScrollPinned(
+  element: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
+  thresholdPx = transcriptScrollPinThresholdPx,
+): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= thresholdPx;
+}
+
+export function shouldConsumeActivationRequest(
+  open: boolean,
+  activationRequest: number,
+  lastConsumedRequest: number,
+): boolean {
+  return open && activationRequest !== 0 && activationRequest !== lastConsumedRequest;
+}
+
+function scrollTranscriptListToBottom(element: Pick<HTMLElement, "scrollHeight" | "scrollTop">): void {
+  element.scrollTop = element.scrollHeight;
 }
 
 function ApprovalsTab({

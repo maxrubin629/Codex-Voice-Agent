@@ -4,9 +4,11 @@ import type {
   AppState,
   ApprovalDecision,
   CodexPermissionMode,
+  CodexRequestOptions,
   CodexSettingsScope,
   CodexServiceTier,
   CodexVoiceApi,
+  RealtimeContextRequest,
   ReasoningEffort,
   ReplaySessionLoadResult,
   ReplaySessionMetadata,
@@ -59,11 +61,23 @@ const api: CodexVoiceApi = {
   showProjectChats: (open?: boolean) => ipcRenderer.invoke("projects:showChats", { open }),
   summarizeProject: (projectId?: string, chatId?: string) =>
     ipcRenderer.invoke("projects:summarize", { projectId, chatId }),
-  sendToCodex: (text: string, chatId?: string, workspacePath?: string | null) =>
-    ipcRenderer.invoke("codex:send", { text, chatId, workspacePath }),
+  sendToCodex: (
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ) =>
+    ipcRenderer.invoke("codex:send", { text, chatId, workspacePath, ...options }),
   steerCodex: (text: string, chatId?: string) => ipcRenderer.invoke("codex:steer", { text, chatId }),
-  queueCodexRequest: (text: string, chatId?: string, workspacePath?: string | null) =>
-    ipcRenderer.invoke("codex:queue", { text, chatId, workspacePath }),
+  queueCodexRequest: (
+    text: string,
+    chatId?: string,
+    workspacePath?: string | null,
+    options?: CodexRequestOptions,
+  ) =>
+    ipcRenderer.invoke("codex:queue", { text, chatId, workspacePath, ...options }),
+  realtimeSessionStarted: () => ipcRenderer.invoke("realtime:sessionStarted"),
+  realtimeSessionEnded: () => ipcRenderer.invoke("realtime:sessionEnded"),
   cancelQueuedCodexRequest: (queuedId?: string | null, chatId?: string) =>
     ipcRenderer.invoke("codex:cancelQueued", { queuedId, chatId }),
   interruptCodex: (chatId?: string) => ipcRenderer.invoke("codex:interrupt", { chatId }),
@@ -96,6 +110,8 @@ const api: CodexVoiceApi = {
     ipcRenderer.invoke("rightPanel:getActiveThreadSummary", { chatId }),
   getTranscriptMessages: (chatId?: string) =>
     ipcRenderer.invoke("rightPanel:getTranscriptMessages", { chatId }),
+  getRealtimeContext: (request?: RealtimeContextRequest) =>
+    ipcRenderer.invoke("realtime:getContext", request),
   saveOpenAiApiKey: (apiKey: string) => ipcRenderer.invoke("settings:saveOpenAiApiKey", { apiKey }),
   clearOpenAiApiKey: () => ipcRenderer.invoke("settings:clearOpenAiApiKey"),
   createRealtimeClientSecret: () => ipcRenderer.invoke("realtime:createClientSecret"),

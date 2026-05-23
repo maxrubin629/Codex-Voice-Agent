@@ -1,3 +1,7 @@
+import { EventEmitter } from "node:events";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({
@@ -7,53 +11,187 @@ vi.mock("electron", () => ({
 }));
 
 import {
-  codexVoiceTurnText,
+  VoiceCodexOrchestrator,
   mcpToolGrantFromRequest,
   normalizeThreadItemType,
   progressItemsFromThread,
   resolveVisibleSubagentTarget,
   subagentsFromSessionLogText,
-  threadTurnsHaveVoiceBridgePrompt,
   todoItemsFromPlanNotification,
   visibleSubagentsForChat,
   type CodexThreadItem,
   type CodexThreadTurn,
 } from "./orchestrator";
+import { ProjectStore } from "./projectStore";
 import type { PendingCodexRequest, VoiceChat } from "../shared/types";
 
-function countOccurrences(value: string, needle: string): number {
-  return value.split(needle).length - 1;
+type FakeCodexRequest = {
+  method: string;
+  params: any;
+};
+
+class FakeCodexBridge extends EventEmitter {
+  requests: FakeCodexRequest[] = [];
+  private nextTurnId = 1;
+
+  async start(): Promise<void> {}
+  stop(): void {}
+
+  async request(method: string, params?: unknown): Promise<unknown> {
+    this.requests.push({ method, params });
+    if (method === "thread/resume" || method === "thread/name/set" || method === "thread/inject_items") {
+      return {};
+    }
+    if (method === "turn/start") {
+      return { turn: { id: `turn-${this.nextTurnId++}` } };
+    }
+    if (method === "thread/read") {
+      return { thread: { turns: [] } };
+    }
+    if (method === "plugin/list") {
+      return {
+        marketplaces: [
+          {
+            name: "OpenAI",
+            plugins: [{ id: "browser", name: "Browser", installed: true, enabled: true }],
+          },
+        ],
+      };
+    }
+    if (method === "mcpServerStatus/list") {
+      return {
+        data: [
+          {
+            name: "github",
+            authStatus: "connected",
+            tools: { search_repositories: {}, get_issue: {} },
+          },
+        ],
+      };
+    }
+    if (method === "app/list") {
+      return {
+        data: [
+          {
+            id: "google-drive",
+            name: "Google Drive",
+            isEnabled: true,
+            isAccessible: true,
+            pluginDisplayNames: ["Google Drive"],
+          },
+        ],
+      };
+    }
+    throw new Error(`Unexpected fake Codex request: ${method}`);
+  }
 }
 
-describe("one-time voice prompt injection", () => {
-  it("prepends the bridge prompt for a new thread", () => {
-    const text = codexVoiceTurnText("open the app", false);
+async function testOrchestrator(): Promise<{
+  orchestrator: VoiceCodexOrchestrator;
+  codex: FakeCodexBridge;
+  chatId: string;
+}> {
+  const baseFolder = await mkdtemp(path.join(os.tmpdir(), "cva-orchestrator-"));
+  const store = new ProjectStore(baseFolder);
+  await store.ensureReady();
+  const codex = new FakeCodexBridge();
+  const orchestrator = new VoiceCodexOrchestrator(store, codex as unknown as any);
+  const project = await orchestrator.createProject("Realtime XML", baseFolder);
+  const withChat = await store.addChat(project.id, "Main", "thread-1");
+  return { orchestrator, codex, chatId: withChat.activeChatId! };
+}
 
-    expect(text).toContain("Codex (you) owns the actual planning");
-    expect(text).toContain("Voice ===\nopen the app");
-    expect(countOccurrences(text, "Voice ===\n")).toBe(1);
+describe("realtime delegation orchestration", () => {
+  it("leaves typed UI turns as ordinary Codex user input", async () => {
+    const { orchestrator, codex, chatId } = await testOrchestrator();
+
+    await orchestrator.sendToCodex("plain typed request", chatId);
+
+    const turnStart = codex.requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params.input[0].text).toBe("plain typed request");
   });
 
-  it("sends only the voice marker once the bridge prompt is persisted", () => {
-    const text = codexVoiceTurnText("run the focused tests", true);
+  it("wraps realtime-originated turns and injects start context once per realtime session thread", async () => {
+    const { orchestrator, codex, chatId } = await testOrchestrator();
+    await orchestrator.realtimeSessionStarted();
 
-    expect(text).toBe("Voice ===\nrun the focused tests");
-    expect(text).not.toContain("Codex (you) owns the actual planning");
+    await orchestrator.sendToCodex("open the app", chatId, null, {
+      source: "realtime",
+      transcriptDelta: "user: open the app",
+    });
+    await orchestrator.sendToCodex("run tests", chatId, null, {
+      source: "realtime",
+    });
+
+    const turnStarts = codex.requests.filter((request) => request.method === "turn/start");
+    expect(turnStarts).toHaveLength(2);
+
+    const firstText = turnStarts[0].params.input[0].text;
+    expect(firstText).toContain("<realtime_delegation>");
+    expect(firstText).toContain("<realtime_conversation>");
+    expect(firstText).toContain("Realtime conversation started.");
+    expect(firstText).toContain("<input>open the app</input>");
+    expect(firstText).toContain("<transcript_delta>user: open the app</transcript_delta>");
+    expect(firstText).not.toContain("Voice ===");
+
+    const secondText = turnStarts[1].params.input[0].text;
+    expect(secondText).toContain("<realtime_delegation>");
+    expect(secondText).not.toContain("<realtime_conversation>");
+    expect(secondText).toContain("<input>run tests</input>");
+    expect(secondText).not.toContain("Voice ===");
   });
 
-  it("detects a legacy-injected bridge prompt in previous turns", () => {
-    const firstTurnText = codexVoiceTurnText("initial request", false);
-    const turns: CodexThreadTurn[] = [
-      {
-        id: "turn-1",
-        items: [{ type: "user_message", text: firstTurnText }],
-      },
-    ];
+  it("passes queued realtime context through the delegation transcript delta when idle", async () => {
+    const { orchestrator, codex, chatId } = await testOrchestrator();
+    await orchestrator.realtimeSessionStarted();
 
-    expect(threadTurnsHaveVoiceBridgePrompt(turns)).toBe(true);
-    expect(threadTurnsHaveVoiceBridgePrompt([{ id: "turn-2", items: [{ type: "user_message", text: "plain" }] }])).toBe(
-      false,
-    );
+    await orchestrator.queueCodexRequest("run focused tests", chatId, null, {
+      source: "realtime",
+      transcriptDelta: "user: run focused tests",
+    });
+
+    const turnStart = codex.requests.find((request) => request.method === "turn/start");
+    const text = turnStart?.params.input[0].text;
+    expect(text).toContain("<input>run focused tests</input>");
+    expect(text).toContain("<transcript_delta>user: run focused tests</transcript_delta>");
+  });
+
+  it("injects realtime-ended context as a normal user history item", async () => {
+    const { orchestrator, codex, chatId } = await testOrchestrator();
+    await orchestrator.realtimeSessionStarted();
+    await orchestrator.sendToCodex("open the app", chatId, null, { source: "realtime" });
+
+    await orchestrator.realtimeSessionEnded();
+
+    const injections = codex.requests.filter((request) => request.method === "thread/inject_items");
+    expect(injections).toHaveLength(1);
+    expect(injections[0].params.threadId).toBe("thread-1");
+    expect(injections[0].params.items[0]).toMatchObject({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text" }],
+    });
+    const text = injections[0].params.items[0].content[0].text;
+    expect(text).toContain("<realtime_conversation>");
+    expect(text).toContain("Realtime conversation ended.");
+    expect(text).toContain("<input>Realtime conversation ended.</input>");
+  });
+});
+
+describe("realtime context orchestration", () => {
+  it("reads plugin, MCP, and app availability from app-server for realtime", async () => {
+    const { orchestrator, codex } = await testOrchestrator();
+
+    const result = await orchestrator.getRealtimeContext({ scope: "plugins" });
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("Available Plugins And Apps");
+    expect(result.text).toContain("Browser (browser) - installed, enabled - OpenAI");
+    expect(result.text).toContain("github - connected - 2 tools");
+    expect(result.text).toContain("Google Drive (google-drive) - enabled, accessible via Google Drive");
+    expect(codex.requests.map((request) => request.method)).toContain("plugin/list");
+    expect(codex.requests.map((request) => request.method)).toContain("mcpServerStatus/list");
+    expect(codex.requests.map((request) => request.method)).toContain("app/list");
   });
 });
 

@@ -12,6 +12,7 @@ import type {
   PhoneSettings,
   PhoneStatus,
 } from "../shared/types";
+import { shouldCreateRealtimeResponseAfterToolOutputs } from "../shared/realtimeSpeechPolicy";
 import { getOpenAiApiKey } from "./apiKeyStore";
 import { realtimeConfig, realtimeTools } from "./realtime";
 
@@ -64,6 +65,8 @@ type PhoneCallSessionFactory = (
 type PhoneControllerOptions = {
   toolHandler?: PhoneToolHandler;
   callSessionFactory?: PhoneCallSessionFactory;
+  onRealtimeSessionStarted?: () => Promise<void> | void;
+  onRealtimeSessionEnded?: () => Promise<void> | void;
 };
 
 type IncomingCallEvent = {
@@ -86,6 +89,8 @@ export class PhoneController extends EventEmitter {
   private endingCallIds = new Set<string>();
   private readonly toolHandler?: PhoneToolHandler;
   private readonly callSessionFactory: PhoneCallSessionFactory;
+  private readonly onRealtimeSessionStarted?: () => Promise<void> | void;
+  private readonly onRealtimeSessionEnded?: () => Promise<void> | void;
 
   constructor(
     private readonly adapter: PhoneRealtimeAdapter = new OpenAiPhoneRealtimeAdapter(),
@@ -93,6 +98,8 @@ export class PhoneController extends EventEmitter {
   ) {
     super();
     this.toolHandler = options.toolHandler;
+    this.onRealtimeSessionStarted = options.onRealtimeSessionStarted;
+    this.onRealtimeSessionEnded = options.onRealtimeSessionEnded;
     this.callSessionFactory =
       options.callSessionFactory ??
       ((call, hooks) =>
@@ -285,7 +292,10 @@ export class PhoneController extends EventEmitter {
           })
         : null;
       this.activeSession = session;
-      if (session) await session.start();
+      if (session) {
+        await session.start();
+        await this.notifyRealtimeSessionStarted();
+      }
       if (this.activeCall) this.activeCall = { ...this.activeCall, status: "active" };
       this.appendLog({
         id: randomLogId(),
@@ -327,6 +337,7 @@ export class PhoneController extends EventEmitter {
     const call = this.activeCall;
     this.activeSession = null;
     this.activeCall = null;
+    this.notifyRealtimeSessionEnded();
     this.appendLog({
       id: randomLogId(),
       callId,
@@ -363,6 +374,28 @@ export class PhoneController extends EventEmitter {
       statusCode,
     });
     this.emitState();
+  }
+
+  private async notifyRealtimeSessionStarted(): Promise<void> {
+    try {
+      await this.onRealtimeSessionStarted?.();
+    } catch (error) {
+      this.emitEvent(
+        "realtime",
+        "sessionLifecycleFailed",
+        error instanceof Error ? error.message : "Unable to mark realtime started.",
+      );
+    }
+  }
+
+  private notifyRealtimeSessionEnded(): void {
+    void Promise.resolve(this.onRealtimeSessionEnded?.()).catch((error) => {
+      this.emitEvent(
+        "realtime",
+        "sessionLifecycleFailed",
+        error instanceof Error ? error.message : "Unable to mark realtime ended.",
+      );
+    });
   }
 
   private appendLog(entry: PhoneCallLogEntry): void {
@@ -743,7 +776,9 @@ class RealtimeSipCallSession implements PhoneCallSession {
       call.outputSent = true;
       call.pendingOutput = undefined;
     }
-    this.send({ type: "response.create" });
+    if (shouldCreateRealtimeResponseAfterToolOutputs(outputs.map(({ call }) => call.name))) {
+      this.send({ type: "response.create" });
+    }
     this.cleanupTrackedResponse(record);
   }
 

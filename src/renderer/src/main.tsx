@@ -114,6 +114,7 @@ type AppWindowKind = "voice" | "debug";
 type ApiKeyDialogMode = "connect" | "settings";
 type VoiceTone = "off" | "listening" | "working" | "connecting" | "paused" | "waiting";
 type VoiceSettingsTab = "general" | "appearance" | "configuration" | "archive";
+type VoiceShortcutAction = "settings" | "rightPanel";
 
 type VoiceOrbCustomization = {
   accentColor: string;
@@ -365,6 +366,32 @@ function supportsDualPaneLayout(): boolean {
   return window.matchMedia(dualPaneLayoutMediaQuery).matches;
 }
 
+export function voiceShortcutActionForEvent(
+  event: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">,
+  platform = typeof navigator === "undefined" ? "" : navigator.platform,
+): VoiceShortcutAction | null {
+  const isMac = /\b(mac|iphone|ipad|ipod)/i.test(platform);
+  const expectedModifierPressed = isMac ? event.metaKey : event.ctrlKey;
+  if (!expectedModifierPressed || event.altKey || event.shiftKey) return null;
+  if (isMac && event.ctrlKey) return null;
+
+  if (event.key === ",") return "settings";
+  if (event.key === ".") return "rightPanel";
+  return null;
+}
+
+export function pendingRequestIds(requests: Pick<PendingCodexRequest, "requestId">[]): string[] {
+  return requests.map((request) => String(request.requestId));
+}
+
+export function hasNewPendingRequests(
+  previousRequestIds: readonly string[],
+  nextRequests: Pick<PendingCodexRequest, "requestId">[],
+): boolean {
+  const previous = new Set(previousRequestIds);
+  return nextRequests.some((request) => !previous.has(String(request.requestId)));
+}
+
 function viewportWidth(): number {
   return Math.max(0, window.innerWidth);
 }
@@ -536,6 +563,8 @@ function App(): React.ReactElement {
         onLog: (event) => {
           logRealtimeEvent(event);
         },
+        onSessionStarted: () => window.codexVoice.realtimeSessionStarted(),
+        onSessionEnded: () => window.codexVoice.realtimeSessionEnded(),
         onOutputLevel: updateVoiceOutputLevel,
         getTranscriptMessages: (chatId) => window.codexVoice.getTranscriptMessages(chatId),
       });
@@ -678,6 +707,7 @@ function VoiceHome({
   const [futureResizeClosing, setFutureResizeClosing] = useState(false);
   const [rightPaneRevealWidth, setRightPaneRevealWidth] = useState(0);
   const [transcriptActivationRequest, setTranscriptActivationRequest] = useState(0);
+  const [approvalsActivationRequest, setApprovalsActivationRequest] = useState(0);
   const [canShowBothPanes, setCanShowBothPanes] = useState(() => supportsDualPaneLayout());
   const [newOpen, setNewOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
@@ -708,6 +738,7 @@ function VoiceHome({
   const canShowBothPanesRef = useRef(canShowBothPanes);
   const lastAutoTranscriptEventRef = useRef<string | null>(null);
   const transcriptAutoActivatedRef = useRef(false);
+  const pendingRequestIdsRef = useRef<string[]>([]);
   const projects = state.projects;
   const archivedProjects = state.archivedProjects;
   const activeProject = state.activeProject;
@@ -748,7 +779,6 @@ function VoiceHome({
   const modelSupportsFast = supportsFastMode(selectedCodexModel);
   const fastModeOn = isFastServiceTier(effectiveServiceTier);
   const pendingRequests = state.runtime.pendingRequests;
-  const primaryPendingRequest = pendingRequests[0] ?? null;
   const filteredProjects = projects.filter((project) => {
     const haystack = [
       project.displayName,
@@ -861,6 +891,42 @@ function VoiceHome({
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [contextMenu]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const action = voiceShortcutActionForEvent(event);
+      if (!action) return;
+
+      event.preventDefault();
+      if (action === "settings") {
+        setPermissionsOpen(false);
+        setModelOpen(false);
+        setSettingsOpen((current) => !current);
+        return;
+      }
+
+      setPermissionsOpen(false);
+      if (futureOpenRef.current) {
+        closeFuturePane();
+      } else {
+        openFuturePane();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const previousIds = pendingRequestIdsRef.current;
+    const nextIds = pendingRequestIds(pendingRequests);
+    pendingRequestIdsRef.current = nextIds;
+
+    if (!hasNewPendingRequests(previousIds, pendingRequests)) return;
+    setInspectedThread(null);
+    openFuturePane();
+    setApprovalsActivationRequest((current) => current + 1);
+  }, [pendingRequests]);
 
   async function createNewProject(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -1341,14 +1407,6 @@ function VoiceHome({
 
           {error && <ErrorOverlay message={error} onDismiss={onDismissError} />}
 
-          {primaryPendingRequest && (
-            <VoicePendingRequestPanel
-              request={primaryPendingRequest}
-              requestCount={pendingRequests.length}
-              onAction={onAction}
-            />
-          )}
-
           <section className="voice-project-region" aria-label="Projects">
             <FeaturedProjectCard
               activeProjectId={activeProjectId}
@@ -1470,6 +1528,7 @@ function VoiceHome({
           state={state}
           events={events}
           activateTranscriptRequest={transcriptActivationRequest}
+          activateApprovalsRequest={approvalsActivationRequest}
           inspectedThread={inspectedThread}
           onClose={closeFuturePane}
           onAction={onAction}
@@ -4646,35 +4705,6 @@ function StatusPill({ label, tone }: { label: string; tone: "good" | "warn" | "m
   return <span className={`status-pill ${tone}`}>{label}</span>;
 }
 
-function VoicePendingRequestPanel({
-  request,
-  requestCount,
-  onAction,
-}: {
-  request: PendingCodexRequest;
-  requestCount: number;
-  onAction: (action: () => Promise<unknown>) => Promise<void>;
-}): React.ReactElement {
-  return (
-    <section className={`voice-pending-panel ${request.kind}`} aria-label="Pending Codex request">
-      <div className="voice-pending-topline">
-        <span>{requestKindLabel(request)}</span>
-        {requestCount > 1 && <strong>{requestCount} waiting</strong>}
-      </div>
-      <h2>{request.title}</h2>
-      {requestContextLabel(request) && <p>{requestContextLabel(request)}</p>}
-      {request.kind === "question" ? (
-        <ToolQuestionForm request={request} onAction={onAction} surface="voice" />
-      ) : (
-        <>
-          <RequestDetails request={request} surface="voice" />
-          <ApprovalActions request={request} onAction={onAction} surface="voice" />
-        </>
-      )}
-    </section>
-  );
-}
-
 function PendingRequestCard({
   request,
   onAction,
@@ -4915,8 +4945,12 @@ function requestContextLabel(request: PendingCodexRequest): string {
   return [request.projectName, request.chatName].filter(Boolean).join(" / ");
 }
 
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+const rootElement = typeof document === "undefined" ? null : document.getElementById("root");
+
+if (rootElement) {
+  createRoot(rootElement).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+}
